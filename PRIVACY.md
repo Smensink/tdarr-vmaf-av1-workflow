@@ -7,3 +7,5 @@ Allowed public fields include broad resolution tier, codec bucket, source-type b
 Disallowed public fields include raw rows, file paths, filenames, titles, release groups, exact timestamps, Plex/TMDB/TVDB identifiers, API tokens, job reports, media-library mounts, and Tdarr databases.
 
 The sanitizer is allowlist-based: columns not explicitly used by the aggregation code are ignored.
+
+For the practical workflow and rationale, see [docs/privacy-and-data.md](docs/privacy-and-data.md).
