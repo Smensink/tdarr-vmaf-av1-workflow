@@ -4,6 +4,10 @@ This page explains what each Local Flow Plugin contributes to the workflow. The 
 
 ## Preflight and metadata plugins
 
+### `checkFileAge`
+
+Age-gates newly added files before expensive processing begins. This prevents Tdarr from transcoding files that may still be downloading, importing, unpacking, or being modified by another application. It can calculate age from file creation time, file modification time, or Tdarr's own added/discovered timestamp.
+
 ### `checkVideoCodec`
 
 Skips files that are already in the target codec, normally AV1. This prevents accidental re-encoding of files that have already been processed.
@@ -101,11 +105,3 @@ Future files can use this state to start with narrower and better CQ ranges.
 ### `cleanupTempFiles`
 
 Removes temporary samples, test encodes, and VMAF log artifacts from the work directory.
-
-## Missing/external plugin
-
-### `checkFileAge`
-
-The exported flow references `checkFileAge`, but this plugin is not included in the repository. It is an age gate: it prevents Tdarr from processing files that may still be downloading, importing, or being modified.
-
-Install your own equivalent, replace it with a community/plugin alternative, or remove that node if immediate processing is acceptable.

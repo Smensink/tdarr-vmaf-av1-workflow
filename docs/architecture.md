@@ -63,10 +63,11 @@ The workflow encodes short samples at candidate CQ values, then compares each en
 
 ## Runtime paths
 
-Source in this repo:
+Source in this repo is grouped by Local Flow Plugin category:
 
 ```text
 plugins/vmaf/<plugin>/1.0.0/index.js
+plugins/filter/checkFileAge/1.0.0/index.js
 ```
 
 Typical Tdarr runtime paths:

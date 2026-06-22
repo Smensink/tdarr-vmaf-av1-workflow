@@ -40,7 +40,7 @@ This workflow uses those ideas practically inside Tdarr: VMAF estimates perceptu
 ## How the project is organized
 
 - `docker/` — compose example, Dockerfile, init hooks, and FFmpeg/libvmaf build recipe
-- `plugins/vmaf/` — Tdarr Local Flow Plugins used by the workflow
+- `plugins/` — Tdarr Local Flow Plugins used by the workflow (`vmaf/` and `filter/`)
 - `flow/tdarr-flow-vmaf-av1.json` — importable Tdarr flow
 - `data/seed/` — aggregate warm-start CQ priors
 - `tools/` — install, validation, and data-sanitization helpers
@@ -121,10 +121,6 @@ The workflow writes learning data after successful runs. Future files use that h
 - [Troubleshooting](docs/troubleshooting.md)
 - [Release checklist](docs/release-checklist.md)
 - [Privacy and data handling](docs/privacy-and-data.md)
-
-## Known caveat
-
-The exported flow references a `checkFileAge` local plugin that is not included in this repository. After import, either provide your own age-gate plugin or remove/replace that node. The rest of the VMAF/AV1 workflow is included.
 
 ## Licensing note
 

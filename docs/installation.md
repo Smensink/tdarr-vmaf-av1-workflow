@@ -108,19 +108,18 @@ After import:
 2. Review each plugin input.
 3. Set metadata API inputs only if you want Plex/TMDB/TVDB lookup.
 4. Confirm output and library behavior for your setup.
-5. Resolve the `checkFileAge` caveat below.
+5. Confirm the included `checkFileAge` age gate is present and configured for your preferred minimum age.
 
-## 7. Resolve the `checkFileAge` caveat
+## 7. Configure the included `checkFileAge` gate
 
-The exported flow references a local plugin named `checkFileAge`, but that plugin is not included in this repository.
+The flow includes `plugins/filter/checkFileAge/1.0.0/index.js`. It prevents Tdarr from processing files that may still be downloading, importing, or being modified.
 
-Choose one:
+After import, review its inputs in the Tdarr UI:
 
-- provide your own `checkFileAge` local plugin
-- remove that node from the flow
-- replace it with an equivalent Tdarr/community age gate
+- **Minimum Age (Days)** — default age threshold before processing.
+- **Date Type** — creation time, modification time, or Tdarr-added time.
 
-If you remove it, newly downloaded files may be processed immediately. That can race with imports/downloads if another application is still writing files.
+If you do not want an age gate, you can remove this node from the flow. Be aware that newly added files may then be processed immediately.
 
 ## 8. Validate the deployment
 

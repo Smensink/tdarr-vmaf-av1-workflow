@@ -3,7 +3,13 @@ set -euo pipefail
 CONTAINER="${1:-tdarr}"
 
 echo "== Local plugin syntax =="
-for f in plugins/vmaf/*/1.0.0/index.js; do
+shopt -s nullglob
+plugin_files=(plugins/*/*/1.0.0/index.js)
+if [ "${#plugin_files[@]}" -eq 0 ]; then
+  echo "No plugin files found under plugins/" >&2
+  exit 1
+fi
+for f in "${plugin_files[@]}"; do
   node --check "$f"
 done
 
@@ -33,6 +39,13 @@ echo "== NVENC encoders =="
 "${DOCKER_EXEC[@]}" sh -lc 'tdarr-ffmpeg -hide_banner -encoders 2>/dev/null | grep -iE "av1_nvenc|hevc_nvenc|h264_nvenc"'
 
 echo "== Plugin runtime files =="
-"${DOCKER_EXEC[@]}" sh -lc 'for p in calculateVMAF selectBestParameters learnCQRange vmafOptimizedTranscode; do test -f "/app/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins/vmaf/$p/1.0.0/index.js" || exit 1; done; echo ok'
+"${DOCKER_EXEC[@]}" sh -lc '
+set -e
+for p in calculateVMAF selectBestParameters learnCQRange vmafOptimizedTranscode; do
+  test -f "/app/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins/vmaf/$p/1.0.0/index.js"
+done
+test -f "/app/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins/filter/checkFileAge/1.0.0/index.js"
+echo ok
+'
 
 echo "validation passed"

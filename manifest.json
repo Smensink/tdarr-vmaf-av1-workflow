@@ -114,9 +114,12 @@
       "version": "1.0.0",
       "source": "tdarr-local-plugin-runtime-copy",
       "path": "plugins/vmaf/monitorTranscodeRetry/1.0.0/index.js"
+    },
+    {
+      "name": "checkFileAge",
+      "version": "1.0.0",
+      "source": "tdarr-local-plugin-runtime-copy",
+      "path": "plugins/filter/checkFileAge/1.0.0/index.js"
     }
-  ],
-  "known_missing_or_external": [
-    "checkFileAge plugin referenced by the flow was not found under the local VMAF plugin tree; document/install separately or remove that node after import."
   ]
 }

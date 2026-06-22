@@ -62,4 +62,4 @@ For each release, mention:
 - FFmpeg/libvmaf expectations
 - schema changes to seed files or learning CSVs
 - migration/import notes for existing Tdarr users
-- any known caveats, especially `checkFileAge` or metadata lookup behavior
+- any known caveats, especially age-gate defaults or metadata lookup behavior

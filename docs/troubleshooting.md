@@ -28,9 +28,9 @@ Expected capabilities:
 
 If CAMBI is not explicitly listed by `ffmpeg -h filter=libvmaf`, verify it from actual VMAF JSON/job logs after a test run. Some builds expose CAMBI only through the generic `feature=name=cambi` mechanism.
 
-## Flow imports but a node is missing
+## `checkFileAge` blocks processing
 
-The exported flow references `checkFileAge`, which is not included in this repo. Provide an equivalent local plugin or remove/replace that node after import.
+The included `checkFileAge` plugin intentionally fails the flow for files newer than its configured age threshold. This is useful for avoiding half-written downloads/imports. If this is too conservative for your setup, lower the **Minimum Age (Days)** input or remove the node from the flow.
 
 ## UI shows new plugin code but jobs run old behavior
 
