@@ -1,130 +1,99 @@
 # Adaptive Tdarr workflow vs FileFlows
 
-This project and FileFlows solve related problems, but they sit at different levels.
+This project and FileFlows solve related problems, but they sit at different levels and the adaptive quality approaches differ in detail.
 
-- **FileFlows** is a general file-processing flow engine. Its video plugin includes an [FFmpeg Builder](https://fileflows.com/docs/plugins/video-nodes/ffmpeg-builder/) that builds an FFmpeg command from flow nodes, parses streams, and copies unmodified streams by default. It also supports JavaScript [flow scripts](https://fileflows.com/docs/scripting/javascript/flow-scripts/) and a `Flow` runtime object with helpers such as `Execute`, `GetParameter`, `SetParameter`, `GetProperty`, and `SetProperty`.
-- **This repository** is a specialized Tdarr workflow that implements an adaptive AV1 quality-control loop: sample the file, encode candidate CQs, measure those candidates with VMAF/CAMBI, reject unsafe candidates, retry lower-CQ ranges when needed, transcode the full file only after passing quality gates, and learn from the result.
+## The two FileFlows adaptive quality pieces
 
-So the difference is not "Tdarr can transcode and FileFlows cannot". FileFlows can absolutely build complex FFmpeg flows. The difference is that this project ships a concrete, opinionated **quality-decision system** rather than a generic graph of media-processing building blocks.
+### ab-av1 (DockerMod)
 
-## What FileFlows gives you out of the box
+FileFlows can install **ab-av1** via a DockerMod (`AutoCRF.sh`). This is the most directly comparable piece to this project.
 
-Based on the public FileFlows docs:
+ab-av1 is a Rust CLI tool (by alexheretic) that:
 
-| FileFlows capability | Why it matters |
-|---|---|
-| Flow graph execution | Good visual model for branching media-processing jobs. |
-| FFmpeg Builder | Builds complex FFmpeg commands from smaller nodes and preserves streams unless told to delete/convert them. |
-| Hardware decoding controls | Can test/use hardware decode depending on mode and bit-depth compatibility. |
-| `FfmpegBuilderModel` | Exposes video/audio/subtitle stream objects, filters, encoding parameters, metadata parameters, extension, inputs, and custom executor parameters. |
-| JavaScript flow scripts | Lets advanced users create custom decision nodes. |
-| `Flow.Execute` | Lets a script run external commands and capture exit code/stdout/stderr. |
-| `Flow.GetParameter` / `Flow.SetParameter` | Lets plugins/scripts share complex objects during one flow execution. |
-| `Flow.GetProperty` / `Flow.SetProperty` | Lets scripts store properties on a specific file's database record. |
-| Standard variables | Exposes working/original file paths, file sizes, dates, flow execution metadata, and library-file metadata. |
-
-Those primitives are enough to build a VMAF-based workflow in FileFlows, especially with custom scripts. But the adaptive behavior would need to be authored and maintained as custom logic.
-
-## What this project adds beyond a normal media flow
-
-A usual Tdarr or FileFlows transcode flow often looks like this:
+1. Takes an input file and a `--min-vmaf` target (e.g. `--min-vmaf 95`).
+2. Runs an **interpolated binary search** over CRF values (`sample-encode` at each step) to find the lowest CRF that delivers the target VMAF.
+3. Also enforces `--max-encoded-percent` — a hard ceiling on output size as a percentage of input size. If the binary search finds a CRF that hits VMAF 95 but the output would be larger than the max-encoded threshold, it rejects that CRF and searches lower (more compressed).
+4. Uses **SVT-AV1** as the primary encoder (libsvtav1 in FFmpeg), not NVENC.
+5. Runs on a **single sample** (not multiple samples) — it extracts one short clip and searches over that.
+6. Supports XPSNR as an alternative to VMAF.
+7. Outputs JSON with the best CRF, mean VMAF, predicted full-encode size and time.
 
 ```text
-inspect file -> choose codec/preset/bitrate/CQ -> run FFmpeg -> replace or keep original
+ab-av1 crf-search -i input.mkv --preset 7 --min-vmaf 95 --max-encoded-percent 80
+# → finds best CRF, returns JSON: { crf, vmaf, predicted_size, predicted_time }
 ```
 
-This workflow instead does this:
+ab-av1 in FileFlows is called as a `Flow.Execute` step — FileFlows runs the ab-av1 CLI and parses its JSON output. The VMAF measurement loop is inside the Rust binary, not in FileFlows itself.
 
-```text
-inspect file
-  -> decide content class and risk tier
-  -> extract representative samples plus holdout
-  -> choose initial CQ search range from priors/history
-  -> encode multiple candidate CQs on samples
-  -> score every candidate with VMAF and CAMBI
-  -> reject candidates that pass mean VMAF but fail tail quality, banding, or bitrate floors
-  -> retry lower-CQ ranges if every candidate is unsafe
-  -> validate the selected CQ against a holdout sample
-  -> run the final AV1 NVENC transcode
-  -> export measurements
-  -> update learned CQ priors for future files
-```
+### FFmpeg Builder + VideoEncode
 
-The important part is the feedback loop. It does not assume that `CQ 32` or `VMAF mean >= 95` is always safe. It measures, checks several failure modes, and adapts.
+FileFlows' stock video encoding uses a **visual node graph** (FFmpeg Builder) or a single `VideoEncode` node. Codec and CRF (or bitrate) are set as node parameters. There is no automatic adjustment — the user configures CRF 23 or whatever preset they want and it runs that.
 
-## Adaptive features compared
+The `FfmpegBuilderVideoCodec` node lets users set codec + parameters like `hevc_nvenc -preset hq -crf 23`. The `CheckVideoCodec` method auto-selects the best available encoder for the hardware (NVENC > QSV > AMF > VAAPI > software), but the quality parameter itself is static.
 
-| Area | This project | FileFlows equivalent |
+## Concrete technical differences
+
+| | **ab-av1 (FileFlows)** | **This project** |
 |---|---|---|
-| Candidate CQ sweep | Built in via `testEncodingParameters` and `calculateVMAF`. | Would need custom scripts/nodes that run FFmpeg sample encodes repeatedly. |
-| VMAF scoring | Built in via `calculateVMAF`, using the provided FFmpeg/libvmaf runtime. | Possible with `Flow.Execute` and a suitable FFmpeg/libvmaf binary, but not a turnkey stock FFmpeg Builder decision loop. |
-| CAMBI banding metric | Built into scoring and selection as a hard/soft guard. | Possible if the FileFlows runtime FFmpeg exposes libvmaf `feature=name=cambi`; custom parsing required. |
-| Mean VMAF | Used, but not trusted alone. | Easy to compute if custom VMAF scripting exists. |
-| Tail quality / 1%-low frame VMAF | Explicit guard against a few bad scenes hidden by a good average. | Would need custom parsing of per-frame VMAF JSON and policy code. |
-| Output-size/BPP/Mbps guard | Built in; prevents misleading high-VMAF candidates that collapse bitrate too far. | Possible with custom script and FileFlows file-size/stream variables. |
-| CQ range retry | Built in; if all tested candidates fail policy, the flow expands/retries safer lower-CQ ranges. | Would need explicit graph loops or script-managed retry state. |
-| Holdout validation | Built in; reserves an unseen sample to verify the chosen CQ before full transcode. | Possible, but would require custom sample extraction and validation script. |
-| Learning/warm start | Built in via `learnCQRange`, CSV/EMA state, and optional seed priors. | File-specific properties exist, but global cross-file learning would need external JSON/CSV/database logic. |
-| Runtime expectations | Repo documents/provides the FFmpeg/libvmaf runtime expected by the plugins. | FileFlows can run FFmpeg, but a user must ensure the deployed binary has matching VMAF/CAMBI/NVENC capabilities. |
-| Operational fit | Fits Tdarr's library/queue/transcode model and local flow plugins. | FileFlows is broader and more flexible for arbitrary file workflows. |
+| Quality target | `--min-vmaf` mean VMAF | Multiple: mean VMAF **+** 1%-low VMAF **+** CAMBI banding **+** BPP/Mbps/ratio |
+| Multi-metric guards | No. Single `min-vmaf` mean only. | Yes — see below |
+| Size constraint | `--max-encoded-percent` | BPP + Mbps + ratio % guard, applied per-resolution tier |
+| Encoder | SVT-AV1 (libsvtav1) | AV1 NVENC (av1_nvenc) |
+| Search strategy | Interpolated binary search on CRF | Candidate CQ sweep (4–8 points based on confidence), then fractional CQ refinement |
+| Sample count | 1 sample | 3–12 samples, count chosen by learned mean-min model |
+| Holdout validation | No | Yes — reserves 1 unseen sample, validates chosen CQ on it before committing |
+| Banding metric (CAMBI) | No | Yes — mean, P95, max; tiered limits per HDR/SDR/animation |
+| Tail-quality guard | No — mean only | Yes — 1%-low frame VMAF per resolution/HDR tier |
+| Cross-file learning | No | Yes — CSV + EMA priors per resolution/codec/release-group |
+| Adaptive bracket width | No | Yes — 4–8 CQ steps based on isotonic confidence |
+| CQ retry/loop | No | Yes — if all candidates fail guards, retries lower CQ ranges |
+| HDR metadata | Not handled specially | Tonemap in VMAF graph, HDR passthrough/reinjection on final transcode |
+| Custom FFmpeg | Required: libsvtav1 + libvmaf | Required: libvmaf + CAMBI + NVENC |
+| Integration model | CLI tool invoked via `Flow.Execute` | Tdarr Local Flow plugins, fully native |
 
-## Quality-decision philosophy
+## Why multiple quality dimensions matter
 
-This project is closer to a small per-file encoder experiment than a static transcode preset.
+ab-av1 is elegant and works well for its use case. The limitation is that **mean VMAF alone can hide problems**:
 
-The quality model follows ideas from Netflix's VMAF/CAMBI work:
+- A file can score VMAF 95 mean but have banding on dark gradients (CAMBI would catch this).
+- A file can score VMAF 93 mean but have individual frames at VMAF 70 — the tail of the distribution is the perceptually relevant part (1%-low frame VMAF guard catches this).
+- A file can produce an output at 12% of source size with VMAF 94 — mean VMAF looks fine but the bitrate collapse predicts re-encode artefacts on difficult scenes (BPP/ratio guard catches this).
 
-- [VMAF](https://github.com/Netflix/vmaf) estimates perceptual quality by comparing a distorted encode to a reference source.
-- [CAMBI](https://github.com/Netflix/vmaf/blob/master/resource/doc/cambi.md) targets banding, which can be visible even when VMAF is high.
-- Mean scores are useful, but averages hide tails. A file can have an excellent mean and still have bad dark scenes, gradients, or high-motion sections.
+This is the core reason the Tdarr project uses a multi-dimensional selection policy rather than a single `min-vmaf` threshold. Netflix's own CAMBI paper explicitly frames banding as orthogonal to VMAF — a file can ace VMAF and fail CAMBI.
 
-That is why the selection plugin checks several dimensions before accepting a candidate:
+## Could ab-av1 be used inside FileFlows as-is?
 
-1. **Mean/harmonic VMAF** — overall perceptual quality.
-2. **1%-low frame VMAF** — avoids letting a few ugly scenes hide inside a good average.
-3. **CAMBI mean/P95/max** — catches banding risk.
-4. **Projected bitrate, BPP, and source-size ratio** — catches over-compressed outputs that metrics alone may under-penalize.
-5. **Holdout sample** — checks the selected CQ on a sample not used in the original candidate sweep.
-6. **Learned priors** — narrows future searches when prior data is confident, while widening them when uncertainty is high.
+Yes. If you have an FFmpeg with SVT-AV1 and libvmaf, you can call ab-av1 from a FileFlows flow script. The FileFlows DockerMod installs it automatically. It would give you a VMAF-guided CRF search with size constraint — more capable than a static CRF, less capable than this project's multi-guard policy.
 
-## Could this be ported to FileFlows?
+The main limitation is that ab-av1 is designed around SVT-AV1. If you want NVENC (faster on NVIDIA hardware), you'd need to adapt or replace the ab-av1 logic.
 
-Yes, but it would be a rewrite rather than a simple import.
+## Could FileFlows replicate this project's full policy?
 
-A credible FileFlows port would likely need these custom pieces:
+FileFlows scripting (`Flow.Execute`, `Flow.GetParameter`, `Flow.SetParameter`) is powerful enough to replicate the adaptive loop. A FileFlows implementation could:
 
-1. A sample-extraction script using `Flow.Execute` and FileFlows path/stream variables.
-2. A candidate-encode script that generates multiple AV1 NVENC sample outputs.
-3. A VMAF/CAMBI scoring script that invokes an FFmpeg/libvmaf binary and parses JSON output.
-4. A selection script that implements the same mean VMAF, 1%-low, CAMBI, BPP, Mbps, ratio, and holdout rules.
-5. A retry/loop mechanism for lower-CQ sweeps when all candidates are unsafe.
-6. A persistence layer for global learning data. `Flow.SetProperty` is useful for per-file state, but cross-library CQ priors probably belong in an external JSON/CSV/database file.
-7. A final FFmpeg Builder or direct FFmpeg execution step that uses the selected parameters.
+1. Extract multiple samples via FFmpeg Builder.
+2. Loop over CQ values, calling `Flow.Execute` to run NVENC encodes.
+3. Call `Flow.Execute` to run `ffmpeg ... libvmaf` and parse the JSON.
+4. Evaluate CAMBI, 1%-low, BPP, ratio against tiered policy.
+5. Retry lower CQ on failure.
+6. Validate on holdout.
+7. Persist CSV/JSON learning state across runs.
 
-The biggest porting question is state. FileFlows exposes file-record properties and flow parameters, which are good for per-file decisions. This workflow's adaptive behavior depends on cross-file history, so a FileFlows port needs an explicit global learner store.
+The scripting surface is there. The novelty is in the policy logic and the learning state — not in any FileFlows primitive that doesn't exist.
 
-## When FileFlows might be the better fit
+## Practical summary
 
-FileFlows may be a better base if you want:
+| | ab-av1 | This project |
+|---|---|---|
+| VMAF-guided | ✅ CRF search via binary search | ✅ CQ sweep + selection |
+| CAMBI banding guard | ❌ | ✅ |
+| 1%-low / tail quality | ❌ | ✅ |
+| Size guard | `--max-encoded-percent` | BPP + Mbps + ratio per tier |
+| Holdout sample | ❌ | ✅ |
+| Learning | ❌ | ✅ |
+| HDR handling | Not special | Tonemap + passthrough |
+| Hardware encoder | SVT-AV1 | AV1 NVENC |
+| Deployment | FileFlows DockerMod | Tdarr Local Flow + custom FFmpeg |
+| Operates on | Single sample | Multiple samples + holdout |
 
-- one tool for many file types, not only media-library transcodes;
-- a visual FFmpeg command builder with broad stream-copy/transcode handling;
-- scriptable custom logic without Tdarr's local plugin packaging model;
-- workflows that move, rename, notify, or process non-video files alongside video files.
-
-## When this Tdarr workflow is the better fit
-
-This workflow is the better fit if the goal is specifically:
-
-- AV1 NVENC transcoding for media libraries;
-- VMAF/CAMBI-guided CQ selection;
-- adaptive retries rather than static CQ/bitrate choices;
-- learned priors that reduce future sample sweeps;
-- documented FFmpeg/libvmaf runtime compatibility;
-- drop-in Tdarr local-flow behavior.
-
-## Bottom line
-
-FileFlows provides excellent general-purpose media-flow primitives. This project provides a specialized adaptive quality optimizer.
-
-A FileFlows implementation could be built, and the FileFlows scripting model is flexible enough to host it. But the novel part of this repository is not the existence of a flow graph or FFmpeg command builder; it is the **adaptive measurement-and-selection policy** layered around FFmpeg: candidate sweeps, VMAF/CAMBI scoring, tail-risk guards, output-size guards, holdout validation, retry, and learning.
+ab-av1 is the closest thing in the FileFlows ecosystem to what this project does — and the comparison is useful because it clarifies exactly where this project's multi-guard policy goes further than a single VMAF mean + size cap.

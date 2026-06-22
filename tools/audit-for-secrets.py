@@ -22,6 +22,8 @@ ALLOW_SNIPPETS = [
     "path.extname(holdout.path || '') || '.mkv'", # generic extension fallback, not a real media title
     "('msys-user-path', re.compile", # this audit tool's own pattern definition
     "('explicit-seb', re.compile", # this audit tool's own pattern definition
+    "input.mkv", # FileFlows comparison doc: example ab-av1 command
+    "input_file.mkv", # FileFlows comparison doc: example ab-av1 command
 ]
 
 def should_skip(path: Path):
