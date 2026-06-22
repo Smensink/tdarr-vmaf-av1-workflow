@@ -1,151 +1,131 @@
 # Tdarr VMAF AV1 Workflow
 
-A Tdarr local-flow workflow for AV1 NVENC transcoding with VMAF/CAMBI-guided CQ selection, adaptive sample extraction, learned CQ priors, output-size guards, and holdout validation.
+**GitHub description:** Tdarr AV1 NVENC workflow with a matching FFmpeg/libvmaf container, VMAF/CAMBI-guided CQ sweeps, adaptive quality guards, holdout validation, and learned CQ priors.
 
-This repository is a **clean public export** of a custom workflow. It is meant to be a reproducible starting point, not a dump of someone else's Tdarr install. Private Tdarr state is intentionally excluded: databases, logs, job reports, media paths, raw learning rows, API keys, and cache/work directories.
+This project is a Tdarr workflow for people who want **measured, per-title AV1 quality decisions** instead of a fixed CRF/CQ preset. It extends the usual Tdarr pattern of "if file matches rules, run one transcode command" into a quality-search pipeline:
 
-## Who this is for
+1. inspect the source file
+2. extract representative samples
+3. encode those samples at several candidate CQ values
+4. score each candidate against the source with Netflix VMAF and CAMBI-style banding signals
+5. reject candidates that are too small, too low-quality, or risky on a holdout sample
+6. transcode the full file using the selected parameters
+7. record the result so future files start with better CQ guesses
 
-This project is useful if you want to:
+The recommended path is to use the **provided container image/build assets for FFmpeg and libvmaf** rather than a stock Tdarr image with whatever FFmpeg happens to be present. The plugins expect a specific capability set: AV1 NVENC, NVIDIA decode support, libvmaf, VMAF model support, and libvmaf feature support for CAMBI-style banding checks. Using the provided image/build keeps those pieces aligned.
 
-- run AV1 NVENC transcodes through Tdarr
-- choose CQ values from measured VMAF/CAMBI outcomes instead of fixed presets
-- avoid obvious over-compression with BPP/bitrate/source-ratio guards
-- warm-start learning from aggregate priors without importing someone else's raw media history
-- inspect or adapt a complex VMAF-based Tdarr flow
+## What is different from a usual Tdarr install?
 
-It is **not** a one-click generic Tdarr replacement. You still need a working Tdarr deployment, NVIDIA GPU support, media mounts, and a compatible FFmpeg/libvmaf build.
+A typical Tdarr flow usually applies static rules: check codec/size/path, then run a predetermined transcode preset. That works, but it cannot know whether CQ 31, 35, or 39 is enough for a specific film or episode.
 
-## What is included
+This workflow adds a feedback loop:
 
-- `plugins/vmaf/` — Tdarr local flow plugin source
-- `flow/tdarr-flow-vmaf-av1.json` — exported Tdarr flow JSON
-- `docker/` — example compose file, init hooks, Dockerfile, and FFmpeg/libvmaf build recipe
-- `data/seed/` — aggregate-only warm-start priors
-- `tools/` — sanitizer, privacy audit, install helper, and validation script
-- `docs/` — architecture, installation notes, quality policy, privacy notes, release checklist, and troubleshooting
+| Usual Tdarr flow | This workflow |
+|---|---|
+| One preset per rule/library | Per-file CQ search |
+| Trusts encoder settings | Measures sample output against source |
+| Usually checks size/codec after transcode | Predicts output size before final transcode |
+| No objective quality feedback | Uses VMAF, CAMBI, 1%-low frame quality, and holdout validation |
+| No memory between files | Learns CQ priors from completed runs |
+| Any FFmpeg build might be used | Expects the provided FFmpeg/libvmaf capability set |
 
-## What is intentionally excluded
+## Why VMAF and CAMBI?
 
-- Tdarr databases and backups
-- raw `vmaf_results.csv` / `vmaf_cq_learning.csv` rows
-- job reports and application logs
-- media paths, filenames, titles, release groups, Plex/TMDB/TVDB IDs
-- API keys, tokens, `.env` files, and host-specific config
-- built FFmpeg/CUDA/libvmaf binaries and runtime cache files
+[VMAF](https://github.com/Netflix/vmaf) is Netflix's perceptual video quality metric. It combines multiple lower-level image features into a score that better tracks human perception than simple metrics like PSNR. Netflix originally described this direction in [Toward a Practical Perceptual Video Quality Metric](https://netflixtechblog.com/toward-a-practical-perceptual-video-quality-metric-653f208b9652).
 
-## Requirements
+VMAF is useful, but a high average VMAF can still miss specific failure modes. Banding is one of them: smooth gradients can become visibly stair-stepped even when the overall VMAF score looks acceptable. Netflix introduced [CAMBI](https://netflixtechblog.com/cambi-a-new-video-quality-metric-for-hdr-1ba3aefc0f44), a banding-focused metric, to help detect that kind of artifact.
 
-Expected runtime shape:
+This workflow uses those ideas practically inside Tdarr: VMAF estimates perceptual quality, CAMBI helps flag banding risk, and extra guards prevent the encoder from choosing an output that is statistically good but visually suspicious.
 
-- Tdarr with Local Flow Plugins
-- NVIDIA GPU with NVENC/CUVID support
-- Docker with NVIDIA GPU passthrough, if using the example compose file
-- custom FFmpeg exposing the filters/encoders used by the flow:
-  - `libvmaf`
-  - optionally `libvmaf_cuda`
-  - `av1_nvenc`, `hevc_nvenc`, `h264_nvenc`
-- Node.js available locally if you want to run plugin syntax checks
-- Python 3.10+ for the sanitizer/audit tools
+## How the project is organized
 
-See [Installation](docs/installation.md) for the full setup path.
+- `docker/` — compose example, Dockerfile, init hooks, and FFmpeg/libvmaf build recipe
+- `plugins/vmaf/` — Tdarr Local Flow Plugins used by the workflow
+- `flow/tdarr-flow-vmaf-av1.json` — importable Tdarr flow
+- `data/seed/` — aggregate warm-start CQ priors
+- `tools/` — install, validation, and data-sanitization helpers
+- `docs/` — detailed architecture, plugin reference, quality policy, and troubleshooting
 
-## Quick start
+## Recommended installation path
+
+Use the provided FFmpeg/libvmaf image/build path first. The workflow is designed around that environment; a stock Tdarr FFmpeg build is unlikely to expose everything the plugins expect.
+
+1. Clone the repo.
+2. Use the provided image/build assets in `docker/`.
+3. Start Tdarr with NVIDIA GPU passthrough.
+4. Install the local plugins.
+5. Import the flow.
+6. Validate the running container.
 
 ```bash
 git clone https://github.com/Smensink/tdarr-vmaf-av1-workflow.git
 cd tdarr-vmaf-av1-workflow
 
-# Check the public export for obvious private data before changing/publishing it.
-python3 tools/audit-for-secrets.py .
-
-# Check plugin syntax.
+# Validate the checked-out plugin source.
 for f in plugins/vmaf/*/1.0.0/index.js; do node --check "$f" || exit 1; done
-```
 
-Then:
-
-1. Review `docker/docker-compose.example.yml` and add your own media-library mounts.
-2. Build or mount a compatible FFmpeg/libvmaf install.
-3. Start Tdarr.
-4. Install/copy the local plugins.
-5. Import `flow/tdarr-flow-vmaf-av1.json` in the Tdarr UI.
-6. Review every plugin input in the Tdarr UI before processing real media.
-7. Validate the running container:
-
-```bash
+# After Tdarr is running:
+bash tools/install-local-plugins.sh tdarr
 bash tools/validate-install.sh tdarr
 ```
 
-## Installing the local plugins
+See [Installation](docs/installation.md) for the full setup path.
 
-For an already-running Tdarr container named `tdarr`, you can copy the exported plugins into both Tdarr local-plugin runtime locations:
+## Flow overview
 
-```bash
-bash tools/install-local-plugins.sh tdarr
-```
-
-The script restarts the container after copying. If you install manually, copy each plugin to both the server and node local-flow plugin roots; otherwise the UI and worker can disagree about which code is running.
-
-## Importing the flow
-
-Import:
+At a high level:
 
 ```text
-flow/tdarr-flow-vmaf-av1.json
+preflight checks
+  → optional metadata lookup
+  → HDR / stream metadata detection
+  → representative sample extraction
+  → candidate AV1 NVENC sample encodes
+  → VMAF/CAMBI scoring
+  → CQ range expansion if the target is not bracketed
+  → candidate selection with quality and size guards
+  → holdout validation
+  → final AV1 NVENC transcode
+  → result export and CQ learning
+  → cleanup
 ```
 
-Known import caveat: the exported flow references a `checkFileAge` local plugin that was not found in the exported VMAF plugin tree. After import, either provide your own `checkFileAge` plugin or remove/replace that node in the Tdarr UI.
+Each plugin's exact role is documented in [Plugin reference](docs/plugin-reference.md).
 
-`fetchMediaMetadata` supports optional Plex/TMDB/TVDB lookups. Leave those inputs blank if you do not want metadata API calls. If you do use them, enter your own local endpoint/API keys in the Tdarr UI; none are included here.
+## Quality decision summary
 
-## Learning data and privacy
+The final CQ is not chosen from VMAF mean alone. A candidate must survive several layers:
 
-The files in `data/seed/` are aggregate priors only. They do **not** include raw rows, titles, paths, timestamps, release groups, or API identifiers.
+- mean/harmonic VMAF target
+- 1%-low frame VMAF floor
+- projected BPP, bitrate, and output/source-size ratio
+- CAMBI/banding threshold where available
+- holdout sample validation
+- retry logic if every candidate is too risky
 
-To generate your own seed files from private local data:
+See [Quality policy](docs/quality-policy.md) for the decision model.
 
-```bash
-python3 tools/sanitize-learning-data.py \
-  --learning-csv /path/to/vmaf_cq_learning.csv \
-  --ema-json /path/to/ema_cq_state.json \
-  --out-dir data/seed
-```
+## Learning and warm starts
 
-The sanitizer is allowlist-based: only broad buckets and rounded summary statistics are emitted.
+The workflow writes learning data after successful runs. Future files use that history to start with a better CQ bracket instead of cold-starting from the same wide range every time.
 
-## Important licensing note
-
-The included FFmpeg build recipe can enable GPL/nonfree options for CUDA/NVENC workflows. A locally built image may be fine for personal use, but **prebuilt binary/image redistribution may not be**. Treat this repository as a source/build recipe unless you have independently checked the exact license implications of your FFmpeg configuration.
+`data/seed/` contains aggregate warm-start priors. They are intentionally broad summaries, not raw transcode history. The seed priors help new installs avoid a completely blank model; your own local learning data should gradually become more important.
 
 ## Documentation
 
 - [Installation](docs/installation.md)
+- [FFmpeg/libvmaf runtime](docs/runtime-image.md)
 - [Architecture](docs/architecture.md)
+- [Plugin reference](docs/plugin-reference.md)
 - [Quality policy](docs/quality-policy.md)
-- [Privacy and data handling](docs/privacy-and-data.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Release checklist](docs/release-checklist.md)
+- [Privacy and data handling](docs/privacy-and-data.md)
 
-## Repository layout
+## Known caveat
 
-```text
-docker/     container recipe, compose example, init hooks, FFmpeg build script
-plugins/    Tdarr LocalFlowPlugins/vmaf plugin source
-flow/       Tdarr flow JSON export
-data/seed/  aggregate-only warm-start priors
-tools/      sanitizer, privacy audit, install validation
-docs/       installation, architecture, policy, privacy, troubleshooting
-```
+The exported flow references a `checkFileAge` local plugin that is not included in this repository. After import, either provide your own age-gate plugin or remove/replace that node. The rest of the VMAF/AV1 workflow is included.
 
-## Current status
+## Licensing note
 
-This repo has been validated against the original local Tdarr container with:
-
-```bash
-python3 tools/audit-for-secrets.py .
-for f in plugins/vmaf/*/1.0.0/index.js; do node --check "$f" || exit 1; done
-bash tools/validate-install.sh tdarr
-```
-
-Your own FFmpeg build, GPU, Tdarr version, flow import, and media paths still need local validation.
+The FFmpeg/libvmaf build path can involve GPL and nonfree FFmpeg configuration flags for NVIDIA workflows. Use the provided image/build assets for operational compatibility, but do your own licensing review before redistributing any prebuilt binary image.

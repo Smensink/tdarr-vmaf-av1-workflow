@@ -12,6 +12,8 @@ If this fails, fix syntax before copying plugins into Tdarr. Tdarr's runtime err
 
 ## Validate a running Tdarr container
 
+The first troubleshooting step should be validating the FFmpeg/libvmaf runtime. If this fails, fix the image/build before debugging plugin policy.
+
 ```bash
 bash tools/validate-install.sh tdarr
 ```

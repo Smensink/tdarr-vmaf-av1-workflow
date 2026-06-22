@@ -1,30 +1,46 @@
 # Installation
 
-This repository provides the workflow, plugins, seed priors, and build/deploy helpers. It does not ship a private Tdarr database or a guaranteed-redistributable FFmpeg binary.
+The recommended installation path is to run this workflow with the **provided FFmpeg/libvmaf image or build recipe**. The plugins assume capabilities that are not present in many stock Tdarr/FFmpeg installs.
 
-## 1. Prepare Tdarr
+## Why the provided image/build matters
 
-Use either an existing Tdarr container or the example compose file:
+This is not just a set of Tdarr plugins. The plugins call FFmpeg in specific ways and expect support for:
+
+- AV1 hardware encoding via `av1_nvenc`
+- NVIDIA decode paths such as CUVID/NVDEC where available
+- `libvmaf`
+- optionally `libvmaf_cuda`
+- libvmaf model support
+- libvmaf `feature=` support for CAMBI-style banding checks
+- FFprobe/FFmpeg wrappers named the way Tdarr expects, especially `tdarr-ffmpeg` and `tdarr-ffprobe`
+
+If you run the flow against a random FFmpeg binary, failures will often appear deep inside Tdarr job reports. Using the provided image/build path makes the runtime match what the workflow expects.
+
+## 1. Clone the repository
 
 ```bash
-cp docker/docker-compose.example.yml docker-compose.yml
+git clone https://github.com/Smensink/tdarr-vmaf-av1-workflow.git
+cd tdarr-vmaf-av1-workflow
 ```
 
-Before starting it, edit `docker-compose.yml` and set:
+## 2. Choose runtime path
 
-- your timezone
-- `PUID` / `PGID`
-- media-library mounts
-- persistent paths for `server`, `configs`, `logs`, and `cache`
-- whether Tdarr auth should be enabled
+### Recommended: provided image/build path
 
-The example compose file keeps media mounts commented out on purpose. Do not expose an unauthenticated Tdarr UI to the public internet.
+Use the Docker assets under `docker/` so Tdarr, FFmpeg, libvmaf, and the init hooks are kept together.
 
-## 2. Provide compatible FFmpeg/libvmaf
+```text
+docker/docker-compose.example.yml
+docker/Dockerfile
+docker/build-ffmpeg-libvmaf.sh
+docker/custom-cont-init.d/
+```
 
-The flow expects an FFmpeg build with NVIDIA hardware encoding and VMAF support.
+If a prebuilt image is published for your platform, prefer that. Otherwise build locally from the provided recipe. Either way, validate the result with `tools/validate-install.sh` before processing real media.
 
-Minimum practical checks:
+### Advanced: bring your own FFmpeg
+
+Only do this if you can reproduce the expected FFmpeg/libvmaf capabilities yourself. At minimum, the following checks should pass inside the Tdarr container:
 
 ```bash
 tdarr-ffmpeg -hide_banner -filters 2>/dev/null | grep -iE 'libvmaf|vmaf'
@@ -32,15 +48,34 @@ tdarr-ffmpeg -hide_banner -encoders 2>/dev/null | grep -iE 'av1_nvenc|hevc_nvenc
 tdarr-ffmpeg -hide_banner -h filter=libvmaf 2>&1 | grep -i feature
 ```
 
-The build recipe is in:
+## 3. Configure Docker Compose
 
-```text
-docker/build-ffmpeg-libvmaf.sh
+Copy the example and edit it:
+
+```bash
+cp docker/docker-compose.example.yml docker-compose.yml
 ```
 
-It is a recipe for local builds. If your FFmpeg configure output includes `--enable-nonfree`, do not redistribute the resulting image/binary unless you have independently confirmed that redistribution is allowed.
+Set your own:
 
-## 3. Install local plugins
+- timezone
+- `PUID` / `PGID`
+- media-library mounts
+- persistent `server`, `configs`, `logs`, and `cache` paths
+- Tdarr auth setting
+- image tag or build target, depending on how you are using the provided image/build assets
+
+The example file keeps media mounts commented out on purpose. Do not expose an unauthenticated Tdarr UI to the public internet.
+
+## 4. Start Tdarr
+
+```bash
+docker compose up -d
+```
+
+Wait for the container to finish startup. The init hooks install FFmpeg wrappers and copy local plugin patches when configured.
+
+## 5. Install local plugins
 
 With a running Tdarr container named `tdarr`:
 
@@ -48,11 +83,18 @@ With a running Tdarr container named `tdarr`:
 bash tools/install-local-plugins.sh tdarr
 ```
 
-This copies each plugin under `plugins/vmaf/` into both local-flow plugin paths used by Tdarr's server and node, then restarts the container.
+This copies every plugin under `plugins/vmaf/` to both Tdarr runtime plugin roots and restarts the container.
 
-Why both paths matter: Tdarr can show plugins from the server path while the node executes its own cached/runtime copy. If only one path is updated, the UI and worker can silently disagree.
+Why both paths matter:
 
-## 4. Import the flow
+```text
+/app/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins/vmaf/...
+/app/Tdarr_Node/assets/app/plugins/FlowPlugins/LocalFlowPlugins/vmaf/...
+```
+
+The server/UI and node worker can otherwise disagree about which plugin code is current.
+
+## 6. Import the flow
 
 Import this file in the Tdarr UI:
 
@@ -63,14 +105,14 @@ flow/tdarr-flow-vmaf-av1.json
 After import:
 
 1. Open the flow in the UI.
-2. Review every plugin input.
-3. Add your own Plex/TMDB/TVDB credentials only if you want metadata lookup.
-4. Confirm output paths and codec policy match your library.
+2. Review each plugin input.
+3. Set metadata API inputs only if you want Plex/TMDB/TVDB lookup.
+4. Confirm output and library behavior for your setup.
 5. Resolve the `checkFileAge` caveat below.
 
-## 5. Resolve the `checkFileAge` caveat
+## 7. Resolve the `checkFileAge` caveat
 
-The exported flow references a local plugin named `checkFileAge`, but that plugin was not present in the exported VMAF plugin tree.
+The exported flow references a local plugin named `checkFileAge`, but that plugin is not included in this repository.
 
 Choose one:
 
@@ -78,9 +120,9 @@ Choose one:
 - remove that node from the flow
 - replace it with an equivalent Tdarr/community age gate
 
-If you remove it, newly downloaded files may be processed immediately. That may be fine, but it can race with downloads/imports if your media manager is still writing files.
+If you remove it, newly downloaded files may be processed immediately. That can race with imports/downloads if another application is still writing files.
 
-## 6. Validate the deployment
+## 8. Validate the deployment
 
 Run:
 
@@ -88,14 +130,26 @@ Run:
 bash tools/validate-install.sh tdarr
 ```
 
-This checks local plugin syntax, the running Tdarr container, FFmpeg/VMAF filters, NVENC encoders, and the presence of key runtime plugin files.
+The script checks:
 
-## 7. Start conservatively
+- local plugin JavaScript syntax
+- container availability
+- FFmpeg version and filters
+- VMAF/libvmaf support
+- NVENC encoders
+- key plugin runtime files
+
+## 9. Start conservatively
 
 Before pointing this at a whole library:
 
-1. Test on a small library or a few known files.
-2. Read job reports for VMAF/CAMBI output.
-3. Confirm output size and quality are acceptable.
-4. Confirm learning files are being updated in your own `configs/` directory.
-5. Only then scale concurrency.
+1. Test on a few known files.
+2. Read the Tdarr job reports.
+3. Confirm VMAF/CAMBI scores are being emitted.
+4. Confirm output size and quality are acceptable.
+5. Confirm learning files are being updated in your own `configs/` directory.
+6. Only then scale worker concurrency.
+
+## Binary/image licensing note
+
+The FFmpeg build path may use GPL/nonfree configuration flags for NVIDIA workflows. Use the provided image/build path for operational compatibility, but do a separate licensing review before redistributing a prebuilt image.

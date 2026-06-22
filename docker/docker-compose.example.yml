@@ -1,5 +1,9 @@
 services:
   tdarr:
+    # Recommended: use a project-provided runtime image for this workflow when one is
+    # available for your platform. The stock Tdarr image is shown as a fallback base
+    # for local builds/mounted FFmpeg artifacts, but arbitrary stock FFmpeg builds are
+    # not expected to satisfy the VMAF/CAMBI/NVENC checks.
     image: ghcr.io/haveagitgat/tdarr:latest
     container_name: tdarr
     restart: unless-stopped
