@@ -1,0 +1,437 @@
+{
+  "name": "VMAF Parameter Optimization",
+  "description": "VMAF-aware optimization workflow with intelligent retry logic. Includes codec check, file limits, HDR detection, Bayesian learning, live size monitoring, cleanup, and clear error messages for impossible scenarios. Public export: review plugin inputs after import and add local media/library settings in Tdarr.",
+  "tags": "video,vmaf,optimization,quality,learning,retry,hdr,cleanup",
+  "flowPlugins": [
+    {
+      "name": "Input File",
+      "sourceRepo": "Community",
+      "pluginName": "inputFile",
+      "version": "1.0.0",
+      "id": "input1",
+      "position": {
+        "x": 400,
+        "y": 100
+      }
+    },
+    {
+      "name": "Check File Age",
+      "sourceRepo": "Local",
+      "pluginName": "checkFileAge",
+      "version": "1.0.0",
+      "id": "agecheck1",
+      "position": {
+        "x": 400,
+        "y": 200
+      }
+    },
+    {
+      "name": "Check Video Codec",
+      "sourceRepo": "Local",
+      "pluginName": "checkVideoCodec",
+      "version": "1.0.0",
+      "id": "codec1",
+      "position": {
+        "x": 400,
+        "y": 250
+      }
+    },
+    {
+      "name": "Check File Limits",
+      "sourceRepo": "Local",
+      "pluginName": "checkFileLimits",
+      "version": "1.0.0",
+      "id": "limits1",
+      "position": {
+        "x": 400,
+        "y": 280
+      }
+    },
+    {
+      "name": "Detect GPU Encoder",
+      "sourceRepo": "Local",
+      "pluginName": "detectGPUEncoder",
+      "version": "1.0.0",
+      "id": "gpu1",
+      "position": {
+        "x": 400,
+        "y": 300
+      }
+    },
+    {
+      "name": "Check HDR Content",
+      "sourceRepo": "Local",
+      "pluginName": "checkHdrContent",
+      "version": "1.0.0",
+      "id": "hdr1",
+      "position": {
+        "x": 400,
+        "y": 350
+      }
+    },
+    {
+      "name": "Extract Video Samples",
+      "sourceRepo": "Local",
+      "pluginName": "extractVideoSamples",
+      "version": "1.0.0",
+      "id": "extract1",
+      "position": {
+        "x": 400,
+        "y": 400
+      }
+    },
+    {
+      "name": "Test Encoding Parameters",
+      "sourceRepo": "Local",
+      "pluginName": "testEncodingParameters",
+      "version": "1.0.0",
+      "id": "test1",
+      "position": {
+        "x": 400,
+        "y": 500
+      }
+    },
+    {
+      "name": "Calculate VMAF",
+      "sourceRepo": "Local",
+      "pluginName": "calculateVMAF",
+      "version": "1.0.0",
+      "id": "vmaf1",
+      "position": {
+        "x": 400,
+        "y": 600
+      }
+    },
+    {
+      "name": "Select Best Parameters",
+      "sourceRepo": "Local",
+      "pluginName": "selectBestParameters",
+      "version": "1.0.0",
+      "id": "select1",
+      "position": {
+        "x": 400,
+        "y": 700
+      }
+    },
+    {
+      "name": "Check CQ Range Retry",
+      "sourceRepo": "Local",
+      "pluginName": "checkCQRangeRetry",
+      "version": "1.0.0",
+      "id": "retry1",
+      "position": {
+        "x": 400,
+        "y": 750
+      }
+    },
+    {
+      "name": "Learn CQ Range",
+      "sourceRepo": "Local",
+      "pluginName": "learnCQRange",
+      "version": "1.0.0",
+      "id": "learn1",
+      "position": {
+        "x": 400,
+        "y": 800
+      }
+    },
+    {
+      "name": "Export VMAF Results to CSV",
+      "sourceRepo": "Local",
+      "pluginName": "exportVMAFResults",
+      "version": "1.0.0",
+      "id": "export1",
+      "position": {
+        "x": 400,
+        "y": 850
+      }
+    },
+    {
+      "name": "Compare File Size Ratio Live",
+      "sourceRepo": "Community",
+      "pluginName": "compareFileSizeRatioLive",
+      "version": "1.0.0",
+      "id": "sizeCheck1",
+      "position": {
+        "x": 400,
+        "y": 900
+      }
+    },
+    {
+      "name": "VMAF Optimized Transcode",
+      "sourceRepo": "Local",
+      "pluginName": "vmafOptimizedTranscode",
+      "version": "1.0.0",
+      "id": "transcode1",
+      "position": {
+        "x": 400,
+        "y": 950
+      }
+    },
+    {
+      "name": "Monitor Transcode Retry",
+      "sourceRepo": "Local",
+      "pluginName": "monitorTranscodeRetry",
+      "version": "1.0.0",
+      "id": "monitorRetry1",
+      "position": {
+        "x": 400,
+        "y": 1000
+      }
+    },
+    {
+      "name": "Replace Original File",
+      "sourceRepo": "Community",
+      "pluginName": "replaceOriginalFile",
+      "version": "1.0.0",
+      "id": "replace1",
+      "position": {
+        "x": 400,
+        "y": 1050
+      }
+    },
+    {
+      "name": "Cleanup Temporary Files",
+      "sourceRepo": "Local",
+      "pluginName": "cleanupTempFiles",
+      "version": "1.0.0",
+      "id": "cleanup1",
+      "position": {
+        "x": 400,
+        "y": 1100
+      }
+    }
+  ],
+  "flowEdges": [
+    {
+      "source": "input1",
+      "sourceHandle": "1",
+      "target": "agecheck1",
+      "targetHandle": null,
+      "id": "edge0"
+    },
+    {
+      "source": "agecheck1",
+      "sourceHandle": "1",
+      "target": "codec1",
+      "targetHandle": null,
+      "id": "edge0a"
+    },
+    {
+      "source": "codec1",
+      "sourceHandle": "1",
+      "target": "limits1",
+      "targetHandle": null,
+      "id": "edge0b",
+      "_comment": "File needs transcoding"
+    },
+    {
+      "source": "codec1",
+      "sourceHandle": "2",
+      "target": "replace1",
+      "targetHandle": null,
+      "id": "edge0c",
+      "_comment": "Already in target codec - skip processing"
+    },
+    {
+      "source": "limits1",
+      "sourceHandle": "1",
+      "target": "gpu1",
+      "targetHandle": null,
+      "id": "edge0d",
+      "_comment": "File within limits"
+    },
+    {
+      "source": "limits1",
+      "sourceHandle": "2",
+      "target": "replace1",
+      "targetHandle": null,
+      "id": "edge0e",
+      "_comment": "File exceeds limits - skip processing"
+    },
+    {
+      "source": "gpu1",
+      "sourceHandle": "1",
+      "target": "hdr1",
+      "targetHandle": null,
+      "id": "edge2",
+      "_comment": "GPU encoder detected"
+    },
+    {
+      "source": "gpu1",
+      "sourceHandle": "2",
+      "target": "replace1",
+      "targetHandle": null,
+      "id": "edge2b",
+      "_comment": "CRITICAL FIX #3/#19: GPU not found - fail immediately to avoid wasting time"
+    },
+    {
+      "source": "hdr1",
+      "sourceHandle": "1",
+      "target": "extract1",
+      "targetHandle": null,
+      "id": "edge2c",
+      "_comment": "HDR content detected"
+    },
+    {
+      "source": "hdr1",
+      "sourceHandle": "2",
+      "target": "extract1",
+      "targetHandle": null,
+      "id": "edge2d",
+      "_comment": "SDR content detected"
+    },
+    {
+      "source": "extract1",
+      "sourceHandle": "1",
+      "target": "test1",
+      "targetHandle": null,
+      "id": "edge3"
+    },
+    {
+      "source": "test1",
+      "sourceHandle": "1",
+      "target": "vmaf1",
+      "targetHandle": null,
+      "id": "edge4"
+    },
+    {
+      "source": "vmaf1",
+      "sourceHandle": "1",
+      "target": "select1",
+      "targetHandle": null,
+      "id": "edge5"
+    },
+    {
+      "source": "select1",
+      "sourceHandle": "1",
+      "target": "retry1",
+      "targetHandle": null,
+      "id": "edge6"
+    },
+    {
+      "source": "select1",
+      "sourceHandle": "2",
+      "target": "retry1",
+      "targetHandle": null,
+      "id": "edge6a"
+    },
+    {
+      "source": "retry1",
+      "sourceHandle": "1",
+      "target": "test1",
+      "targetHandle": null,
+      "id": "edge6b",
+      "_comment": "Retry with adjusted CQ range"
+    },
+    {
+      "source": "retry1",
+      "sourceHandle": "2",
+      "target": "learn1",
+      "targetHandle": null,
+      "id": "edge6c",
+      "_comment": "Continue (success or max retries)"
+    },
+    {
+      "source": "learn1",
+      "sourceHandle": "1",
+      "target": "export1",
+      "targetHandle": null,
+      "id": "edge6d",
+      "_comment": "Learning completed"
+    },
+    {
+      "source": "learn1",
+      "sourceHandle": "2",
+      "target": "export1",
+      "targetHandle": null,
+      "id": "edge6e",
+      "_comment": "Learning disabled or insufficient data - still export results"
+    },
+    {
+      "source": "export1",
+      "sourceHandle": "1",
+      "target": "sizeCheck1",
+      "targetHandle": null,
+      "id": "edge7"
+    },
+    {
+      "source": "sizeCheck1",
+      "sourceHandle": "1",
+      "target": "transcode1",
+      "targetHandle": null,
+      "id": "edge7a",
+      "_comment": "Proceed to transcode"
+    },
+    {
+      "source": "sizeCheck1",
+      "sourceHandle": "2",
+      "target": "transcode1",
+      "targetHandle": null,
+      "id": "edge7a2",
+      "_comment": "Size check output 2 - also proceed to transcode (live monitoring will handle)"
+    },
+    {
+      "source": "transcode1",
+      "sourceHandle": "1",
+      "target": "monitorRetry1",
+      "targetHandle": null,
+      "id": "edge7b"
+    },
+    {
+      "source": "transcode1",
+      "sourceHandle": "2",
+      "target": "monitorRetry1",
+      "targetHandle": null,
+      "id": "edge7c"
+    },
+    {
+      "source": "monitorRetry1",
+      "sourceHandle": "1",
+      "target": "transcode1",
+      "targetHandle": null,
+      "id": "edge7d",
+      "_comment": "Retry transcode with higher CQ"
+    },
+    {
+      "source": "monitorRetry1",
+      "sourceHandle": "2",
+      "target": "replace1",
+      "targetHandle": null,
+      "id": "edge8",
+      "_comment": "Success - replace original"
+    },
+    {
+      "source": "monitorRetry1",
+      "sourceHandle": "3",
+      "target": "retry1",
+      "targetHandle": null,
+      "id": "edge8b",
+      "_comment": "Trigger sweep retry at higher CQ range"
+    },
+    {
+      "source": "replace1",
+      "sourceHandle": "1",
+      "target": "cleanup1",
+      "targetHandle": null,
+      "id": "edge9",
+      "_comment": "MEDIUM FIX #6: Cleanup temp files after successful processing"
+    },
+    {
+      "source": "codec1",
+      "sourceHandle": "2",
+      "target": "cleanup1",
+      "targetHandle": null,
+      "id": "edge9a",
+      "_comment": "Cleanup even if skipping (no temp files, but ensures flow completes)"
+    },
+    {
+      "source": "limits1",
+      "sourceHandle": "2",
+      "target": "cleanup1",
+      "targetHandle": null,
+      "id": "edge9b",
+      "_comment": "Cleanup even if skipping"
+    }
+  ]
+}

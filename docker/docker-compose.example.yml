@@ -1,0 +1,44 @@
+services:
+  tdarr:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: tdarr
+    restart: unless-stopped
+    ports:
+      - "8265:8265"   # Web UI; bind to 127.0.0.1 or reverse proxy securely if exposed
+      - "8266:8266"   # Server API
+    environment:
+      serverIP: "0.0.0.0"
+      serverPort: "8266"
+      webUIPort: "8265"
+      internalNode: "true"
+      inContainer: "true"
+      ffmpegVersion: ""
+      nodeName: "vmaf-node"
+      auth: "true"
+      openBrowser: "false"
+      maxLogSizeMB: "10"
+      TZ: "Etc/UTC"
+      PUID: "1000"
+      PGID: "1000"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      enableDockerAutoUpdater: "false"
+      LD_LIBRARY_PATH: "/usr/local/ffmpeg-custom/lib:/usr/local/lib:/usr/lib/x86_64-linux-gnu"
+    gpus: all
+    volumes:
+      - "./server:/app/server"
+      - "./configs:/app/configs"
+      - "./logs:/app/logs"
+      - "./cache:/temp"
+      - "./custom-ffmpeg:/usr/local/ffmpeg-custom"
+      - "./custom-libvmaf-lib:/custom-libvmaf-lib"
+      - "./custom-libvmaf-include:/usr/local/include/libvmaf"
+      - "./custom-libvmaf-pkgconfig:/custom-libvmaf-pkgconfig"
+      - "./custom-cuda:/usr/local/cuda"
+      - "./docker/custom-cont-init.d:/custom-cont-init.d:ro"
+      - "./docker:/usr/local/build-scripts:ro"
+      - "./build-workspace:/tmp/ffmpeg-build"
+      - "./custom-vmaf-models:/usr/local/share/model"
+      # Add your own media library mounts, for example:
+      # - "/srv/media/tv:/media/tv:ro"
+      # - "/srv/media/movies:/media/movies:ro"

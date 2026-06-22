@@ -1,0 +1,16 @@
+--- a/libvmaf/src/meson.build
++++ b/libvmaf/src/meson.build
+@@ -XXX,XX +XXX,XX @@
+         t = custom_target('cu_ptx_target_' + name,
+             build_by_default: true,
+             output : ['@0@.ptx'.format(name)],
+             input : _cu,
+-            command : [nvcc_exe, '--ptx', '@INPUT@', '-o', '@OUTPUT@' ,
++            command : [nvcc_exe, '--ptx', '-arch=compute_120', '@INPUT@', '-o', '@OUTPUT@' ,
+                 '-I', './src',
+                 '-I', '../src',
+                 '-I', '../include',
+                 '-I', '../src/feature',
+                 '-I', '../src/' + cuda_dir,
+             ]
+         )

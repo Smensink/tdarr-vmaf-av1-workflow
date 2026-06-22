@@ -1,0 +1,42 @@
+{
+  "schema": "tdarr-vmaf-av1-seed-priors/v1",
+  "privacy": "Aggregate-only warm-start priors. No file paths, filenames, titles, release groups, exact timestamps, API identifiers, or raw rows are included.",
+  "generated_at_utc": "2026-06-22T22:39:36Z",
+  "minimum_bucket_samples": 3,
+  "buckets": [
+    {
+      "resolution_tier": "1080p",
+      "source_codec": "h264",
+      "source_type": "bluray/remux",
+      "content_class": "live",
+      "samples": 3,
+      "selected_cq_p25": 20.5,
+      "selected_cq_p50": 23.0,
+      "selected_cq_p75": 25.5,
+      "selected_vmaf_p50": 96.49,
+      "selected_ssim_p50": 97.98,
+      "selected_cambi_p50": 1.307,
+      "output_bpp_p50": 0.32495,
+      "output_ratio_pct_p50": 56.66,
+      "source_bpp_p50": 0.55469,
+      "adaptive_frame_floor_p50": 84.8
+    },
+    {
+      "resolution_tier": "4k",
+      "source_codec": "hevc",
+      "source_type": "web",
+      "content_class": "live",
+      "samples": 18,
+      "selected_cq_p25": 26.0,
+      "selected_cq_p50": 28.5,
+      "selected_cq_p75": 32.8,
+      "selected_vmaf_p50": 96.42,
+      "selected_ssim_p50": 99.30348,
+      "selected_cambi_p50": 1.088,
+      "output_bpp_p50": 0.05071,
+      "output_ratio_pct_p50": 41.84,
+      "source_bpp_p50": 0.10539,
+      "adaptive_frame_floor_p50": 86.0
+    }
+  ]
+}

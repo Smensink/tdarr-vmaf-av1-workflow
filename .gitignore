@@ -1,0 +1,37 @@
+# Runtime / private Tdarr state
+server/
+configs/*.csv
+configs/*.json
+logs/
+cache/
+backups/
+upgrade-backups/
+build-workspace/
+custom-ffmpeg/
+custom-cuda/
+custom-libvmaf-*/
+custom-vmaf-models/
+
+# Media/work products
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.ts
+*.jsonl
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.bak*
+
+# Local raw/private data drop zone
+data/private/
+
+# Tooling
+__pycache__/
+*.pyc
+node_modules/
+.env
+.env.*

@@ -1,0 +1,122 @@
+{
+  "exported_at_utc": "2026-06-22T22:38:33Z",
+  "source": "local clean-room export from allowlisted Tdarr VMAF workflow files",
+  "excluded": [
+    "raw configs",
+    "server DB",
+    "job reports",
+    "logs",
+    "cache/workdirs",
+    "raw learning CSV rows",
+    "media paths",
+    "backup trees",
+    "stale duplicate learnCQRanges plugin"
+  ],
+  "plugins": [
+    {
+      "name": "calculateVMAF",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/calculateVMAF/1.0.0/index.js"
+    },
+    {
+      "name": "checkCQBracket",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/checkCQBracket/1.0.0/index.js"
+    },
+    {
+      "name": "checkCQRangeRetry",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/checkCQRangeRetry/1.0.0/index.js"
+    },
+    {
+      "name": "checkHdrContent",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/checkHdrContent/1.0.0/index.js"
+    },
+    {
+      "name": "exportVMAFResults",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/exportVMAFResults/1.0.0/index.js"
+    },
+    {
+      "name": "extractVideoSamples",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/extractVideoSamples/1.0.0/index.js"
+    },
+    {
+      "name": "learnCQRange",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/learnCQRange/1.0.0/index.js"
+    },
+    {
+      "name": "selectBestParameters",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/selectBestParameters/1.0.0/index.js"
+    },
+    {
+      "name": "testEncodingParameters",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/testEncodingParameters/1.0.0/index.js"
+    },
+    {
+      "name": "vmafOptimizedTranscode",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/vmafOptimizedTranscode/1.0.0/index.js"
+    },
+    {
+      "name": "checkFileLimits",
+      "version": "1.0.0",
+      "source": "tdarr-local-plugin-runtime-copy",
+      "path": "plugins/vmaf/checkFileLimits/1.0.0/index.js"
+    },
+    {
+      "name": "checkVideoCodec",
+      "version": "1.0.0",
+      "source": "tdarr-local-plugin-runtime-copy",
+      "path": "plugins/vmaf/checkVideoCodec/1.0.0/index.js"
+    },
+    {
+      "name": "cleanupTempFiles",
+      "version": "1.0.0",
+      "source": "tdarr-local-plugin-runtime-copy",
+      "path": "plugins/vmaf/cleanupTempFiles/1.0.0/index.js"
+    },
+    {
+      "name": "detectGPUEncoder",
+      "version": "1.0.0",
+      "source": "tdarr-local-plugin-runtime-copy",
+      "path": "plugins/vmaf/detectGPUEncoder/1.0.0/index.js"
+    },
+    {
+      "name": "detectSceneComplexity",
+      "version": "1.0.0",
+      "source": "tdarr-local-plugin-runtime-copy",
+      "path": "plugins/vmaf/detectSceneComplexity/1.0.0/index.js"
+    },
+    {
+      "name": "fetchMediaMetadata",
+      "version": "1.0.0",
+      "source": "tdarr-local-plugin-runtime-copy",
+      "path": "plugins/vmaf/fetchMediaMetadata/1.0.0/index.js"
+    },
+    {
+      "name": "monitorTranscodeRetry",
+      "version": "1.0.0",
+      "source": "tdarr-local-plugin-runtime-copy",
+      "path": "plugins/vmaf/monitorTranscodeRetry/1.0.0/index.js"
+    }
+  ],
+  "known_missing_or_external": [
+    "checkFileAge plugin referenced by the flow was not found under the local VMAF plugin tree; document/install separately or remove that node after import."
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema": "tdarr-vmaf-av1-ema-seed/v1",
+  "privacy": "Rounded CQ EMA by resolution tier only; no timestamp retained.",
+  "ema": {
+    "4K": 30.22,
+    "1080p": 34.23,
+    "720p": 35.57,
+    "1440p": 30.48,
+    "other": 35.86
+  },
+  "sampleCounts": {
+    "4K": 198,
+    "1080p": 1061,
+    "720p": 172,
+    "1440p": 122,
+    "other": 266
+  }
+}

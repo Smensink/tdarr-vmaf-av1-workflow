@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Tdarr VMAF AV1 aggregate CQ priors",
+  "type": "object",
+  "required": [
+    "schema",
+    "privacy",
+    "buckets"
+  ],
+  "properties": {
+    "schema": {
+      "const": "tdarr-vmaf-av1-seed-priors/v1"
+    },
+    "privacy": {
+      "type": "string"
+    },
+    "generated_at_utc": {
+      "type": "string"
+    },
+    "minimum_bucket_samples": {
+      "type": "integer"
+    },
+    "buckets": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}
