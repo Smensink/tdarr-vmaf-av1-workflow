@@ -118,6 +118,7 @@ The workflow writes learning data after successful runs. Future files use that h
 - [Architecture](docs/architecture.md)
 - [Plugin reference](docs/plugin-reference.md)
 - [Quality policy](docs/quality-policy.md)
+- [Adaptive Tdarr workflow vs FileFlows](docs/fileflows-comparison.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Release checklist](docs/release-checklist.md)
 - [Privacy and data handling](docs/privacy-and-data.md)
