@@ -146,7 +146,7 @@ Before pointing this at a whole library:
 2. Read the Tdarr job reports.
 3. Confirm VMAF/CAMBI scores are being emitted.
 4. Confirm output size and quality are acceptable.
-5. Confirm learning files are being updated in your own `configs/` directory.
+5. Confirm learning files are being updated in your own `configs/` directory. The SQLite database (`vmaf_training.db`) is created automatically on first use — no manual setup required. New installs start with zero history in SQLite; the `data/seed/` priors provide a fallback until enough jobs have been run locally.
 6. Only then scale worker concurrency.
 
 ## Binary/image licensing note
