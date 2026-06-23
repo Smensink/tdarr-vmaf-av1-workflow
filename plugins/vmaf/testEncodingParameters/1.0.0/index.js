@@ -185,7 +185,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
     var cqStep = Number(args.inputs.cqStep) || 2;
     var effectiveRangeWidth = cqRangeWidth;
     var effectiveStep = cqStep;
-
+    
     // ENHANCEMENT FIX #14: Input validation
     if (isNaN(cqStep) || cqStep <= 0) {
         args.jobLog('WARNING: Invalid cqStep (' + args.inputs.cqStep + '), using default 2');
@@ -267,29 +267,29 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
 
     args.variables.vmafCQStep = cqStep;
     args.variables.vmafCQStepEffective = effectiveStep;
-
+    
     var crfValuesStr = String(args.inputs.crfValues) || '24,26,28,30,32';
     var presetsStr = String(args.inputs.presets) || 'p7';
-
+    
     var targetMinVMAF = Number(args.inputs.targetMinVMAF);
     if (isNaN(targetMinVMAF) || targetMinVMAF < 0 || targetMinVMAF > 100) {
         args.jobLog('WARNING: Invalid targetMinVMAF (' + args.inputs.targetMinVMAF + '), using default 90');
         targetMinVMAF = 90;
     }
-
+    
     var targetSizeReduction = Number(args.inputs.targetSizeReduction);
     if (isNaN(targetSizeReduction) || targetSizeReduction < 0 || targetSizeReduction > 100) {
         args.jobLog('WARNING: Invalid targetSizeReduction (' + args.inputs.targetSizeReduction + '), using default 30');
         targetSizeReduction = 30;
     }
-
+    
     var cqRangeWidth = Number(args.inputs.cqRangeWidth);
     if (isNaN(cqRangeWidth) || cqRangeWidth <= 0) {
         args.jobLog('WARNING: Invalid cqRangeWidth (' + args.inputs.cqRangeWidth + '), using default 8');
         cqRangeWidth = 8;
         effectiveRangeWidth = 8;
     }
-
+    
     var samples = args.variables.vmafSamples || [];
     var targetCodec = args.variables.vmafTargetCodec || 'av1';
     var useGPU = args.variables.vmafUseGPU || false;
@@ -302,7 +302,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
     var hdrMasterDisplay = args.variables.hdr_master_display || '';
     var hdrMaxCll = args.variables.hdr_max_cll || '';
     var releaseGroup = args.variables.vmafReleaseGroup || '';
-
+    
     if (samples.length === 0) {
         args.jobLog('Error: No video samples found. Run Extract Video Samples first.');
         return {
@@ -311,25 +311,25 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             variables: args.variables,
         };
     }
-
+    
     var cacheDir = args.workDir || '/temp';
     var crfValues = [];
-
+    
     // Guided/override CQ selection (learning + retries)
     var overrideCQMin = args.variables.vmafOverrideCQMin;
     var overrideCQMax = args.variables.vmafOverrideCQMax;
     var guidedNext = Array.isArray(args.variables.vmafNextCQs) ? args.variables.vmafNextCQs : (args.variables.vmafNextCQ ? [args.variables.vmafNextCQ] : []);
     var isRetry = overrideCQMin !== undefined && overrideCQMax !== undefined;
-
+    
     if (isRetry || guidedNext.length > 0) {
         args.jobLog('=== Guided CQ Selection ===');
         if (isRetry) {
             args.jobLog('Override CQ range: ' + overrideCQMin + ' - ' + overrideCQMax);
         }
-
+        
         var testedCQs = args.variables.vmafTestedCQs || [];
         args.jobLog('Already tested CQ values: ' + (testedCQs.length > 0 ? testedCQs.slice().sort(function(a, b) { return a - b; }).join(', ') : 'none'));
-
+        
         var candidateList = guidedNext.slice(0, 6);
         if (candidateList.length === 0 && isRetry) {
             for (var cq = overrideCQMin; cq <= overrideCQMax; cq += effectiveStep) {
@@ -339,7 +339,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         if (isRetry) {
             candidateList = candidateList.filter(function(cqVal) { return cqVal >= overrideCQMin && cqVal <= overrideCQMax; });
         }
-
+        
         var seen = {};
         candidateList.forEach(function(cqVal) {
             if (testedCQs.indexOf(cqVal) === -1 && !seen[cqVal]) {
@@ -347,7 +347,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 seen[cqVal] = true;
             }
         });
-
+        
         if (crfValues.length < 2 && isRetry) {
             var padLow = Math.max(16, overrideCQMin - effectiveStep);
             var padHigh = Math.min(51, overrideCQMax + effectiveStep);
@@ -358,7 +358,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 }
             });
         }
-
+        
         if (crfValues.length === 0 && isRetry) {
             for (var cq4 = overrideCQMin; cq4 <= overrideCQMax; cq4 += effectiveStep) {
                 if (!seen[cq4]) {
@@ -366,25 +366,25 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 }
             }
         }
-
+        
         args.jobLog('CQ values to test (ordered): ' + crfValues.join(', '));
         args.jobLog('');
-
+        
         delete args.variables.vmafOverrideCQMin;
         delete args.variables.vmafOverrideCQMax;
         delete args.variables.vmafNextCQ;
         delete args.variables.vmafNextCQs;
-
+        
         args.variables.vmafDynamicCQ = true;
         if (isRetry) {
             args.variables.vmafCQRange = { min: overrideCQMin, max: overrideCQMax, width: overrideCQMax - overrideCQMin };
         }
     }
-
+    
 // Dynamic CQ range calculation
     else if (dynamicCQ) {
         args.jobLog('=== Dynamic CQ Range Calculation ===');
-
+        
         // Get source file characteristics
         var sourceBitrateMbps = 0;
         var sourceWidth = 1920;
@@ -392,15 +392,15 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         var sourceCodec = 'unknown';
         var sourceDuration = 0;
         var sourceFileSizeMB = args.inputFileObj.file_size || 0;
-
+        
         if (args.inputFileObj.ffProbeData) {
             var format = args.inputFileObj.ffProbeData.format || {};
             var streams = args.inputFileObj.ffProbeData.streams || [];
-
+            
             sourceDuration = parseFloat(format.duration) || 0;
             var sourceBitrate = parseFloat(format.bit_rate) || 0;
             sourceBitrateMbps = sourceBitrate / 1000000;
-
+            
             // Find video stream
             for (var i = 0; i < streams.length; i++) {
                 if (streams[i].codec_type === 'video') {
@@ -415,12 +415,12 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 }
             }
         }
-
+        
         // If bitrate not in metadata, calculate from file size and duration
         if (sourceBitrateMbps <= 0 && sourceDuration > 0 && sourceFileSizeMB > 0) {
             sourceBitrateMbps = (sourceFileSizeMB * 8) / sourceDuration;
         }
-
+        
         args.jobLog('Source file: ' + sourceFileSizeMB.toFixed(2) + ' MB');
         args.jobLog('Source codec: ' + sourceCodec);
         args.jobLog('Source resolution: ' + sourceWidth + 'x' + sourceHeight);
@@ -472,11 +472,11 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             baseCQ = Math.round(releaseGroupPrior.cq_statistics.median);
             args.jobLog('Using release group prior median CQ: ' + baseCQ);
         }
-
+        
         // Adjust for resolution (pixels per frame)
         var pixelCount = sourceWidth * sourceHeight;
         var pixelFactor = pixelCount / (1920 * 1080); // Normalize to 1080p
-
+        
         if (pixelFactor >= 4) {
             // 4K or higher - need lower CQ for quality
             baseCQ = 26;
@@ -493,16 +493,16 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             // 480p or lower
             baseCQ = 38;
         }
-
+        
         args.jobLog('Base CQ for ' + sourceWidth + 'x' + sourceHeight + ': ' + baseCQ);
-
+        
         // Adjust for source bitrate (bits per pixel per second)
         // Higher bitrate source = more room for compression = can use higher CQ
         var fps = 24; // Assume 24fps if not available
         var bitsPerPixel = (sourceBitrateMbps * 1000000) / (pixelCount * fps);
-
+        
         args.jobLog('Bits per pixel: ' + bitsPerPixel.toFixed(4));
-
+        
         // Typical H264 web content: 0.05-0.15 bpp
         // High quality source: 0.15-0.30 bpp
         // Very high quality/raw: 0.30+ bpp
@@ -527,6 +527,47 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             baseCQ += 2;
             args.jobLog('Source is high quality (bpp > 0.20) - increasing CQ by 2');
         }
+        
+        // 
+        // ── Source CAMBI prior: already-banded source → higher CQ is safe ──
+        // High source CAMBI means the reference has visible banding. VMAF can't reach
+        // as high on a banded reference, and the viewer won't notice additional compression
+        // on top of existing banding. This is complementary to BPP: BPP measures bitrate
+        // compression, CAMBI measures visible artifact load.
+        var sourceCAMBIPrior = args.variables.vmafSourceCAMBI;
+        var cambiCQModel = args.variables.vmafSourceCambiCQModel;
+        if (sourceCAMBIPrior !== null && sourceCAMBIPrior !== undefined) {
+            if (cambiCQModel && isFinite(cambiCQModel.slope) && cambiCQModel.support >= 8) {
+                // Data-driven: the learning data has enough banded-source rows to estimate how
+                // CQ shifts per unit of source banding. Clamp the current source CAMBI into the
+                // observed training range (no extrapolation), shift baseCQ relative to the
+                // mean-banding source, and cap to a sane band.
+                var clampedCambi = Math.max(cambiCQModel.cambiMin, Math.min(cambiCQModel.cambiMax, sourceCAMBIPrior));
+                var rawCambiDelta = cambiCQModel.slope * (clampedCambi - cambiCQModel.meanCambi);
+                var cambiDelta = Math.round(Math.max(-2, Math.min(5, rawCambiDelta)));
+                if (cambiDelta !== 0) {
+                    baseCQ += cambiDelta;
+                    args.jobLog('Source banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + '): learned model adjusts CQ by '
+                        + (cambiDelta > 0 ? '+' : '') + cambiDelta + ' (slope ' + cambiCQModel.slope.toFixed(3)
+                        + ' CQ/CAMBI vs mean ' + cambiCQModel.meanCambi.toFixed(2) + ', support ' + cambiCQModel.support + ' rows)');
+                } else {
+                    args.jobLog('Source banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + '): learned model adjustment ~0 (near training mean ' + cambiCQModel.meanCambi.toFixed(2) + ')');
+                }
+            } else {
+                // Cold-start fallback: fixed-step heuristic, used until enough banded-source
+                // rows accrue in the learning CSV for the slope model to take over.
+                if (sourceCAMBIPrior > 5.0) {
+                    baseCQ += 3;
+                    args.jobLog('Source has high banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + ') - increasing CQ by 3 (heuristic; source already visibly degraded)');
+                } else if (sourceCAMBIPrior > 3.0) {
+                    baseCQ += 2;
+                    args.jobLog('Source has moderate banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + ') - increasing CQ by 2 (heuristic)');
+                } else if (sourceCAMBIPrior > 1.0) {
+                    baseCQ += 1;
+                    args.jobLog('Source has mild banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + ') - increasing CQ by 1 (heuristic)');
+                }
+            }
+        }
 
         // Adjust for target size reduction
         // Higher target reduction = need higher CQ
@@ -537,7 +578,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             baseCQ -= 2;
             args.jobLog('Low target reduction (' + targetSizeReduction + '%) - reducing CQ by 2');
         }
-
+        
         // Adjust for VMAF target (monotonic: higher target -> lower CQ / higher quality).
         // Finer bands so the high-quality 94-96 region pulls CQ down more than the old 93
         // default did (old code gave the SAME -2 for 93 and 95, so raising the target never
@@ -559,7 +600,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             baseCQ += 2;
             args.jobLog('Low VMAF target (' + targetMinVMAF + ') - increasing CQ by 2');
         }
-
+        
         // Codec/tier/HDR awareness
         var codecCat = (sourceCodec || '').toLowerCase().indexOf('av1') !== -1 ? 'av1' :
                        ((sourceCodec || '').toLowerCase().indexOf('265') !== -1 || (sourceCodec || '').toLowerCase().indexOf('hevc') !== -1 ? 'hevc' :
@@ -569,13 +610,13 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         } else if (codecCat === 'h264') {
             baseCQ -= 1; // Needs more quality headroom
         }
-
+        
         if (isHDR) {
             baseCQ -= 2; // Protect highlights
         } else if (String(pixFmt || '').toLowerCase().indexOf('10') !== -1) {
             baseCQ -= 1; // Mild buffer for 10-bit
         }
-
+        
         // Release group profile-based adjustments
         var releaseGroupProfiles = null;
         try {
@@ -619,14 +660,14 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             args.jobLog('Release group: ' + releaseGroup + ' (no profile match, using heuristics)');
             args.variables.vmafReleaseGroupUsed = releaseGroup;
         }
-
+        
         // Genre/style based adjustments (after bitrate/resolution math)
         var mediaGenres = Array.isArray(args.variables.vmafMediaGenre) ? args.variables.vmafMediaGenre : [];
         var mediaGenresLower = mediaGenres.map(function(g) { return String(g).toLowerCase(); });
         var isAnimation = args.variables.vmafMediaIsAnimation === true || mediaGenresLower.indexOf('animation') !== -1 || mediaGenresLower.indexOf('anime') !== -1 || mediaGenresLower.indexOf('cartoon') !== -1;
         var mediaType = args.variables.vmafMediaType || 'unknown';
         var metadataSource = args.variables.vmafMediaMetadataSource || 'none';
-
+        
         var genreAdjustment = 0;
         var animationAdjustment = 0;
         if (isAnimation) {
@@ -640,13 +681,13 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 genreAdjustment = 2;
             }
         }
-
+        
         if (mediaType === 'movie') {
             genreAdjustment += 1; // movies usually higher quality sources
         } else if (mediaType === 'tv') {
             genreAdjustment += 0; // keep neutral for episodic TV
         }
-
+        
         var sourceConfidence = 0.5;
         if (metadataSource === 'plex') sourceConfidence = 1.0;
         else if (metadataSource === 'tmdb') sourceConfidence = 0.9;
@@ -654,7 +695,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         else if (metadataSource === 'none') sourceConfidence = 0.3;
         var genrePresenceConfidence = mediaGenresLower.length > 0 ? 1.0 : 0.4;
         var metadataConfidence = Math.max(0.3, Math.min(1.0, sourceConfidence * genrePresenceConfidence));
-
+        
         var totalGenreAdjustment = (genreAdjustment + animationAdjustment) * metadataConfidence;
         if (totalGenreAdjustment !== 0) {
             baseCQ += totalGenreAdjustment;
@@ -662,30 +703,30 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         }
         args.variables.vmafGenreCQAdjustment = genreAdjustment;
         args.variables.vmafAnimationCQAdjustment = animationAdjustment;
-
+        
         // Clamp baseCQ to valid range
         baseCQ = Math.max(16, Math.min(48, baseCQ));
-
+        
         // Adaptive range/step based on sample variance signal from extraction
         args.variables.vmafCQRangeWidthUsed = effectiveRangeWidth;
         args.variables.vmafCQStepUsed = effectiveStep;
-
+        
         // Generate CQ range centered around baseCQ (heuristic), with CI-based widening if noisy
         var heuristicCQMin = Math.max(16, baseCQ - Math.floor(effectiveRangeWidth / 2));
         var heuristicCQMax = Math.min(51, heuristicCQMin + effectiveRangeWidth);
-
+        
         // Ensure we don't go below 16 or above 51
         if (heuristicCQMax > 51) {
             heuristicCQMax = 51;
             heuristicCQMin = Math.max(16, heuristicCQMax - effectiveRangeWidth);
         }
-
+        
         // Check for learned CQ range from Bayesian learning; adjust span based on confidence/sampleCount
         var learnedCQRange = args.variables.vmafLearnedCQRange;
         var cqMin = heuristicCQMin;
         var cqMax = heuristicCQMax;
         var cqSource = 'heuristic';
-
+        
         // Analyze across-CQ slope/variance to adjust span/step
         if (aggregatedResults.length >= 2) {
             var cqPoints = aggregatedResults.filter(function(r) {
@@ -698,7 +739,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                     std: r.vmafStdDev || 0
                 };
             }).sort(function(a, b) { return a.cq - b.cq; });
-
+            
             var steep = false;
             for (var si = 0; si < cqPoints.length - 1; si++) {
                 var a = cqPoints[si];
@@ -776,7 +817,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 args.jobLog('Previous CQ noise low (' + previousNoise.toFixed(2) + '), tightening heuristic span to ' + heuristicCQMin + '-' + heuristicCQMax);
             }
         }
-
+        
         function adjustSpanWithConfidence(minVal, maxVal, confidence, sampleCount) {
             var span = maxVal - minVal;
             if (confidence >= 0.8 && sampleCount >= 15) {
@@ -795,7 +836,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             }
             return { min: newMin, max: newMax };
         }
-
+        
         if (learnedCQRange && learnedCQRange.min !== undefined && learnedCQRange.max !== undefined) {
             var learnedCQMin = learnedCQRange.min;
             var learnedCQMax = learnedCQRange.max;
@@ -803,7 +844,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             var minSamplesForLearning = 5; // Could be from plugin input, but using default for now
             var sampleWeight = Math.min(1, (learnedCQRange.sampleCount || 0) / 15);
             learningWeight = Math.min(1, Math.max(learningWeight, sampleWeight));
-
+            
             if (learnedCQRange.sampleCount >= minSamplesForLearning) {
                 // Blend learned range with heuristic, then adjust span by confidence/sampleCount
                 var blendedMin = Math.round(learningWeight * learnedCQMin + (1 - learningWeight) * heuristicCQMin);
@@ -812,7 +853,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 cqMin = adjusted.min;
                 cqMax = adjusted.max;
                 cqSource = 'blended (learned + heuristic, confidence-shaped span)';
-
+                
                 args.jobLog('');
                 args.jobLog('Learning Integration:');
                 args.jobLog('  Heuristic range: CQ ' + heuristicCQMin + '-' + heuristicCQMax);
@@ -826,7 +867,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             args.jobLog('');
             args.jobLog('No learned CQ range available - using heuristic only');
         }
-
+        
         // Historical per-CQ curve: the strongest prior when enough similar sweep points exist
         // (loaded by extractVideoSamples from vmaf_results.csv). Fit a monotonic non-increasing
         // VMAF-vs-CQ curve via PAVA and centre the sweep where it crosses the VMAF target.
@@ -967,7 +1008,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         }
 
         args.jobLog('');
-
+        
         // Store dynamic CQ info in variables for later analysis
         args.variables.vmafDynamicCQ = true;
         args.variables.vmafSourceBitrateMbps = sourceBitrateMbps;
@@ -980,7 +1021,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         args.jobLog('Using manual CQ values: ' + crfValues.join(', '));
         args.variables.vmafDynamicCQ = false;
     }
-
+    
     // Track tested CQ values to avoid retesting in retry loops
     if (!args.variables.vmafTestedCQs) {
         args.variables.vmafTestedCQs = [];
@@ -994,11 +1035,42 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
     args.variables.vmafTestedCQs.sort(function(a, b) { return a - b; });
     args.jobLog('Tracked tested CQ values: ' + args.variables.vmafTestedCQs.join(', '));
     args.jobLog('');
-
+    
     var presets = presetsStr.split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
     var testResults = [];
     var parameterSets = [];
     var encodeFailures = []; // CRITICAL FIX #2: Track encoding failures
+
+    // ── A/B SHADOW (Phase 3): log the new predictor's sweep-domain decision next to the live
+    // logic. No behaviour change - the live crfValues below are still what gets tested. Lets us
+    // compare predictCQCenter / selectSampleCount against the heuristic on real jobs first.
+    try {
+        var _vdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+        var _vp = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js');
+        var _db = _vdb.openDb();
+        var _streams = (args.inputFileObj && args.inputFileObj.ffProbeData && args.inputFileObj.ffProbeData.streams) || [];
+        var _vs = null; for (var _si = 0; _si < _streams.length; _si++) { if (_streams[_si].codec_type === 'video') { _vs = _streams[_si]; break; } }
+        var _w = (_vs && _vs.width) || (typeof sourceWidth !== 'undefined' ? sourceWidth : 0);
+        var _h = (_vs && _vs.height) || (typeof sourceHeight !== 'undefined' ? sourceHeight : 0);
+        var _tgt = (typeof targetMinVMAF !== 'undefined' && targetMinVMAF) || Number(args.inputs.targetMinVMAF) || Number(args.variables.vmafMinVMAF) || 95;
+        var _src = {
+            tier: _vdb.tierFor(_w, _h),
+            source_codec: (_vs && _vs.codec_name) || '',
+            bits_per_pixel: (typeof bitsPerPixel !== 'undefined' && isFinite(bitsPerPixel)) ? bitsPerPixel : null,
+            media_is_animation: args.variables.vmafMediaIsAnimation === true ? 1 : 0,
+            is_hdr: args.variables.isHDR ? 1 : 0
+        };
+        var _curves = _vdb.getSimilarSweepCurves(_db, _src, { limit: 20000 });
+        var _ctr = _vp.predictCQCenter(_curves, _src, { targetVmaf: _tgt }, { recencyHalfLifeDays: 0 });
+        var _sc = _vp.selectSampleCount(_curves, {});
+        args.jobLog('[SHADOW] predictCQCenter=' + (_ctr.centerCq != null ? _ctr.centerCq : 'n/a')
+            + (_ctr.sigmaCq != null ? ' +-' + _ctr.sigmaCq : '')
+            + ' (range ' + _ctr.rangeMin + '-' + _ctr.rangeMax + ', support ' + _ctr.support + ' jobs, tier ' + _src.tier + ')'
+            + ' | live initial crfValues=[' + crfValues.join(',') + ']'
+            + ' | sampleCount suggest=' + _sc.sampleCount + ' (sdEst=' + (_sc.sdEstimate != null ? _sc.sdEstimate.toFixed(2) : 'n/a') + ', ' + _sc.reason + ')');
+    } catch (_shErr) {
+        args.jobLog('[SHADOW] predictor shadow failed (non-fatal): ' + (_shErr && _shErr.message ? _shErr.message : String(_shErr)));
+    }
 
     // Generate parameter sets - all use 10-bit (p010le) format
     if (crfValues.length === 0) {
@@ -1006,7 +1078,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         args.jobLog('ERROR: ' + errorMsg);
         throw new Error(errorMsg);
     }
-
+    
     for (var pi = 0; pi < presets.length; pi++) {
         for (var ci = 0; ci < crfValues.length; ci++) {
             var preset = presets[pi];
@@ -1063,28 +1135,28 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
     var totalTests = parameterSets.length * samples.length;
     var completedTests = 0;
     args.jobLog('Testing ' + parameterSets.length + ' parameter sets on ' + samples.length + ' samples (' + totalTests + ' total encodes)...');
-
+    
     // Report initial progress to Tdarr
     if (args.updateWorker) {
         args.updateWorker({ percentage: 0 });
     }
-
+    
     for (var psi = 0; psi < parameterSets.length; psi++) {
         var paramSet = parameterSets[psi];
         for (var si = 0; si < samples.length; si++) {
             var sample = samples[si];
             var container = path.extname(sample).slice(1);
             var outputPath = cacheDir + '/test_' + paramSet.id + '_s' + (si + 1) + '.' + container;
-
+            
             // Update progress at start of each encode
             var currentProgress = Math.round((completedTests / totalTests) * 100);
             if (args.updateWorker) {
-                args.updateWorker({
+                args.updateWorker({ 
                     percentage: currentProgress,
                     ETA: Math.round((totalTests - completedTests) * 15) // Estimate ~15 seconds per encode
                 });
             }
-
+            
             var cmd = '"' + args.ffmpegPath + '"';
             if (paramSet.isGPU && paramSet.encoder.indexOf('av1_nvenc') !== -1) {
                 cmd += ' -hwaccel cuda';
@@ -1144,12 +1216,12 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 });
                 args.jobLog('  Size: ' + fileSize.toFixed(2) + ' MB, Time: ' + encodingTime.toFixed(1) + 's');
                 completedTests++;
-
+                
                 // Update progress after each completed encode
                 var progressPercent = Math.round((completedTests / totalTests) * 100);
                 args.jobLog('  Progress: ' + completedTests + '/' + totalTests + ' encodes [' + progressPercent + '%]');
                 if (args.updateWorker) {
-                    args.updateWorker({
+                    args.updateWorker({ 
                         percentage: progressPercent,
                         ETA: Math.round((totalTests - completedTests) * encodingTime) // Use actual encode time for better ETA
                     });
@@ -1175,21 +1247,21 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             }
         }
     }
-
+    
     // Report 100% completion
     if (args.updateWorker) {
         args.updateWorker({ percentage: 100 });
     }
-
+    
     // CRITICAL FIX #2: Analyze failures and warn/fail if too many
     var totalExpectedTests = parameterSets.length * samples.length;
     var failureRate = encodeFailures.length / totalExpectedTests;
-
+    
     if (encodeFailures.length > 0) {
         args.jobLog('');
         args.jobLog('=== Encoding Failure Analysis ===');
         args.jobLog('Total failures: ' + encodeFailures.length + ' / ' + totalExpectedTests + ' (' + (failureRate * 100).toFixed(1) + '%)');
-
+        
         // Group failures by parameter set
         var failuresByParamSet = {};
         for (var f = 0; f < encodeFailures.length; f++) {
@@ -1199,7 +1271,7 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             }
             failuresByParamSet[fail.parameterSetId]++;
         }
-
+        
         // Check if any parameter set had 100% failure
         var completelyFailedSets = [];
         for (var paramId in failuresByParamSet) {
@@ -1208,11 +1280,11 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 completelyFailedSets.push(paramId);
             }
         }
-
+        
         if (completelyFailedSets.length > 0) {
             args.jobLog('WARNING: ' + completelyFailedSets.length + ' parameter set(s) had 100% failure: ' + completelyFailedSets.join(', '));
         }
-
+        
         // Fail if >50% of tests failed
         if (failureRate > 0.5) {
             var errorMsg = 'Too many encoding failures (' + encodeFailures.length + ' / ' + totalExpectedTests + '). ';
@@ -1220,19 +1292,19 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             errorMsg += 'Check logs for specific error messages.';
             throw new Error(errorMsg);
         }
-
+        
         // Warn if >20% failed
         if (failureRate > 0.2) {
             args.jobLog('WARNING: High failure rate (' + (failureRate * 100).toFixed(1) + '%). Results may be incomplete.');
         }
     }
-
+    
     if (testResults.length === 0) {
         var errorMsg = 'No successful encoding tests. All ' + totalExpectedTests + ' tests failed. ';
         errorMsg += 'Check GPU availability, codec support, and FFmpeg configuration.';
         throw new Error(errorMsg);
     }
-
+    
     args.variables.vmafTestResults = testResults;
     args.variables.vmafParameterSets = parameterSets;
     args.variables.vmafEncodeFailures = encodeFailures; // Store for analysis

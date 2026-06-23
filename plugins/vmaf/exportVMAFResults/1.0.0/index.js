@@ -39,7 +39,7 @@ var plugin = function (args) {
     var fs = require('fs');
     var path = require('path');
     var csvPath = args.inputs.csvPath || '/app/configs/vmaf_results.csv';
-
+    
     // Get all data
     var inputFile = args.inputFileObj;
     var testResults = args.variables.vmafTestResults || [];
@@ -50,7 +50,7 @@ var plugin = function (args) {
     var bestSize = args.variables.vmafBestSize || null;
     var strategy = args.variables.vmafStrategy || 'pareto-efficiency-curve';
     var minVMAF = args.variables.vmafMinVMAF || 90;
-
+    
     // ENHANCEMENT FIX #15: Get retry tracking data
     var retryCount = args.variables.vmafRetryCount || 0;
     var transcodeRetryCount = args.variables.vmafTranscodeRetryCount || 0;
@@ -58,7 +58,7 @@ var plugin = function (args) {
     var sweepRetryHistory = args.variables.vmafSweepRetryHistory || [];
     var cqRangeRetryHistory = args.variables.vmafCQRangeRetryHistory || [];
     var transcodeFailures = args.variables.vmafTranscodeFailures || [];
-
+    
     // Create lookup map for parameter sets from testResults
     var paramSetMap = {};
     for (var t = 0; t < testResults.length; t++) {
@@ -66,7 +66,7 @@ var plugin = function (args) {
             paramSetMap[testResults[t].parameterSetId] = testResults[t].parameterSet;
         }
     }
-
+    
     // Extract file metadata
     var fileMetadata = {
         filePath: inputFile._id || '',
@@ -150,7 +150,7 @@ var plugin = function (args) {
     }
     var dynamicGenreAdjustment = args.variables.vmafGenreCQAdjustment || 0;
     var dynamicAnimationAdjustment = args.variables.vmafAnimationCQAdjustment || 0;
-
+    
     // Helper function to escape CSV fields
     function escapeCsvField(field) {
         if (field === null || field === undefined) {
@@ -162,17 +162,17 @@ var plugin = function (args) {
         }
         return str;
     }
-
+    
     // Helper function to calculate best parameters for each strategy
     function calculateBestForStrategy(results, strategy, minVMAF) {
         if (!results || results.length === 0) return null;
-
+        
         var validResults = results.filter(function(r) { return r.avgVMAF >= minVMAF; });
         if (validResults.length === 0) return null;
-
+        
         var best = null;
         var bestScore = -1;
-
+        
         if (strategy === 'quality' || strategy === 'pareto-quality') {
             best = validResults.reduce(function(prev, curr) {
                 return curr.avgVMAF > prev.avgVMAF ? curr : prev;
@@ -201,10 +201,10 @@ var plugin = function (args) {
                 return currEff > prevEff ? curr : prev;
             }, validResults[0]);
         }
-
+        
         return best;
     }
-
+    
     // Calculate best parameters for all strategies
     var allStrategies = ['pareto-efficiency', 'pareto-quality', 'pareto-size', 'efficiency-curve', 'pareto-efficiency-curve', 'diminishing-returns', 'balanced', 'quality', 'size', 'efficiency'];
     var strategySelections = {};
@@ -220,7 +220,7 @@ var plugin = function (args) {
             };
         }
     }
-
+    
     // Find the parameterSetId for the selected bestParams
     var selectedParamSetId = '';
     if (bestParams) {
@@ -239,13 +239,13 @@ var plugin = function (args) {
                 if (agg2.parameterSet) {
                     // Match by key fields: preset, quality/cq, pixFmt
                     var presetMatch = agg2.parameterSet.preset === bestParams.preset;
-                    var qualityMatch = (agg2.parameterSet.quality === bestParams.quality ||
+                    var qualityMatch = (agg2.parameterSet.quality === bestParams.quality || 
                                       agg2.parameterSet.cq === bestParams.quality ||
                                       agg2.parameterSet.quality === bestParams.cq ||
                                       agg2.parameterSet.cq === bestParams.cq);
                     var pixFmtMatch = (!agg2.parameterSet.pixFmt && !bestParams.pixFmt) ||
                                      (agg2.parameterSet.pixFmt === bestParams.pixFmt);
-
+                    
                     if (presetMatch && qualityMatch && pixFmtMatch) {
                         selectedParamSetId = agg2.parameterSetId;
                         break;
@@ -254,10 +254,10 @@ var plugin = function (args) {
             }
         }
     }
-
+    
     // Build CSV content
     var csvLines = [];
-
+    
     // Header row
     var headers = [
         'timestamp',
@@ -287,14 +287,14 @@ var plugin = function (args) {
         'transcode_failures_count', 'transcode_failures_reasons',
     ];
     csvLines.push(headers.map(escapeCsvField).join(','));
-
+    
     // Data rows - one row per VMAF result
     var timestamp = new Date().toISOString();
     for (var i = 0; i < vmafResults.length; i++) {
         var result = vmafResults[i];
         // Get parameter set from result or lookup map
         var paramSet = result.parameterSet || paramSetMap[result.parameterSetId] || {};
-
+        
         var row = [
             timestamp,
             fileMetadata.filePath,
@@ -386,7 +386,7 @@ var plugin = function (args) {
             transcodeFailures.length,
             transcodeFailures.length > 0 ? transcodeFailures.map(function(f) { return f.reason || 'unknown'; }).join(';') : '',
         ];
-
+        
         // Fill in aggregated data if available
         for (var a = 0; a < aggregatedResults.length; a++) {
             if (aggregatedResults[a].parameterSetId === result.parameterSetId) {
@@ -404,16 +404,16 @@ var plugin = function (args) {
                 break;
             }
         }
-
+        
         csvLines.push(row.map(escapeCsvField).join(','));
     }
-
+    
     // If no individual results, create rows from aggregated results
     if (vmafResults.length === 0 && aggregatedResults.length > 0) {
         for (var a = 0; a < aggregatedResults.length; a++) {
             var aggResult = aggregatedResults[a];
             var paramSet2 = aggResult.parameterSet || {};
-
+            
             var row2 = [
                 timestamp,
                 fileMetadata.filePath,
@@ -507,7 +507,7 @@ var plugin = function (args) {
             csvLines.push(row2.map(escapeCsvField).join(','));
         }
     }
-
+    
     // Write CSV file (append mode)
     try {
         // Ensure directory exists
@@ -520,10 +520,10 @@ var plugin = function (args) {
                 args.jobLog('Warning: Could not create directory ' + dirPath + ': ' + mkdirErr.message);
             }
         }
-
+        
         var csvContent = csvLines.join('\n') + '\n';
         var fileExists = fs.existsSync(csvPath);
-
+        
         if (fileExists) {
             // Append to existing file (without header if file exists)
             fs.appendFileSync(csvPath, csvContent.split('\n').slice(1).join('\n'));
@@ -533,7 +533,7 @@ var plugin = function (args) {
             fs.writeFileSync(csvPath, csvContent, { mode: 0o644 });
             args.jobLog('Created new CSV file with VMAF results: ' + csvPath);
         }
-
+        
         args.jobLog('Exported ' + (vmafResults.length || aggregatedResults.length) + ' result rows to CSV');
         args.jobLog('CSV file location: ' + csvPath);
     } catch (err) {
@@ -541,7 +541,7 @@ var plugin = function (args) {
         args.jobLog('CSV path: ' + csvPath);
         args.jobLog('Directory exists: ' + fs.existsSync(path.dirname(csvPath)));
         args.jobLog('File exists: ' + fs.existsSync(csvPath));
-
+        
         // Try alternative path in /temp (cache directory) if configs fails
         if (csvPath.indexOf('/app/configs') === 0) {
             var altPath = csvPath.replace('/app/configs', '/temp');
@@ -620,6 +620,86 @@ var plugin = function (args) {
         }
     } catch (runtimeErr) {
         args.jobLog('WARNING: Could not export FFmpeg/libvmaf runtime metrics sidecar CSV: ' + runtimeErr.message);
+    }
+    
+    // ── Unified SQLite training store (dual-write alongside the CSV) ──
+    // Writes the per-CQ sweep curve INCLUDING CAMBI (new signal) plus the job's source +
+    // decision facts. Keyed by the shared vmafJobId so learnCQRange can later attach the
+    // final outcome to the same row. Non-fatal: a DB failure never breaks the flow.
+    try {
+        var vmafdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+        var _db = vmafdb.openDb();
+        var _jobId = args.variables.vmafJobId
+            || vmafdb.makeJobId(fileMetadata.filePath, args.variables.vmafJobStartTime || '');
+        function _bitDepth(pf) {
+            if (!pf) return null; pf = String(pf).toLowerCase();
+            if (pf.indexOf('12le') !== -1 || pf.indexOf('12be') !== -1 || pf.indexOf('p012') !== -1) return 12;
+            if (pf.indexOf('10le') !== -1 || pf.indexOf('10be') !== -1 || pf.indexOf('p010') !== -1 || pf.indexOf('yuv420p10') !== -1) return 10;
+            return 8;
+        }
+        vmafdb.upsertJob(_db, {
+            job_id: _jobId,
+            timestamp: timestamp,
+            file_path: fileMetadata.filePath,
+            file_name: fileMetadata.fileName,
+            source_codec: fileMetadata.videoCodec,
+            source_width: fileMetadata.videoWidth,
+            source_height: fileMetadata.videoHeight,
+            bits_per_pixel: Number(sourceBitsPerPixel) || null,
+            source_duration_sec: Number(fileMetadata.duration) || null,
+            pixel_format: fileMetadata.pixelFormat,
+            bit_depth: _bitDepth(fileMetadata.pixelFormat),
+            is_hdr: fileMetadata.isHDR ? 1 : 0,
+            color_primaries: fileMetadata.colorPrimaries,
+            color_trc: fileMetadata.colorTrc,
+            colorspace: fileMetadata.colorspace,
+            tier: vmafdb.tierFor(fileMetadata.videoWidth, fileMetadata.videoHeight),
+            media_genre: mediaGenresString,
+            media_is_animation: mediaIsAnimation ? 1 : 0,
+            media_type: mediaType,
+            media_year: parseInt(mediaYear) || null,
+            media_metadata_source: mediaMetadataSource,
+            media_source_type: mediaSourceType,
+            release_group: releaseGroup,
+            source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null),
+            source_cambi_p95: (args.variables.vmafSourceCAMBIP95 != null ? Number(args.variables.vmafSourceCAMBIP95) : null),
+            target_min_vmaf: Number(args.variables.vmafMinVMAF) || null,
+            selected_parameter_set_id: args.variables.vmafSelectedParameterSetId || (bestParams && bestParams.parameterSetId) || '',
+            selected_vmaf: Number(bestVMAF) || null,
+            selected_vmaf_min: Number(args.variables.vmafBestMinVMAF) || null,
+            selected_size_mb: Number(bestSize) || null
+        });
+        var _pts = [];
+        for (var _ai = 0; _ai < aggregatedResults.length; _ai++) {
+            var _ar = aggregatedResults[_ai] || {};
+            var _ps = _ar.parameterSet || {};
+            _pts.push({
+                parameter_set_id: _ar.parameterSetId || '',
+                cq: Number(_ps.cq != null ? _ps.cq : _ps.quality) || null,
+                preset: _ps.preset || null,
+                tune: _ps.tune || null,
+                multipass: _ps.multipass != null ? String(_ps.multipass) : null,
+                spatial_aq: _ps.spatial_aq != null ? String(_ps.spatial_aq) : null,
+                temporal_aq: _ps.temporal_aq != null ? String(_ps.temporal_aq) : null,
+                aq_strength: _ps.aq_strength != null ? String(_ps.aq_strength) : null,
+                vmaf_mean: _ar.avgVMAFMean != null ? Number(_ar.avgVMAFMean) : (Number(_ar.avgVMAF) || null),
+                vmaf_harmonic_mean: Number(_ar.avgVMAF) || null,
+                vmaf_min: Number(_ar.minVMAF) || null,
+                vmaf_max: Number(_ar.maxVMAF) || null,
+                vmaf_p1_low: _ar.vmafP1Low != null ? Number(_ar.vmafP1Low) : null,
+                vmaf_stddev: _ar.vmafStdDev != null ? Number(_ar.vmafStdDev) : null,
+                ssim: _ar.avgSSIM != null ? Number(_ar.avgSSIM) : null,
+                cambi_mean: _ar.avgCAMBI != null ? Number(_ar.avgCAMBI) : null,
+                cambi_max: _ar.maxCAMBI != null ? Number(_ar.maxCAMBI) : null,
+                cambi_p95: _ar.p95CAMBI != null ? Number(_ar.p95CAMBI) : null,
+                avg_size_mb: Number(_ar.avgFileSizeMB) || null,
+                sample_count: parseInt(_ar.sampleCount) || null
+            });
+        }
+        var _n = vmafdb.insertSweepPoints(_db, _jobId, _pts);
+        args.jobLog('SQLite training store: job ' + _jobId + ' + ' + _n + ' sweep points (CAMBI included)');
+    } catch (dbErr) {
+        args.jobLog('WARNING: SQLite training-store write failed (non-fatal): ' + (dbErr && dbErr.message ? dbErr.message : String(dbErr)));
     }
 
     return {

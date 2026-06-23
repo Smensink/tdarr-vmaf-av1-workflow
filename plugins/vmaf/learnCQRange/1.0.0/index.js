@@ -224,7 +224,7 @@ var plugin = function (args) {
 
     args.inputs = lib.loadDefaultValues(args.inputs, details);
 
-
+    
 
     var fs = require('fs');
 
@@ -242,11 +242,11 @@ var plugin = function (args) {
 
     var csvPath = args.inputs.csvPath || '/app/configs/vmaf_cq_learning.csv';
 
-
+    
 
     args.jobLog('=== Bayesian CQ Range Learning (Enhanced) ===');
 
-
+    
 
     if (!learningEnabled) {
 
@@ -264,7 +264,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Get learning data from selectBestParameters
 
@@ -286,7 +286,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Get retry history data
 
@@ -300,19 +300,19 @@ var plugin = function (args) {
 
     var releaseGroup = args.variables.vmafReleaseGroup || args.variables.vmafReleaseGroupUsed || '';
 
-
+    
 
     // Get current heuristic CQ range (for prior)
 
-    var heuristicCQMin = args.variables.vmafCalculatedBaseCQ ?
+    var heuristicCQMin = args.variables.vmafCalculatedBaseCQ ? 
 
         Math.max(16, args.variables.vmafCalculatedBaseCQ - Math.floor((args.variables.vmafCQRange?.width || 8) / 2)) : null;
 
-    var heuristicCQMax = args.variables.vmafCalculatedBaseCQ ?
+    var heuristicCQMax = args.variables.vmafCalculatedBaseCQ ? 
 
         Math.min(51, heuristicCQMin + (args.variables.vmafCQRange?.width || 8)) : null;
 
-
+    
 
     // Load historical data from CSV
 
@@ -326,7 +326,7 @@ var plugin = function (args) {
 
             var lines = csvContent.split('\n').filter(function(line) { return line.trim().length > 0; });
 
-
+            
 
             if (lines.length > 1) {
 
@@ -334,7 +334,7 @@ var plugin = function (args) {
 
                 var headers = lines[0].split(',').map(function(h) { return h.trim().replace(/^"|"$/g, ''); });
 
-
+                
 
                 // Simple CSV parser that handles quoted fields
 
@@ -346,7 +346,7 @@ var plugin = function (args) {
 
                     var inQuotes = false;
 
-
+                    
 
                     for (var i = 0; i < line.length; i++) {
 
@@ -386,7 +386,7 @@ var plugin = function (args) {
 
                 }
 
-
+                
 
                 // Parse data rows
 
@@ -460,7 +460,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Find similar sources
 
@@ -488,7 +488,7 @@ var plugin = function (args) {
 
     var currentSourceType = String(args.variables.vmafMediaSourceType || 'unknown').toLowerCase();
 
-
+    
 
     // Determine resolution tier
 
@@ -504,7 +504,7 @@ var plugin = function (args) {
 
     else if (pixelCount >= 1280 * 720) resolutionTier = '720p';
 
-
+    
 
     args.jobLog('Source characteristics:');
 
@@ -532,7 +532,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Find similar sources
 
@@ -554,7 +554,7 @@ var plugin = function (args) {
 
         var histSourceType = String(hist.media_source_type || '').toLowerCase();
 
-
+        
 
         var histPixelCount = histWidth * histHeight;
 
@@ -568,23 +568,23 @@ var plugin = function (args) {
 
         else if (histPixelCount >= 1280 * 720) histResolutionTier = '720p';
 
-
+        
 
         var bitrateDiff = Math.abs(histBitrate - sourceBitrate);
 
         var bitrateThreshold = sourceBitrate * (bitrateTolerance / 100);
 
+        
 
+        var codecCategory = sourceCodec.toLowerCase().indexOf('264') !== -1 ? 'h264' : 
 
-        var codecCategory = sourceCodec.toLowerCase().indexOf('264') !== -1 ? 'h264' :
-
-                           (sourceCodec.toLowerCase().indexOf('265') !== -1 || sourceCodec.toLowerCase().indexOf('hevc') !== -1 ? 'hevc' :
+                           (sourceCodec.toLowerCase().indexOf('265') !== -1 || sourceCodec.toLowerCase().indexOf('hevc') !== -1 ? 'hevc' : 
 
                            (sourceCodec.toLowerCase().indexOf('av1') !== -1 ? 'av1' : 'other'));
 
-        var histCodecCategory = histCodec.toLowerCase().indexOf('264') !== -1 ? 'h264' :
+        var histCodecCategory = histCodec.toLowerCase().indexOf('264') !== -1 ? 'h264' : 
 
-                                (histCodec.toLowerCase().indexOf('265') !== -1 || histCodec.toLowerCase().indexOf('hevc') !== -1 ? 'hevc' :
+                                (histCodec.toLowerCase().indexOf('265') !== -1 || histCodec.toLowerCase().indexOf('hevc') !== -1 ? 'hevc' : 
 
                                 (histCodec.toLowerCase().indexOf('av1') !== -1 ? 'av1' : 'other'));
 
@@ -610,13 +610,13 @@ var plugin = function (args) {
 
         var animationMatches = currentIsAnimation === histIsAnimation;
 
-
+        
 
         var releaseMatches = sourceReleaseGroup && histReleaseGroup && sourceReleaseGroup.toLowerCase() === histReleaseGroup.toLowerCase();
 
         var yearDistance = (currentMediaYear && histYear) ? Math.abs(currentMediaYear - histYear) : null;
 
-
+        
 
         var sourceTypeMatches = true;
 
@@ -626,11 +626,11 @@ var plugin = function (args) {
 
         }
 
+        
 
+        if (histResolutionTier === resolutionTier && 
 
-        if (histResolutionTier === resolutionTier &&
-
-            bitrateDiff <= bitrateThreshold &&
+            bitrateDiff <= bitrateThreshold && 
 
             codecCategory === histCodecCategory &&
 
@@ -658,7 +658,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Profile prior: median CQ for same resolution tier + codec + animation (ignore genre) when few similar sources
 
@@ -688,7 +688,7 @@ var plugin = function (args) {
 
             else if (hPixels >= 1280 * 720) hTier = '720p';
 
-
+            
 
             var hCodecCat = h.source_codec ? h.source_codec.toLowerCase() : 'unknown';
 
@@ -700,11 +700,11 @@ var plugin = function (args) {
 
             else hCodecCat = 'other';
 
-
+            
 
             var hAnim = h.media_is_animation === true || h.media_is_animation === 'true' || h.media_is_animation === '1';
 
-
+            
 
             if (hTier === resolutionTier && hCodecCat === codecCategory && hAnim === currentIsAnimation) {
 
@@ -726,11 +726,11 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     args.jobLog('Found ' + similarSources.length + ' similar historical sources');
 
-
+    
 
     // Online posterior-style range and next CQ selection
 
@@ -1138,7 +1138,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     function successScore(pred, target, std) {
 
@@ -1156,7 +1156,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     var targetVmaf = learningData.target_min_vmaf || learningData.source_target_vmaf || args.variables.vmafMinVMAF || 90;
 
@@ -1210,7 +1210,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Keep the raw linear fit for observability, but avoid using it as guidance when it violates the expected trend:
 
@@ -1314,7 +1314,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     if (model) {
 
@@ -1403,7 +1403,7 @@ var plugin = function (args) {
 
         nextCandidates = scored.slice(0, 3).map(function(x) { return x.cq; });
 
-
+        
 
         args.jobLog('');
 
@@ -1447,7 +1447,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // If still no learned range, fallback to profile prior (resolution tier + codec + animation)
 
@@ -1473,7 +1473,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     args.variables.vmafLearnedCQRange = {
 
@@ -1529,7 +1529,7 @@ var plugin = function (args) {
     + ' (adaptive width ' + adaptiveWidth + ', conf=' + ((estimatedCqConfidence !== null && isFinite(estimatedCqConfidence)) ? estimatedCqConfidence.toFixed(3) : 'n/a') + ')'
     + ' | Next CQs: ' + nextCandidates.join(', '));
 
-
+    
 
     // Log retry history for analysis
 
@@ -1537,7 +1537,7 @@ var plugin = function (args) {
 
     args.jobLog('=== Retry History Analysis ===');
 
-
+    
 
     // Transcode retry history
 
@@ -1549,7 +1549,7 @@ var plugin = function (args) {
 
             var retry = transcodeRetryHistory[i];
 
-            args.jobLog('  Retry #' + (i + 1) + ': CQ ' + retry.fromCQ + ' → ' + retry.toCQ +
+            args.jobLog('  Retry #' + (i + 1) + ': CQ ' + retry.fromCQ + ' → ' + retry.toCQ + 
 
                        ' (VMAF at target: ' + (retry.vmafAtToCQ ? retry.vmafAtToCQ.toFixed(2) : 'N/A') + ')');
 
@@ -1561,7 +1561,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Sweep retry history
 
@@ -1573,7 +1573,7 @@ var plugin = function (args) {
 
             var sweepRetry = sweepRetryHistory[i];
 
-            args.jobLog('  Sweep Retry #' + (i + 1) + ': Trigger CQ ' + sweepRetry.triggerCQ +
+            args.jobLog('  Sweep Retry #' + (i + 1) + ': Trigger CQ ' + sweepRetry.triggerCQ + 
 
                        ' → Range ' + sweepRetry.newCQRange + ' (Reason: ' + sweepRetry.reason + ')');
 
@@ -1581,7 +1581,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // CQ range retry history
 
@@ -1593,7 +1593,7 @@ var plugin = function (args) {
 
             var rangeRetry = cqRangeRetryHistory[i];
 
-            args.jobLog('  Range Retry #' + (i + 1) + ': ' + rangeRetry.newRange +
+            args.jobLog('  Range Retry #' + (i + 1) + ': ' + rangeRetry.newRange + 
 
                        ' (Reason: ' + rangeRetry.reason + ', Executed: ' + (rangeRetry.executed ? 'Yes' : 'No') + ')');
 
@@ -1601,7 +1601,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Transcode failures analysis. learnedCQMin/Max start from the posterior bracket and
 
@@ -1627,11 +1627,11 @@ var plugin = function (args) {
 
             var status = failure.succeeded ? '✓' : '✗';
 
-            args.jobLog('  ' + status + ' CQ ' + failure.originalCQ + ' → ' + failure.finalCQ +
+            args.jobLog('  ' + status + ' CQ ' + failure.originalCQ + ' → ' + failure.finalCQ + 
 
                        ' (Retries: ' + failure.retries + ', Reason: ' + failure.reason + ')');
 
-
+            
 
             // Adjust learned range based on failures
 
@@ -1655,7 +1655,7 @@ var plugin = function (args) {
 
         }
 
-
+        
 
         // Update learned range if adjusted
 
@@ -1677,7 +1677,7 @@ var plugin = function (args) {
 
     }
 
-
+    
 
     // Save current run to CSV with enhanced retry tracking
 
@@ -1693,7 +1693,7 @@ var plugin = function (args) {
 
         var timestamp = now.toISOString();
 
-
+        
 
         if (!timestamp || !timestamp.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)) {
 
@@ -1701,7 +1701,7 @@ var plugin = function (args) {
 
         }
 
-
+        
 
         // Compile retry data
 
@@ -1709,13 +1709,13 @@ var plugin = function (args) {
 
         var transcodeRetryCQs = transcodeRetryHistory.map(function(r) { return r.toCQ; }).join(';');
 
-        var transcodeRetryVMAFs = transcodeRetryHistory.map(function(r) {
+        var transcodeRetryVMAFs = transcodeRetryHistory.map(function(r) { 
 
-            return r.vmafAtToCQ ? r.vmafAtToCQ.toFixed(2) : 'N/A';
+            return r.vmafAtToCQ ? r.vmafAtToCQ.toFixed(2) : 'N/A'; 
 
         }).join(';');
 
-
+        
 
         var sweepRetryCount = sweepRetryHistory.length;
 
@@ -1723,7 +1723,7 @@ var plugin = function (args) {
 
         var sweepRetryReasons = sweepRetryHistory.map(function(r) { return r.reason; }).join(';');
 
-
+        
 
         var cqRangeRetryCount = cqRangeRetryHistory.filter(function(r) { return r.executed; }).length;
 
@@ -1731,7 +1731,7 @@ var plugin = function (args) {
 
         var cqRangeRetryReasons = cqRangeRetryHistory.filter(function(r) { return r.executed; }).map(function(r) { return r.reason; }).join(';');
 
-
+        
 
         // Get final outcome
 
@@ -1741,7 +1741,7 @@ var plugin = function (args) {
 
         var totalRetries = transcodeRetryCount;
 
-
+        
 
         if (transcodeFailures.length > 0) {
 
@@ -1759,7 +1759,7 @@ var plugin = function (args) {
 
         }
 
-
+        
 
         var mediaGenreString = (args.variables.vmafMediaGenre || []).join(';');
 
@@ -1817,7 +1817,7 @@ var plugin = function (args) {
 
         var estMethod = estCqRounded !== '' ? (estimatedCqMethod || 'isotonic') : '';
 
-
+        
 
         var csvRowValues = [
 
@@ -1913,17 +1913,21 @@ var plugin = function (args) {
 
             modelStd,
 
-            modelTrainingSamples
+            modelTrainingSamples,
+
+            (args.variables.vmafSourceCAMBI !== null && args.variables.vmafSourceCAMBI !== undefined && isFinite(args.variables.vmafSourceCAMBI)) ? args.variables.vmafSourceCAMBI : '',
+
+            (args.variables.vmafSourceCAMBIP95 !== null && args.variables.vmafSourceCAMBIP95 !== undefined && isFinite(args.variables.vmafSourceCAMBIP95)) ? args.variables.vmafSourceCAMBIP95 : ''
 
         ];
 
         var csvRow = formatCsvRow(csvRowValues);
 
+        
 
+        var csvHeader = 'timestamp,source_bitrate_mbps,source_width,source_height,source_codec,source_duration_sec,source_file_size_mb,bits_per_pixel,tested_cq_min,tested_cq_max,selected_cq,selected_vmaf,selected_ssim,selected_cambi,selected_projected_output_bpp,selected_projected_output_ratio_pct,target_min_vmaf,adaptive_frame_floor_used,actual_size_reduction_pct,met_vmaf_target,met_size_target,total_retries,transcode_succeeded,transcode_retry_count,transcode_retry_cqs,transcode_retry_vmafs,sweep_retry_count,sweep_retry_ranges,sweep_retry_reasons,cq_range_retry_count,cq_range_retry_ranges,cq_range_retry_reasons,media_genre,media_is_animation,media_type,media_year,media_metadata_source,media_source_type,estimated_cq_at_target,estimated_cq_confidence,estimated_cq_method,estimated_cq_support,estimated_cq_min_abs_delta,model_slope,model_intercept,model_std,model_training_samples,source_cambi,source_cambi_p95';
 
-        var csvHeader = 'timestamp,source_bitrate_mbps,source_width,source_height,source_codec,source_duration_sec,source_file_size_mb,bits_per_pixel,tested_cq_min,tested_cq_max,selected_cq,selected_vmaf,selected_ssim,selected_cambi,selected_projected_output_bpp,selected_projected_output_ratio_pct,target_min_vmaf,adaptive_frame_floor_used,actual_size_reduction_pct,met_vmaf_target,met_size_target,total_retries,transcode_succeeded,transcode_retry_count,transcode_retry_cqs,transcode_retry_vmafs,sweep_retry_count,sweep_retry_ranges,sweep_retry_reasons,cq_range_retry_count,cq_range_retry_ranges,cq_range_retry_reasons,media_genre,media_is_animation,media_type,media_year,media_metadata_source,media_source_type,estimated_cq_at_target,estimated_cq_confidence,estimated_cq_method,estimated_cq_support,estimated_cq_min_abs_delta,model_slope,model_intercept,model_std,model_training_samples';
-
-
+        
 
         var fileExists = fs.existsSync(csvPath);
 
@@ -1979,21 +1983,32 @@ var plugin = function (args) {
 
                     var droppedRows = 0;
 
+                    var paddedRows = 0;
+
                     for (var li = 1; li < existingLines.length; li++) {
 
-                        if (countCsvCols(existingLines[li]) === expectedCols) migrated.push(existingLines[li]);
+                        var ncCols = countCsvCols(existingLines[li]);
 
-                        else droppedRows++;
-
+                        if (ncCols === expectedCols) {
+                            migrated.push(existingLines[li]);
+                        } else if (ncCols < expectedCols) {
+                            // Older, narrower schema: pad with empty trailing fields for the
+                            // columns added since (e.g. source_cambi). Preserve history rather
+                            // than dropping it - dropping would wipe the learning set.
+                            migrated.push(existingLines[li] + new Array(expectedCols - ncCols + 1).join(','));
+                            paddedRows++;
+                        } else {
+                            droppedRows++;
+                        }
                     }
 
                     fs.writeFileSync(csvPath + '.pre_migration.bak', existing);
 
                     fs.writeFileSync(csvPath, migrated.join('\n'));
 
-                    args.jobLog('Migrated learning CSV to canonical schema: ' + (migrated.length - 1) + ' rows kept, '
+                    args.jobLog('Migrated learning CSV to canonical schema: ' + (migrated.length - 1) + ' rows kept ('
 
-                        + droppedRows + ' dropped (backup: ' + csvPath + '.pre_migration.bak)');
+                        + paddedRows + ' padded), ' + droppedRows + ' dropped (backup: ' + csvPath + '.pre_migration.bak)');
 
                 }
 
@@ -2005,7 +2020,7 @@ var plugin = function (args) {
 
         }
 
-
+        
 
         if (fileExists) {
 
@@ -2017,7 +2032,7 @@ var plugin = function (args) {
 
         }
 
-
+        
 
         args.jobLog('');
 
@@ -2038,6 +2053,39 @@ var plugin = function (args) {
     }
 
 
+
+    // ── Unified SQLite training store (dual-write the final outcome alongside the CSV) ──
+    // Partial upsert by the shared vmafJobId attaches outcome to the job row that
+    // exportVMAFResults created with the curve + decision. Non-fatal.
+    try {
+        var vmafdbL = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+        var _dbL = vmafdbL.openDb();
+        var _fpL = (args.inputFileObj && args.inputFileObj._id) || '';
+        var _jobIdL = args.variables.vmafJobId
+            || vmafdbL.makeJobId(_fpL, args.variables.vmafJobStartTime || '');
+        vmafdbL.upsertJob(_dbL, {
+            job_id: _jobIdL,
+            timestamp: timestamp,
+            file_path: _fpL || undefined,
+            target_min_vmaf: Number(learningData.target_min_vmaf) || null,
+            selected_cq: Number(finalCQ || learningData.selected_cq) || null,
+            selected_vmaf: Number(learningData.selected_vmaf) || null,
+            selected_cambi: (learningData.selected_cambi !== '' && learningData.selected_cambi != null) ? Number(learningData.selected_cambi) : null,
+            source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null),
+            source_cambi_p95: (args.variables.vmafSourceCAMBIP95 != null ? Number(args.variables.vmafSourceCAMBIP95) : null),
+            transcode_succeeded: transcodeSucceeded ? 1 : 0,
+            met_vmaf_target: learningData.met_vmaf_target ? 1 : 0,
+            met_size_target: learningData.met_size_target ? 1 : 0,
+            actual_size_reduction_pct: Number(learningData.actual_size_reduction_pct) || null,
+            total_retries: parseInt(totalRetries) || 0,
+            transcode_retry_count: parseInt(transcodeRetryCount) || 0,
+            sweep_retry_count: parseInt(sweepRetryCount) || 0,
+            cq_range_retry_count: parseInt(cqRangeRetryCount) || 0
+        });
+        args.jobLog('SQLite training store: outcome attached to job ' + _jobIdL);
+    } catch (dbErrL) {
+        args.jobLog('WARNING: SQLite outcome write failed (non-fatal): ' + (dbErrL && dbErrL.message ? dbErrL.message : String(dbErrL)));
+    }
 
     // Update EMA state for trend tracking
 
@@ -2146,3 +2194,4 @@ var plugin = function (args) {
 };
 
 exports.plugin = plugin;
+

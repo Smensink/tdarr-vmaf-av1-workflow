@@ -40,7 +40,9 @@ This workflow uses those ideas practically inside Tdarr: VMAF estimates perceptu
 ## How the project is organized
 
 - `docker/` — compose example, Dockerfile, init hooks, and FFmpeg/libvmaf build recipe
-- `plugins/` — Tdarr Local Flow Plugins used by the workflow (`vmaf/` and `filter/`)
+- `plugins/vmaf/_lib/` — shared Node.js libraries: `vmafdb.js` (SQLite data layer), `vmafpredict.js` (CQ predictor), backfill script, and analysis tools
+- `plugins/vmaf/` — Tdarr Local Flow Plugins (`vmaf/` category)
+- `plugins/filter/checkFileAge/` — age-gate plugin (`filter/` category)
 - `flow/tdarr-flow-vmaf-av1.json` — importable Tdarr flow
 - `data/seed/` — aggregate warm-start CQ priors
 - `tools/` — install, validation, and data-sanitization helpers
@@ -107,7 +109,9 @@ See [Quality policy](docs/quality-policy.md) for the decision model.
 
 ## Learning and warm starts
 
-The workflow writes learning data after successful runs. Future files use that history to start with a better CQ bracket instead of cold-starting from the same wide range every time.
+The workflow writes learning data to an **SQLite database** (`vmaf_training.db`) after successful runs. Future files use that history to start with a better CQ bracket instead of cold-starting from the same wide range every time.
+
+The library `plugins/vmaf/_lib/vmafdb.js` manages two tables: `jobs` (source facts, decision, outcome) and `sweep_points` (the CQ→VMAF curve for each job). The predictor `plugins/vmaf/_lib/vmafpredict.js` pools sweep curves from similar past jobs to predict a CQ centre, then runs a sequential root-finding sweep — converging in ~2–3 transcodes. Legacy CSV files (`vmaf_results.csv`, `vmaf_cq_learning.csv`) are retained for backward compatibility.
 
 `data/seed/` contains aggregate warm-start priors. They are intentionally broad summaries, not raw transcode history. The seed priors help new installs avoid a completely blank model; your own local learning data should gradually become more important.
 

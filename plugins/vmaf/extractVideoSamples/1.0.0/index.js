@@ -1038,7 +1038,7 @@ var plugin = function (args) {
 
 
 
-
+    
 
 
 
@@ -1730,7 +1730,7 @@ var plugin = function (args) {
 
 
 
-
+    
 
 
 
@@ -1990,7 +1990,7 @@ var plugin = function (args) {
 
 
 
-
+    
 
 
 
@@ -2560,6 +2560,14 @@ var plugin = function (args) {
 
             var yearIdx = idx('media_year');
 
+            // Source banding column - present only on rows written after the source-CAMBI
+            // recording change. Older rows have it empty/absent (idx may be -1 or value '').
+            var cambiIdx = idx('source_cambi');
+
+            // Target VMAF column - used to down-weight rows optimized to a different VMAF
+            // target (e.g. recovered VMAF-93-era history when the current job targets 95).
+            var targetIdx = idx('target_min_vmaf');
+
 
 
             if ((tierIdx === -1 && (widthIdx === -1 || heightIdx === -1)) || cIdx === -1 || cqIdx === -1) {
@@ -2591,6 +2599,12 @@ var plugin = function (args) {
 
 
             var scored = [];
+
+            // Weighted (source_cambi, selected_cq) pairs for the CAMBI->CQ slope model.
+            var cambiPairs = [];
+
+            // Current job's VMAF target, for target-proximity weighting of historical rows.
+            var currentTargetVmaf = Number(args.variables.vmafMinVMAF) || Number(args.inputs && args.inputs.targetMinVMAF) || 95;
 
 
 
@@ -2860,6 +2874,20 @@ var plugin = function (args) {
 
                 w *= bppW;
 
+                // Target-VMAF proximity: a row optimized to a different VMAF target picked its
+                // CQ on a different quality curve, so it's weaker evidence for this job. Gaussian
+                // decay by target distance (sigma 2.0 VMAF pts: a 93-vs-95 gap -> ~0.61 weight)
+                // lets recovered VMAF-93-era history still inform a VMAF-95 job, just less, and
+                // shifts naturally toward same-target rows as they accrue. Tune sigmaT to taste.
+                if (targetIdx !== -1 && cols.length > targetIdx) {
+                    var hTarget = parseFloat(cols[targetIdx]);
+                    if (!isNaN(hTarget) && isFinite(hTarget) && isFinite(currentTargetVmaf)) {
+                        var dT = Math.abs(hTarget - currentTargetVmaf);
+                        var sigmaT = 2.0;
+                        w *= Math.exp(-(dT * dT) / (2 * sigmaT * sigmaT));
+                    }
+                }
+
 
 
 
@@ -3048,6 +3076,14 @@ var plugin = function (args) {
 
                 scored.push({ v: cq, w: w });
 
+                // Source-banding evidence: only rows that recorded a source CAMBI value.
+                if (cambiIdx !== -1 && cols.length > cambiIdx) {
+                    var hSrcCambi = parseFloat(cols[cambiIdx]);
+                    if (!isNaN(hSrcCambi) && isFinite(hSrcCambi)) {
+                        cambiPairs.push({ x: hSrcCambi, y: cq, w: w });
+                    }
+                }
+
 
 
                 looseCount += 1;
@@ -3065,6 +3101,43 @@ var plugin = function (args) {
 
 
 
+
+            // ── Source CAMBI -> CQ slope model (data-driven replacement for the fixed
+            //    +1/+2/+3 banding heuristic in testEncodingParameters). Weighted least squares
+            //    selected_cq ~ a + b*source_cambi over matched neighbours that recorded a
+            //    source CAMBI. Fit here from history (no dependency on the current job's source
+            //    CAMBI, which isn't measured until later in this plugin); applied in
+            //    testEncodingParameters where the current source CAMBI is known. Only set when
+            //    there is enough support and real spread, so the heuristic carries cold-start.
+            (function fitSourceCambiCQModel() {
+                var n = cambiPairs.length;
+                if (n < 8) return;
+                var sw = 0, swx = 0, swy = 0;
+                for (var i = 0; i < n; i++) { sw += cambiPairs[i].w; swx += cambiPairs[i].w * cambiPairs[i].x; swy += cambiPairs[i].w * cambiPairs[i].y; }
+                if (!(sw > 0)) return;
+                var mx = swx / sw, my = swy / sw;
+                var sxx = 0, sxy = 0, xmin = Infinity, xmax = -Infinity;
+                for (var j = 0; j < n; j++) {
+                    var dx = cambiPairs[j].x - mx;
+                    sxx += cambiPairs[j].w * dx * dx;
+                    sxy += cambiPairs[j].w * dx * (cambiPairs[j].y - my);
+                    if (cambiPairs[j].x < xmin) xmin = cambiPairs[j].x;
+                    if (cambiPairs[j].x > xmax) xmax = cambiPairs[j].x;
+                }
+                // Need real spread in source CAMBI to estimate a slope.
+                if (!(sxx > 1e-6) || (xmax - xmin) < 1.0) return;
+                var slope = sxy / sxx;
+                if (!isFinite(slope)) return;
+                args.variables.vmafSourceCambiCQModel = {
+                    slope: slope,
+                    meanCambi: mx,
+                    cambiMin: xmin,
+                    cambiMax: xmax,
+                    support: n
+                };
+                args.jobLog('Source-CAMBI CQ model: slope=' + slope.toFixed(3) + ' CQ per CAMBI point, meanCAMBI='
+                    + mx.toFixed(2) + ', support=' + n + ' rows (x-range ' + xmin.toFixed(2) + '-' + xmax.toFixed(2) + ')');
+            })();
 
             var effN = effectiveSampleSize(scored);
 
@@ -3830,7 +3903,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -3894,7 +3967,7 @@ var plugin = function (args) {
 
 
 
-
+            
 
 
 
@@ -3914,7 +3987,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -3970,7 +4043,7 @@ var plugin = function (args) {
 
 
 
-
+    
 
 
 
@@ -4198,7 +4271,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -4430,7 +4503,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -4554,7 +4627,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -4642,7 +4715,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -4770,7 +4843,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -4782,7 +4855,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -4842,7 +4915,7 @@ var plugin = function (args) {
 
 
 
-
+        
 
 
 
@@ -4854,7 +4927,7 @@ var plugin = function (args) {
 
 
 
-
+    
 
 
 
@@ -4986,7 +5059,7 @@ var plugin = function (args) {
 
 
 
-
+    
 
 
 
@@ -5086,7 +5159,7 @@ var plugin = function (args) {
 
 
 
-
+            
 
 
 
@@ -5482,7 +5555,7 @@ var plugin = function (args) {
 
 
 
-
+    
 
 
 
@@ -6098,7 +6171,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+    
 
 
 
@@ -6118,7 +6191,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+    
 
 
 
@@ -6138,7 +6211,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+        
 
 
 
@@ -6150,7 +6223,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+        
 
 
 
@@ -6170,7 +6243,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+        
 
 
 
@@ -6326,7 +6399,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+    
 
 
 
@@ -6446,7 +6519,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+    
 
 
 
@@ -6482,7 +6555,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+    
 
 
 
@@ -6498,7 +6571,7 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-
+    
 
 
 
@@ -6516,9 +6589,82 @@ for (var i = 0; i < numSegments; i++) {
 
     args.variables.vmafOriginalFile = inputFile;
 
+    // Seed a stable per-job id shared across the flow. exportVMAFResults and learnCQRange
+    // both key their unified-DB writes by this, so the curve, decision and outcome all land
+    // on one jobs row. Deterministic fallback (filePath + start time) keeps export/learn in
+    // sync even if this seed is somehow skipped.
+    try {
+        if (!args.variables.vmafJobId) {
+            var _vdbSeed = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+            args.variables.vmafJobStartTime = new Date().toISOString();
+            args.variables.vmafJobId = _vdbSeed.makeJobId((inputFile && inputFile._id) || '', args.variables.vmafJobStartTime);
+        }
+    } catch (eSeed) { args.jobLog('vmafJobId seed skipped (non-fatal): ' + eSeed.message); }
+
 
 
     args.jobLog('Extracted ' + samplePaths.length + ' video samples.');
+
+
+    // ── Source CAMBI baseline measurement (for CQ prior + relative gate) ──
+    // Measures banding already present in the source by self-comparing one sample.
+    // High source CAMBI → source is already visibly degraded → safe to use higher CQ.
+    // Also used by selectBestParameters to raise the CAMBI limit above source+tolerance.
+    var sourceCAMBI = null;
+    var sourceCAMBIP95 = null;
+    try {
+        if (samplePaths.length > 0) {
+            var execSyncSC = require('child_process').execSync;
+            var fsSC = require('fs');
+            var scPath = samplePaths[0];
+            var scLogPath = '/tmp/source_cambi_' + Date.now() + '.json';
+            // Detect HDR for pixel format
+            var scIsHdr = false;
+            if (args.inputFileObj && args.inputFileObj.ffProbeData && args.inputFileObj.ffProbeData.streams) {
+                for (var sci = 0; sci < args.inputFileObj.ffProbeData.streams.length; sci++) {
+                    var scs = args.inputFileObj.ffProbeData.streams[sci];
+                    if (scs.codec_type === 'video') {
+                        var scTrc = (scs.color_transfer || '').toLowerCase();
+                        if (scTrc.indexOf('smpte2084') !== -1 || scTrc.indexOf('hlg') !== -1) { scIsHdr = true; }
+                        break;
+                    }
+                }
+            }
+            var scPixFmt = scIsHdr ? 'yuv420p10le' : 'yuv420p';
+            var scCmd = '"' + args.ffmpegPath + '" -y -hide_banner -i "' + scPath + '" -i "' + scPath + '" '
+                + '-filter_complex "[0:v]format=' + scPixFmt + '[dist];[1:v]format=' + scPixFmt + '[ref];[dist][ref]libvmaf=log_fmt=json:log_path=' + scLogPath + ':feature=name=cambi" '
+                + '-f null -';
+            args.jobLog('Measuring source CAMBI baseline on first sample...');
+            try {
+                execSyncSC(scCmd, { stdio: 'pipe', timeout: 60000, shell: '/bin/sh', maxBuffer: 32 * 1024 * 1024 });
+            } catch (e) { /* FFmpeg may exit non-zero with libvmaf */ }
+            if (fsSC.existsSync(scLogPath)) {
+                var scData = JSON.parse(fsSC.readFileSync(scLogPath, 'utf-8'));
+                var scPooled = scData.pooled_metrics || {};
+                if (scPooled.cambi) {
+                    sourceCAMBI = scPooled.cambi.mean !== undefined ? parseFloat(scPooled.cambi.mean) : null;
+                    var scFrames = scData.frames || [];
+                    var scFrameCambis = [];
+                    for (var scfi = 0; scfi < scFrames.length; scfi++) {
+                        var scv = scFrames[scfi].metrics && scFrames[scfi].metrics.cambi;
+                        if (typeof scv === 'number' && isFinite(scv)) scFrameCambis.push(scv);
+                    }
+                    if (scFrameCambis.length > 0) {
+                        scFrameCambis.sort(function(a, b) { return a - b; });
+                        var scP95Idx = Math.min(scFrameCambis.length - 1, Math.max(0, Math.floor(0.95 * (scFrameCambis.length - 1))));
+                        sourceCAMBIP95 = scFrameCambis[scP95Idx];
+                    }
+                    args.jobLog('Source CAMBI baseline: mean=' + (sourceCAMBI !== null ? sourceCAMBI.toFixed(3) : 'N/A')
+                        + ', p95=' + (sourceCAMBIP95 !== null ? sourceCAMBIP95.toFixed(3) : 'N/A'));
+                }
+            }
+            try { fsSC.unlinkSync(scLogPath); } catch (e) {}
+        }
+    } catch (e) {
+        args.jobLog('Source CAMBI measurement failed (non-fatal): ' + e.message);
+    }
+    args.variables.vmafSourceCAMBI = sourceCAMBI;
+    args.variables.vmafSourceCAMBIP95 = sourceCAMBIP95;
 
 
 
@@ -6547,3 +6693,6 @@ for (var i = 0; i < numSegments; i++) {
 
 
 exports.plugin = plugin;
+
+
+

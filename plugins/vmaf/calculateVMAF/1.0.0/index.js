@@ -51,7 +51,7 @@ function runCommand(cmd, args, options) {
         var process = spawn(cmd, args, options);
         var stdout = '';
         var stderr = '';
-
+        
         if (process.stdout) {
             process.stdout.on('data', function(data) {
                 stdout += data.toString();
@@ -62,11 +62,11 @@ function runCommand(cmd, args, options) {
                 stderr += data.toString();
             });
         }
-
+        
         process.on('close', function(code) {
             resolve({ code: code, stdout: stdout, stderr: stderr });
         });
-
+        
         process.on('error', function(err) {
             reject(err);
         });
@@ -112,12 +112,12 @@ function calculateSingleVmafGpuAsync(args, result, samples, cacheDir, modelPath)
     return new Promise(function(resolve) {
         var fs = require('fs');
         var execSpawn = require('child_process').spawn;
-
+        
         var originalSample = result.originalSamplePath || samples[result.sampleIndex];
         var logPath = cacheDir + '/vmaf_' + result.parameterSetId + '_s' + (result.sampleIndex + 1) + '.json';
         var distortedEncoder = (result.parameterSet && result.parameterSet.encoder) || args.variables.vmafTargetCodec || '';
         var isHdr = isHdrContent(args.inputFileObj);
-
+        
         function runOnce(useCpuFormatConversion, prevStderr) {
             var cmd = buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, useCpuFormatConversion, distortedEncoder, isHdr);
             var start = Date.now();
@@ -310,7 +310,7 @@ function parseVmafLog(logPath, fs) {
     try {
         var logContent = fs.readFileSync(logPath, 'utf8');
         var jsonData = JSON.parse(logContent);
-
+        
         var result = {
             vmafMean: null,
             vmafHarmonicMean: null,
@@ -347,7 +347,7 @@ function parseVmafLog(logPath, fs) {
                 result.cambiP95 = cambiScores[c95Idx];
             }
         }
-
+        
         // Extract all VMAF metrics from pooled_metrics (preferred format)
         if (jsonData.pooled_metrics && jsonData.pooled_metrics.vmaf) {
             var vmafMetrics = jsonData.pooled_metrics.vmaf;
@@ -372,10 +372,10 @@ function parseVmafLog(logPath, fs) {
                 result.vmafMean = parseFloat(scoreMatch[1]);
             }
         }
-
+        
         // Use harmonic mean as primary score (Netflix best practice)
         result.vmafScore = result.vmafHarmonicMean !== null ? result.vmafHarmonicMean : result.vmafMean;
-
+        
         return result;
     } catch (e) {
         return null;
@@ -419,7 +419,7 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
         if (lc.indexOf('mpeg4') !== -1) return 'mpeg4_cuvid';
         return null;
     }
-
+    
     // libvmaf_cuda requires CUDA frames
     // According to FFmpeg docs, we need to:
     // 1. Initialize CUDA device explicitly for filters
@@ -431,11 +431,11 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
     var modelParam = modelPath ? ':model=path=' + modelPath : '';
     var cambiFeatureParam = ':feature=name=cambi';
     useCpuFormatConversion = useCpuFormatConversion === true; // Default to false (use scale_cuda)
-
+    
     // Always use yuv420p for GPU VMAF calculations (libvmaf_cuda limitation)
     // Note: This is different from encoding format - encoding can use p010le for HDR content
     var targetFormat = 'yuv420p';
-
+    
     // Detect reference file codec from input file (reference is original sample, same codec)
     var referenceCodec = 'h264'; // default fallback
     var referenceCuvid = 'h264_cuvid'; // default fallback
@@ -476,7 +476,7 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
                 break;
         }
     }
-
+    
     // Build command - both inputs use CUVID decode to keep everything in GPU memory
     // Initialize CUDA device with explicit name for filter use
     var distortedCuvid = mapEncoderToCuvid(distortedEncoder);
@@ -487,7 +487,7 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
         '-hwaccel', 'cuda',
         '-hwaccel_device', '0'
     ];
-
+    
     // cuvid decodes to system memory (NO -hwaccel_output_format cuda). scale_cuda is
     // compute_90-only in this build and crashes on Blackwell (sm_120), so format
     // conversion is done on CPU (format=yuv420p) then re-uploaded with generic hwupload.
@@ -495,7 +495,7 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
         cmdParts.push('-c:v', distortedCuvid);
     }
     cmdParts.push('-i', '"' + distortedPath + '"');
-
+    
     // Add reference file input with CUVID decoder if supported.
         // This keeps both streams in GPU memory from decode to VMAF calculation.
         var tonemapRef = isHdr ? ',tonemap=tonemap=hable:peak=0:desat=0' : '';
@@ -535,7 +535,7 @@ function buildCpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
     } catch (e) {
         // Ignore detection errors; keep default.
     }
-
+    
     if (useGpuDecode) {
         // Use GPU for decoding AV1, but CPU for VMAF analysis
         return [
@@ -567,14 +567,14 @@ function buildCpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
 function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuVmaf, jobLog) {
     var fs = require('fs');
     var execSync = require('child_process').execSync;
-
+    
     var originalSample = result.originalSamplePath || samples[result.sampleIndex];
     var logPath = cacheDir + '/vmaf_' + result.parameterSetId + '_s' + (result.sampleIndex + 1) + '.json';
     var distortedEncoder = (result.parameterSet && result.parameterSet.encoder) || args.variables.vmafTargetCodec || '';
     var isHdr = isHdrContent(args.inputFileObj);
-
+    
     var methods = [];
-
+    
     // Method 1: GPU VMAF (libvmaf_cuda) with scale_cuda - fastest, up to 36x speedup
     // Pure GPU pipeline: CUVID decode → scale_cuda → libvmaf_cuda (no CPU conversion)
     if (hasGpuVmaf) {
@@ -598,35 +598,35 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
         // Log error if GPU VMAF was expected but not available
         console.error('[VMAF Plugin] ERROR: GPU VMAF (libvmaf_cuda) not available - falling back to CPU methods');
     }
-
+    
     // Method 2: GPU decode + CPU VMAF
     methods.push({
         name: 'GPU decode + CPU VMAF',
         cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, true, isHdr),
         expectedTime: '30-90 seconds'
     });
-
+    
     // Method 3: Pure software (fallback)
     methods.push({
         name: 'Software VMAF',
         cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, false, isHdr),
         expectedTime: '60-120 seconds'
     });
-
+    
     var success = false;
     var usedMethod = null;
     var duration = 0;
-
+    
     for (var m = 0; m < methods.length && !success; m++) {
         var method = methods[m];
         jobLog('  [VMAF] Trying: ' + method.name + ' (expected: ' + method.expectedTime + ')');
-
+        
         try {
             var startTime = Date.now();
-            execSync(method.cmd, {
-                stdio: ['ignore', 'pipe', 'pipe'],
-                encoding: 'utf8',
-                maxBuffer: 10 * 1024 * 1024,
+            execSync(method.cmd, { 
+                stdio: ['ignore', 'pipe', 'pipe'], 
+                encoding: 'utf8', 
+                maxBuffer: 10 * 1024 * 1024, 
                 shell: true,
                 timeout: 300000 // 5 minute timeout
             });
@@ -634,7 +634,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
             success = true;
             usedMethod = method.name;
             jobLog('  [VMAF] Success: ' + method.name + ' completed in ' + duration.toFixed(1) + 's');
-
+            
             // Log error to Docker logs if using CPU VMAF instead of GPU
             if (method.name.indexOf('CPU VMAF') !== -1 || method.name.indexOf('Software VMAF') !== -1) {
                 console.error('[VMAF Plugin] WARNING: Using CPU VMAF method: ' + method.name + ' (took ' + duration.toFixed(1) + 's)');
@@ -645,7 +645,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
             var stdout = err.stdout ? err.stdout.toString() : '';
             var stderr = err.stderr ? err.stderr.toString() : '';
             var errorMsg = stderr || stdout || err.message;
-
+            
             // Extract meaningful error (skip version info and configuration)
             // FFmpeg outputs version info first, then the actual error
             var allLines = errorMsg.split('\n');
@@ -666,12 +666,12 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
                 'In',
                 '^$' // empty lines
             ];
-
+            
             // Filter out version/config lines and find actual error
             var errorLines = allLines.filter(function(line) {
                 var trimmed = line.trim();
                 if (trimmed.length === 0) return false;
-
+                
                 // Skip version/config lines
                 for (var p = 0; p < skipPatterns.length; p++) {
                     if (trimmed.indexOf(skipPatterns[p]) !== -1) {
@@ -680,7 +680,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
                 }
                 return true;
             });
-
+            
             // If no filtered lines, try to get the last few lines (where errors usually are)
             if (errorLines.length === 0) {
                 // Get last 10 non-empty lines that aren't version info
@@ -702,7 +702,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
                 }
                 errorLines = lastLines;
             }
-
+            
             // Also look for common error patterns
             var errorPatterns = ['Error', 'Invalid', 'Unknown', 'failed', 'not found', 'cannot', "can't", 'No such'];
             var foundErrorLine = null;
@@ -716,14 +716,14 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
                 }
                 if (foundErrorLine) break;
             }
-
+            
             var meaningfulError = '';
             var isPtxError = false;
             var isScaleCudaError = false;
-
+            
             // Check for scale_cuda PTX version errors (for logging/debugging)
             // Tested error pattern: "cuModuleLoadData(cu_module, data) failed -> CUDA_ERROR_UNSUPPORTED_PTX_VERSION: the provided PTX was compiled with an unsupported toolchain."
-            if (errorMsg.indexOf('CUDA_ERROR_UNSUPPORTED_PTX_VERSION') !== -1 ||
+            if (errorMsg.indexOf('CUDA_ERROR_UNSUPPORTED_PTX_VERSION') !== -1 || 
                 errorMsg.indexOf('unsupported PTX version') !== -1 ||
                 (errorMsg.indexOf('PTX version') !== -1 && errorMsg.indexOf('unsupported') !== -1) ||
                 (errorMsg.indexOf('cuModuleLoadData') !== -1 && errorMsg.indexOf('failed') !== -1 && errorMsg.indexOf('PTX') !== -1) ||
@@ -735,7 +735,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
                 console.error('[VMAF Plugin] Error: CUDA_ERROR_UNSUPPORTED_PTX_VERSION - GPU VMAF will fall back to CPU VMAF.');
             }
             // Check for scale_cuda format conversion errors
-            else if (errorMsg.indexOf('Impossible to convert between') !== -1 &&
+            else if (errorMsg.indexOf('Impossible to convert between') !== -1 && 
                      errorMsg.indexOf('scale_cuda') !== -1) {
                 isScaleCudaError = true;
                 meaningfulError = 'scale_cuda format conversion error: The CUDA scaling filter cannot convert between the required formats.';
@@ -744,7 +744,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
             }
             // Check for other scale_cuda filter errors (any error involving scale_cuda)
             else if (errorMsg.indexOf('scale_cuda') !== -1 && (
-                errorMsg.indexOf('Error') !== -1 ||
+                errorMsg.indexOf('Error') !== -1 || 
                 errorMsg.indexOf('failed') !== -1 ||
                 errorMsg.indexOf('Invalid') !== -1 ||
                 errorMsg.indexOf('reinitializing filters') !== -1)) {
@@ -765,13 +765,13 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
             } else {
                 meaningfulError = errorMsg.substring(0, 500);
             }
-
+            
             // Store error type for fallback logic
             method.ptxError = isPtxError;
             method.scaleCudaError = isScaleCudaError;
-
+            
             jobLog('  [VMAF] Failed: ' + method.name + ' - ' + meaningfulError.substring(0, 200));
-
+            
             // Log error to Docker logs if GPU VMAF fails
             if (method.name.indexOf('GPU VMAF') !== -1 || method.name.indexOf('libvmaf_cuda') !== -1) {
                 if (isScaleCudaError) {
@@ -796,7 +796,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
             }
         }
     }
-
+    
     if (!success) {
         return {
             success: false,
@@ -804,7 +804,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
             error: 'All VMAF methods failed'
         };
     }
-
+    
     // Parse results
     var vmafData = parseVmafLog(logPath, fs);
     if (!vmafData || vmafData.vmafScore === null || isNaN(vmafData.vmafScore)) {
@@ -814,7 +814,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
             error: 'Failed to parse VMAF score from log'
         };
     }
-
+    
     return {
         success: true,
         result: Object.assign({}, result, {
@@ -842,22 +842,22 @@ function calculateSingleVmafAsync(args, result, samples, cacheDir, modelPath, ha
         var originalSample = result.originalSamplePath || samples[result.sampleIndex];
         var logPath = cacheDir + '/vmaf_' + result.parameterSetId + '_s' + (result.sampleIndex + 1) + '.json';
         var isHdr = isHdrContent(args.inputFileObj);
-
+        
         var methods = [];
-
+        
         // For parallel CPU execution, skip GPU VMAF (it's better to run sequentially)
         // Method 1: GPU decode + CPU VMAF
         methods.push({
             name: 'GPU decode + CPU VMAF',
             cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, true, isHdr)
         });
-
+        
         // Method 2: Pure software (fallback)
         methods.push({
             name: 'Software VMAF',
             cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, false, isHdr)
         });
-
+        
         function tryMethod(methodIndex) {
             if (methodIndex >= methods.length) {
                 resolve({
@@ -867,16 +867,16 @@ function calculateSingleVmafAsync(args, result, samples, cacheDir, modelPath, ha
                 });
                 return;
             }
-
+            
             var method = methods[methodIndex];
             var startTime = Date.now();
-
-            runCommand('bash', ['-c', method.cmd], {
+            
+            runCommand('bash', ['-c', method.cmd], { 
                 stdio: ['ignore', 'pipe', 'pipe'],
                 timeout: 300000
             }).then(function(cmdResult) {
                 var duration = (Date.now() - startTime) / 1000;
-
+                
                 if (cmdResult.code === 0) {
                     var vmafData = parseVmafLog(logPath, fs);
                     if (vmafData && vmafData.vmafScore !== null && !isNaN(vmafData.vmafScore)) {
@@ -910,7 +910,7 @@ function calculateSingleVmafAsync(args, result, samples, cacheDir, modelPath, ha
                 tryMethod(methodIndex + 1);
             });
         }
-
+        
         tryMethod(0);
     });
 }
@@ -928,26 +928,26 @@ var plugin = async function (args) {
     args.inputs = lib.loadDefaultValues(args.inputs, details);
     var fs = require('fs');
     var execSync = require('child_process').execSync;
-
+    
     var maxParallel = parseInt(args.inputs.maxParallelVmaf) || 4;
     var maxParallelGpu = parseInt(args.inputs.maxParallelGpuVmaf) || 2;
     if (maxParallelGpu < 1) maxParallelGpu = 1;
     if (maxParallelGpu > 6) maxParallelGpu = 6;
     var testResults = args.variables.vmafTestResults || [];
     var samples = args.variables.vmafSamples || [];
-
+    
     if (testResults.length === 0) {
         var errorMsg = 'VMAF calculation failed: No test results found. Run Test Encoding Parameters first.';
         args.jobLog('Error: ' + errorMsg);
         throw new Error(errorMsg);
     }
-
+    
     var cacheDir = args.workDir || '/temp';
-
+    
     // Check for GPU VMAF support (libvmaf_cuda)
     args.jobLog('=== VMAF Capability Detection ===');
     args.jobLog('Using FFmpeg: ' + args.ffmpegPath);
-
+    
     var hasGpuVmaf = checkGpuVmafSupport(args.ffmpegPath);
     if (hasGpuVmaf) {
         args.jobLog('✅ GPU VMAF (libvmaf_cuda): AVAILABLE - up to 36x faster!');
@@ -962,7 +962,7 @@ var plugin = async function (args) {
         args.jobLog('   Will use CPU VMAF with ' + maxParallel + ' parallel workers');
         args.jobLog('   To enable GPU VMAF, rebuild FFmpeg with --enable-cuda-nvcc');
     }
-
+    
     var requireGpuVmaf = args.variables.vmafRequireGpuVmaf === true;
     args.variables.vmafGpuVmafAvailable = hasGpuVmaf;
     args.variables.vmafGpuVmafRequired = requireGpuVmaf;
@@ -976,7 +976,7 @@ var plugin = async function (args) {
         args.variables.vmafHdrPolicy = 'PQ/HDR content is pre-processed with tonemap=hable before VMAF to convert to BT.709 gamma, making VMAF scores calibrated and cross-comparable with SDR content; HDR output metadata preserved separately in the transcode step';
         args.jobLog('HDR VMAF policy: using the resolution-specific standard VMAF model on libvmaf_cuda. Native HDR VMAF is not available in this stack; scores are a consistent proxy, not a dynamic-HDR preservation guarantee.');
     }
-
+    
     // Find VMAF model based on resolution
     var modelPath = findVmafModel(fs, args.inputFileObj);
     if (modelPath) {
@@ -1004,11 +1004,11 @@ var plugin = async function (args) {
             height = videoStreamForModel.height || 0;
             is4K = width >= 3840 || height >= 2160;
         }
-
+        
         var modelType = modelPath.indexOf('vmaf_4k') !== -1 ? '4K optimized' : 'Standard (1080p)';
         args.jobLog('Using VMAF model: ' + modelPath);
         args.jobLog('  Model type: ' + modelType + ' for resolution ' + width + 'x' + height);
-
+        
         // Log warning if wrong model type is being used
         if (is4K && modelPath.indexOf('vmaf_4k') === -1) {
             console.error('[VMAF Plugin] WARNING: 4K content detected but using standard VMAF model. Results may be less accurate.');
@@ -1027,15 +1027,15 @@ var plugin = async function (args) {
         args.jobLog('ERROR: ' + missingMsg);
         throw new Error(missingMsg);
     }
-
+    
     // Filter valid test results
     var validResults = [];
     var skippedResults = [];
-
+    
     for (var i = 0; i < testResults.length; i++) {
         var result = testResults[i];
         var skipReason = null;
-
+        
         if (!result || !result.outputPath) {
             skipReason = 'missing outputPath';
         } else if (result.sampleIndex === undefined || result.sampleIndex === null) {
@@ -1048,26 +1048,26 @@ var plugin = async function (args) {
                 skipReason = 'missing original sample';
             }
         }
-
+        
         if (skipReason) {
             skippedResults.push({ result: result, reason: skipReason });
         } else {
             validResults.push(result);
         }
     }
-
+    
     if (skippedResults.length > 0) {
         args.jobLog('Skipped ' + skippedResults.length + ' invalid results');
     }
-
+    
     args.jobLog('');
     args.jobLog('=== Starting VMAF Calculations ===');
     args.jobLog('Total samples to process: ' + validResults.length);
-
+    
     if (args.updateWorker) {
         args.updateWorker({ percentage: 0 });
     }
-
+    
     var vmafResults = [];
     var successfulCalculations = 0;
     var failedCalculations = 0;
@@ -1075,16 +1075,16 @@ var plugin = async function (args) {
     var completedCount = 0;
     var cpuFallbackQueue = [];
     var stopGpuFastPath = false;
-
+    
     // GPU VMAF: Run sequentially (GPU handles parallelism internally)
     // CPU VMAF: Run in parallel batches
     if (hasGpuVmaf) {
         args.jobLog('Processing with GPU VMAF (parallel up to ' + maxParallelGpu + ')...');
-
+        
         var queue = validResults.slice();
         var active = 0;
         var completed = 0;
-
+        
         function runNext() {
             if (queue.length === 0) return null;
             if (active >= maxParallelGpu) return null;
@@ -1100,7 +1100,7 @@ var plugin = async function (args) {
                     successfulCalculations++;
                     gpuVmafActuallyUsed = true;
                     completedCount++;
-                    args.jobLog('  VMAF Score: ' + vmafCalcResult.result.vmafScore.toFixed(2) +
+                    args.jobLog('  VMAF Score: ' + vmafCalcResult.result.vmafScore.toFixed(2) + 
                         ' (harmonic), Method: ' + vmafCalcResult.method + ', Time: ' + vmafCalcResult.duration.toFixed(1) + 's');
                 } else {
                     args.jobLog('  FAILED (GPU fast path): ' + vmafCalcResult.error + ' - disabling GPU fast path for remaining samples');
@@ -1112,7 +1112,7 @@ var plugin = async function (args) {
                 }
                 var progressPercent = Math.round((completedCount / validResults.length) * 100);
                 if (args.updateWorker) {
-                    args.updateWorker({
+                    args.updateWorker({ 
                         percentage: progressPercent,
                         ETA: Math.max(0, Math.round((validResults.length - completedCount) * 5))
                     });
@@ -1120,7 +1120,7 @@ var plugin = async function (args) {
                 return runNext();
             });
         }
-
+        
         var runners = [];
         for (var r = 0; r < Math.min(maxParallelGpu, validResults.length); r++) {
             var nxt = runNext();
@@ -1129,7 +1129,7 @@ var plugin = async function (args) {
         if (runners.length > 0) {
             await Promise.all(runners);
         }
-
+        
         if (cpuFallbackQueue.length > 0) {
             args.variables.vmafGpuVmafFallbackUsed = true;
             if (requireGpuVmaf) {
@@ -1166,32 +1166,32 @@ var plugin = async function (args) {
         console.error('[VMAF Plugin] ERROR: Processing with CPU VMAF instead of GPU VMAF - This will be much slower!');
         console.error('[VMAF Plugin] Total samples to process: ' + validResults.length);
         args.jobLog('Processing with CPU VMAF (' + maxParallel + ' parallel workers)...');
-
+        
         var cpuQueueAll = validResults.slice();
         while (cpuQueueAll.length > 0) {
             var batchCpuOnly = cpuQueueAll.splice(0, Math.max(1, maxParallel));
-
+            
             // Log queued samples for visibility
             for (var q = 0; q < batchCpuOnly.length; q++) {
                 var queuedItem = batchCpuOnly[q];
                 args.jobLog('[' + (completedCount + q + 1) + '/' + validResults.length + '] ' + queuedItem.parameterSetId + ' sample ' + (queuedItem.sampleIndex + 1) + ' (CPU queued)');
             }
-
+            
             var cpuResultsOnly = await processBatch(batchCpuOnly, args, samples, cacheDir, modelPath, false);
             for (var bc = 0; bc < cpuResultsOnly.length; bc++) {
                 var resCpu = cpuResultsOnly[bc];
                 completedCount++;
-
+                
                 if (resCpu.success) {
                     vmafResults.push(resCpu.result);
                     successfulCalculations++;
                     args.jobLog('  CPU VMAF success: ' + resCpu.method + ' | Sample ' + (resCpu.result.sampleIndex + 1) + ' | VMAF ' + resCpu.result.vmafScore.toFixed(2));
-
+                    
                     if (resCpu.method && (resCpu.method.indexOf('CPU VMAF') !== -1 || resCpu.method.indexOf('Software VMAF') !== -1)) {
-                        console.error('[VMAF Plugin] CPU VMAF used: Sample ' + completedCount + '/' + validResults.length +
+                        console.error('[VMAF Plugin] CPU VMAF used: Sample ' + completedCount + '/' + validResults.length + 
                             ' - Method: ' + resCpu.method + ' - Time: ' + resCpu.duration.toFixed(1) + 's');
                     }
-
+                    
                     if (resCpu.result.vmafMin !== null && resCpu.result.vmafMin < 70) {
                         args.jobLog('  ⚠️  Warning: Min VMAF ' + resCpu.result.vmafMin.toFixed(2) + ' - some frames may have artifacts');
                     }
@@ -1199,10 +1199,10 @@ var plugin = async function (args) {
                     failedCalculations++;
                     args.jobLog('  CPU VMAF FAILED: ' + resCpu.error);
                 }
-
+                
                 var progressPercentCpu = Math.round((completedCount / validResults.length) * 100);
                 if (args.updateWorker) {
-                    args.updateWorker({
+                    args.updateWorker({ 
                         percentage: progressPercentCpu,
                         ETA: Math.round((validResults.length - completedCount) * 60) // ~60s per sample with CPU VMAF
                     });
@@ -1210,31 +1210,31 @@ var plugin = async function (args) {
             }
         }
     }
-
+    
     // Validation
     var totalAttempts = validResults.length;
-
+    
     if (totalAttempts === 0) {
         throw new Error('VMAF calculation failed: No valid test results to process');
     }
-
+    
     if (successfulCalculations === 0) {
         throw new Error('VMAF calculation failed: All ' + totalAttempts + ' calculation attempts failed');
     }
-
+    
     var successRate = successfulCalculations / totalAttempts;
     if (successRate < 0.5) {
         throw new Error('VMAF calculation success rate too low (' + (successRate * 100).toFixed(1) + '%)');
     }
-
+    
     if (successRate < 0.8) {
         args.jobLog('WARNING: VMAF success rate is ' + (successRate * 100).toFixed(1) + '%');
     }
-
+    
     // Aggregate results by parameter set
     args.jobLog('');
     args.jobLog('=== Aggregating Results ===');
-
+    
     var aggregated = {};
     for (var n = 0; n < vmafResults.length; n++) {
         var r = vmafResults[n];
@@ -1285,7 +1285,7 @@ var plugin = async function (args) {
         }
         aggregated[r.parameterSetId].fileSizes.push(r.fileSizeMB);
     }
-
+    
     var aggregatedResults = [];
     for (var key in aggregated) {
         var item = aggregated[key];
@@ -1313,7 +1313,7 @@ var plugin = async function (args) {
             }, 0) / item.vmafScores.length;
         }
         var stdDev = Math.sqrt(variance);
-
+        
         aggregatedResults.push({
             parameterSetId: item.parameterSetId,
             parameterSet: item.parameterSet,
@@ -1331,31 +1331,31 @@ var plugin = async function (args) {
             sampleCount: item.vmafScores.length,
             vmafStdDev: stdDev,
         });
-
+        
         args.jobLog(key + ': VMAF=' + avgVMAF.toFixed(2) + ', 1%low=' +
             (overallP1 !== null ? overallP1.toFixed(2) : 'N/A') + ', Min=' +
             (overallMin !== null ? overallMin.toFixed(2) : 'N/A') + ', SSIM=' +
             (avgSSIM !== null ? avgSSIM.toFixed(2) : 'N/A') + ', CAMBI=' +
             (avgCAMBI !== null ? avgCAMBI.toFixed(2) : 'N/A') + ', Size=' + avgSize.toFixed(2) + 'MB');
     }
-
+    
     args.variables.vmafAggregatedResults = aggregatedResults;
     args.variables.vmafResults = vmafResults;
     args.variables.vmafGpuAccelerated = gpuVmafActuallyUsed;
     args.variables.vmafUsedGpuVmaf = gpuVmafActuallyUsed; // Track if GPU VMAF was actually used (not just available)
     args.variables.vmafGpuVmafActuallyUsed = gpuVmafActuallyUsed;
-
+    
     args.jobLog('');
     args.jobLog('=== VMAF Calculation Complete ===');
     args.jobLog('Processed: ' + successfulCalculations + '/' + totalAttempts + ' samples');
     args.jobLog('Parameter sets: ' + aggregatedResults.length);
     args.jobLog('GPU VMAF available: ' + (hasGpuVmaf ? 'Yes' : 'No'));
     args.jobLog('GPU VMAF actually used: ' + (gpuVmafActuallyUsed ? 'Yes' : 'No'));
-
+    
     if (args.updateWorker) {
         args.updateWorker({ percentage: 100 });
     }
-
+    
     return {
         outputFileObj: args.inputFileObj,
         outputNumber: 1,

@@ -36,7 +36,7 @@ Uses FFmpeg scene-change analysis to estimate how variable the source is. More v
 
 ### `extractVideoSamples`
 
-Creates short representative source samples for testing. It also loads learned CQ priors from previous runs so the sweep can begin near a likely-good range instead of starting from scratch.
+Creates short representative source samples for testing. It also loads learned CQ priors from previous runs via `vmafdb.js` and `vmafpredict.js` (`plugins/vmaf/_lib/`) so the sweep can begin near a likely-good range instead of starting from scratch. The `vmafJobId` is seeded here and propagated through the full flow to link all records for a job together.
 
 Important details:
 
@@ -67,9 +67,7 @@ Handles retry decisions when the CQ range or selection result is inadequate. It 
 
 ### `selectBestParameters`
 
-Chooses the final candidate. This is the main policy engine.
-
-It considers:
+Chooses the final candidate. This is the main policy engine. It considers:
 
 - mean/harmonic VMAF
 - 1%-low frame VMAF
@@ -79,8 +77,11 @@ It considers:
 - CAMBI/banding score where available
 - holdout validation
 - learned risk policy for resolution/HDR/content class
+- constraint-aware selectCQ from `vmafpredict.js` (`plugins/vmaf/_lib/`), which picks the cheapest CQ that satisfies all constraints simultaneously
 
 The selected CQ is the most efficient candidate that still clears the quality and safety guards. If no candidate is acceptable, retry plugins get a chance to test safer values.
+
+During Phase 3 (A/B-shadow deployment), this plugin logs a `[SHADOW]` line comparing the new constraint-aware `selectCQ` pick against the live pick — no behavior change until shadow mode is disabled.
 
 ### `vmafOptimizedTranscode`
 
@@ -94,13 +95,17 @@ Tracks final transcode failures and decides whether a retry should use a previou
 
 ### `exportVMAFResults`
 
-Writes detailed per-candidate and per-file quality/size data to CSV. This is useful for later analysis and for improving the learning model.
+Writes detailed per-candidate and per-file quality/size data to CSV (legacy path) and dual-writes the sweep curve to SQLite via `vmafdb.js`. The SQLite record includes VMAF, CAMBI, 1%-low VMAF, SSIM, and the source/decision context — signals the legacy CSV never stored. This is useful for later analysis and for improving the learning model.
 
 ### `learnCQRange`
 
-Updates the CQ learning state from completed runs. It records what was tested, what was selected, whether targets were met, retry behavior, media/source buckets, and model-fit information.
+Updates the CQ learning state from completed runs. It records what was tested, what was selected, whether targets were met, retry behavior, media/source buckets, and model-fit information. The `source_cambi` and `source_cambi_p95` columns are recorded to allow future CQ predictions to account for the source's banding risk. Dual-writes the job outcome to SQLite.
 
 Future files can use this state to start with narrower and better CQ ranges.
+
+### `learnCQRanges`
+
+A secondary learning plugin that maintains per-resolution and per-content-class CQ tier boundaries. It aggregates successful outcomes into discrete CQ buckets (e.g. "1080p animation", "4k live-action") to provide a fast fallback when the full SQLite predictor is unavailable or has insufficient history for a new source type.
 
 ### `cleanupTempFiles`
 

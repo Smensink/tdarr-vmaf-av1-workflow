@@ -20,7 +20,7 @@ A usual Tdarr install often applies a static preset. This workflow instead build
 └──────────┬───────────┘
            │
 ┌──────────▼───────────┐
-│ Tdarr config state    │  CSV/JSON learning data and result history
+│ Tdarr config state    │  SQLite + CSV learning data and result history
 └──────────────────────┘
 ```
 
@@ -77,16 +77,18 @@ Typical Tdarr runtime paths:
 /app/Tdarr_Node/assets/app/plugins/FlowPlugins/LocalFlowPlugins/vmaf/<plugin>/1.0.0/index.js
 ```
 
-Both runtime paths matter. The UI/server and node worker can otherwise run different copies.
+The plugin code communicates through `args.variables`. Longer-lived learning state is stored in Tdarr's config directory as an SQLite database (`vmaf_training.db`) for new data, with legacy CSV files (`vmaf_results.csv`, `vmaf_cq_learning.csv`) retained for backward compatibility.
 
 ## Learning state
 
-The workflow writes two kinds of output:
+The learning system uses **SQLite as the primary store** for new transcode data. The library (`plugins/vmaf/_lib/vmafdb.js`) manages two tables:
 
-- detailed result rows for analysis
-- CQ-learning state used by future jobs
+- **jobs** — one row per transcode: source facts (resolution, codec, bitrate, source CAMBI, bit depth), the CQ decision made, and the measured outcome (actual VMAF, CAMBI, output size).
+- **sweep_points** — one row per (job, CQ) pair: the measured CQ→VMAF/CAMBI/size curve for that file. These curves are content-independent and are pooled across dissimilar sources to predict a good CQ centre before a sweep runs.
 
-The learning system is not magic. It narrows future searches by observing what CQ values worked for similar source tiers. If the prediction is wrong, the bracket/holdout/retry logic still has to protect the final choice.
+The predictor (`plugins/vmaf/_lib/vmafpredict.js`) uses pooled sweep curves from similar past jobs to predict a CQ centre, then runs a sequential root-finding sweep on the file's own measured curve — converging in ~2–3 transcodes instead of a static grid. Constraint-aware logic prevents converging on a CQ that would fail the CAMBI floor or 1%-low VMAF guard.
+
+The legacy CSV files are not cross-linked with new SQLite jobs (they shared no common key). New jobs are unified by `vmafJobId`, a shared variable seeded by `extractVideoSamples` and propagated through the full flow.
 
 ## Why the FFmpeg/libvmaf runtime is part of the architecture
 

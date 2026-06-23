@@ -61,15 +61,15 @@ exports.details = details;
 var plugin = function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
-
+    
     var maxRetries = Number(args.inputs.maxRetries) || 2;
-
+    
     // ENHANCEMENT FIX #14: Input validation
     if (isNaN(maxRetries) || maxRetries < 0) {
         args.jobLog('WARNING: Invalid maxRetries (' + args.inputs.maxRetries + '), using default 2');
         maxRetries = 2;
     }
-
+    
     // ENHANCEMENT FIX #17: Store maxRetries in variables so selectBestParameters can use it
     args.variables.vmafMaxRetries = maxRetries;
 
@@ -79,7 +79,7 @@ var plugin = function (args) {
         retryCount = 0;
         args.variables.vmafRetryCount = 0;
     }
-
+    
     // ENHANCEMENT FIX #16: Progress reporting for retry loops
     if (args.updateWorker) {
         args.updateWorker({
@@ -89,23 +89,23 @@ var plugin = function (args) {
             preset: 'CQ Range Retry Check (Attempt ' + (retryCount + 1) + ' / ' + maxRetries + ')'
         });
     }
-
+    
     var vmafHeadroomThreshold = Number(args.inputs.vmafHeadroomThreshold) || 5;
     var vmafBelowThresholdMargin = Number(args.inputs.vmafBelowThresholdMargin) || 5;
-
+    
     // Get VMAF thresholds (may already be adjusted by selectBestParameters)
     var baseMinVMAF = args.variables.vmafMinVMAF || 90;
     var baseMinFrameVMAF = args.variables.vmafMinFrameVMAF || 0;
-
+    
     // Apply 10-bit buffer if needed (in case checkCQRangeRetry runs before selectBestParameters)
     var vmafBuffer10Bit = args.variables.vmafBuffer10Bit;
     var bufferApplied = args.variables.vmafBufferApplied === true;
-
+    
     // If buffer not yet applied, check if we need to apply it
     if (vmafBuffer10Bit === undefined || vmafBuffer10Bit === null) {
         vmafBuffer10Bit = 5; // Default buffer
     }
-
+    
     if (!bufferApplied && vmafBuffer10Bit > 0) {
         // Detect 10-bit source
         var is10BitSource = args.variables.is10BitSource;
@@ -134,36 +134,36 @@ var plugin = function (args) {
                 }
             }
         }
-
+        
         // Check if GPU VMAF was actually used
         var gpuVmafActuallyUsed = args.variables.vmafUsedGpuVmaf === true;
-
+        
         // Apply buffer if conditions are met
         if (is10BitSource && gpuVmafActuallyUsed) {
             bufferApplied = true;
             args.variables.vmafBufferApplied = true;
         }
     }
-
+    
     // Use adjusted thresholds (either from selectBestParameters or apply buffer here)
     var minVMAF = baseMinVMAF;
     var minFrameVMAF = baseMinFrameVMAF;
-
+    
     if (bufferApplied && vmafBuffer10Bit > 0) {
         minVMAF = Math.max(0, baseMinVMAF - vmafBuffer10Bit);
         minFrameVMAF = Math.max(0, baseMinFrameVMAF - vmafBuffer10Bit);
         args.variables.vmafMinVMAF = minVMAF;
         args.variables.vmafMinFrameVMAF = minFrameVMAF;
     }
-
+    
     // Check if this is a sweep retry triggered by monitorTranscodeRetry
     var sweepRetryTriggered = args.variables.vmafTriggerSweepRetry === true;
     var sweepRetryReason = args.variables.vmafSweepRetryReason || '';
-
+    
     args.jobLog('=== VMAF-Aware CQ Range Retry Check ===');
     args.jobLog('Current retry count: ' + retryCount + ' / ' + maxRetries);
     args.jobLog('VMAF thresholds: minVMAF=' + minVMAF + ', minFrameVMAF=' + minFrameVMAF);
-
+    
     // Helper function to check if a result meets VMAF thresholds
     function meetsVMAFThreshold(result) {
         if (!result) return false;
@@ -173,19 +173,19 @@ var plugin = function (args) {
         }
         return true;
     }
-
+    
     // Helper function to check if VMAF is significantly below threshold
     function isSignificantlyBelowThreshold(vmaf) {
         var threshold = minVMAF - vmafBelowThresholdMargin;
         return vmaf < threshold;
     }
-
+    
     // Helper function to check if any tested higher CQ has acceptable VMAF
     function hasValidHigherCQ(currentMaxCQ, aggregatedResults) {
         for (var i = 0; i < aggregatedResults.length; i++) {
             var result = aggregatedResults[i];
-            if (result.parameterSet &&
-                result.parameterSet.quality !== undefined &&
+            if (result.parameterSet && 
+                result.parameterSet.quality !== undefined && 
                 result.parameterSet.quality > currentMaxCQ) {
                 if (meetsVMAFThreshold(result)) {
                     return {
@@ -199,7 +199,7 @@ var plugin = function (args) {
         }
         return { hasValid: false };
     }
-
+    
     // Helper function to find highest CQ with acceptable VMAF (evidence for retry)
     function findHighestValidCQ(aggregatedResults) {
         var highest = null;
@@ -220,7 +220,7 @@ var plugin = function (args) {
         }
         return highest;
     }
-
+    
     // Helper function to check if CQ range is exhausted
     function isCQRangeExhausted(testedCQs) {
         if (!testedCQs || testedCQs.length === 0) return false;
@@ -230,17 +230,17 @@ var plugin = function (args) {
         var rangeSpan = maxTested - minTested;
         return rangeSpan >= 30 && minTested <= 18 && maxTested >= 48;
     }
-
+    
     // Helper: VMAF trend-based increment using weighted drop per CQ step
     function calculateVMAFTrendBasedIncrement(results, currentCQ, minVMAF, fudgeFactor, cqStepSize) {
         if (!results || results.length < 2) return null;
-
+        
         var byCQ = results.filter(function(r) {
             return r && r.parameterSet && r.parameterSet.quality !== undefined && r.avgVMAF !== undefined;
         }).sort(function(a, b) { return a.parameterSet.quality - b.parameterSet.quality; });
-
+        
         if (byCQ.length < 2) return null;
-
+        
         var weightedDrop = 0;
         var weightTotal = 0;
         for (var i = 0; i < byCQ.length - 1; i++) {
@@ -255,11 +255,11 @@ var plugin = function (args) {
             weightedDrop += dropRate * weight;
             weightTotal += weight;
         }
-
+        
         if (weightTotal === 0) return null;
         var avgDropPerStep = weightedDrop / weightTotal;
         if (avgDropPerStep <= 0) return null;
-
+        
         var currentEntry = null;
         for (var c = 0; c < byCQ.length; c++) {
             if (byCQ[c].parameterSet.quality === currentCQ) {
@@ -276,7 +276,7 @@ var plugin = function (args) {
             }
             if (!currentEntry) currentEntry = byCQ[0];
         }
-
+        
         var currentVMAF = currentEntry.avgVMAF || 0;
         var targetFloor = minVMAF + (fudgeFactor || 0);
         var vmafMargin = currentVMAF - targetFloor;
@@ -284,7 +284,7 @@ var plugin = function (args) {
         if (calculatedIncrement < cqStepSize) calculatedIncrement = cqStepSize;
         var cappedIncrement = Math.min(calculatedIncrement, 30);
         var targetCQ = Math.min(51, currentCQ + cappedIncrement);
-
+        
         return {
             increment: cappedIncrement,
             targetCQ: targetCQ,
@@ -294,26 +294,26 @@ var plugin = function (args) {
             pairsUsed: byCQ.length - 1
         };
     }
-
+    
     // Handle sweep retry triggered by monitorTranscodeRetry
     if (sweepRetryTriggered) {
         args.jobLog('');
         args.jobLog('🔄 SWEEP RETRY TRIGGERED by transcode failure');
         args.jobLog('Reason: ' + sweepRetryReason);
-
+        
         // Clear the trigger flag
         args.variables.vmafTriggerSweepRetry = false;
         args.variables.vmafSweepRetryReason = '';
-
+        
         // Check if we have the override CQ range set by monitorTranscodeRetry
         var overrideCQMin = args.variables.vmafOverrideCQMin;
         var overrideCQMax = args.variables.vmafOverrideCQMax;
-
+        
         if (overrideCQMin !== undefined && overrideCQMax !== undefined) {
             // Check retry count
             if (retryCount >= maxRetries) {
                 args.jobLog('⚠ Maximum retries (' + maxRetries + ') reached - cannot retry sweep');
-
+                
                 // Store tracking info for learning
                 if (!args.variables.vmafCQRangeRetryHistory) {
                     args.variables.vmafCQRangeRetryHistory = [];
@@ -340,7 +340,7 @@ var plugin = function (args) {
                     variables: args.variables,
                 };
             }
-
+            
             // Increment retry count
             args.variables.vmafRetryCount = retryCount + 1;
             // Flag the final permitted retry so monitorTranscodeRetry gives up gracefully
@@ -348,14 +348,14 @@ var plugin = function (args) {
             if (args.variables.vmafRetryCount >= maxRetries) {
                 args.variables.vmafSweepRetriesExhausted = true;
             }
-
+            
             // Clear previous test results to force re-testing
             // But preserve vmafTestedCQs to avoid retesting
             args.variables.vmafTestResults = [];
             args.variables.vmafResults = [];
             args.variables.vmafAggregatedResults = [];
             args.variables.vmafBestParameters = null;
-
+            
             // Store tracking info for learning
             if (!args.variables.vmafCQRangeRetryHistory) {
                 args.variables.vmafCQRangeRetryHistory = [];
@@ -366,11 +366,11 @@ var plugin = function (args) {
                 executed: true,
                 retryCount: args.variables.vmafRetryCount
             });
-
+            
             args.jobLog('');
             args.jobLog('✓ EXECUTING SWEEP RETRY with CQ range: ' + overrideCQMin + ' - ' + overrideCQMax);
             args.jobLog('Retry attempt: ' + args.variables.vmafRetryCount + ' / ' + maxRetries);
-
+            
             return {
                 outputFileObj: args.inputFileObj,
                 outputNumber: 1,
@@ -385,7 +385,7 @@ var plugin = function (args) {
             };
         }
     }
-
+    
     // Regular CQ range retry logic (from selectBestParameters)
     var bestParams = args.variables.vmafBestParameters;
     var selectOutput = args.variables.vmafSelectOutput || 1;
@@ -396,7 +396,7 @@ var plugin = function (args) {
     args.variables.vmafTrendIncrementUsed = null;
     args.variables.vmafTrendCurrentVMAF = null;
     args.variables.vmafTrendMargin = null;
-
+    
     // Check for transcode failures from previous runs
     var transcodeFailures = args.variables.vmafTranscodeFailures || [];
     var hasTranscodeFailures = transcodeFailures.length > 0;
@@ -409,12 +409,12 @@ var plugin = function (args) {
             }
         }
     }
-
+    
     var shouldRetry = false;
     var retryReason = '';
     var newCQMin = null;
     var newCQMax = null;
-
+    
     // Get all tested CQ values to avoid retesting
     var allTestedCQs = args.variables.vmafTestedCQs || [];
     var testedCQSet = {};
@@ -425,17 +425,17 @@ var plugin = function (args) {
     var trendFudge = Number(args.variables.vmafTrendFudgeFactor || 2.5);
     var sizeMonitor = args.variables.liveSizeCompare || {};
     var sizeFlagged = sizeMonitor && (sizeMonitor.error === true || sizeMonitor.predictedTooLarge === true);
-
+    
     // Check if retry is needed
     if (selectOutput === 2) {
         // No suitable parameters found - need to retry with different CQ range
         args.jobLog('');
         args.jobLog('No suitable parameters found - evaluating retry options');
-
+        
         // Get current tested CQ range
         var testedCQMin = Infinity;
         var testedCQMax = -Infinity;
-
+        
         for (var i = 0; i < aggregatedResults.length; i++) {
             var result = aggregatedResults[i];
             if (result.parameterSet && result.parameterSet.quality !== undefined) {
@@ -444,7 +444,7 @@ var plugin = function (args) {
                 if (cq > testedCQMax) testedCQMax = cq;
             }
         }
-
+        
         // Handle edge case where no CQ values were tested (shouldn't happen, but be safe)
         if (testedCQMin === Infinity || testedCQMax === -Infinity) {
             // Fallback to default CQ range if no tested values found
@@ -456,12 +456,12 @@ var plugin = function (args) {
         } else {
             args.jobLog('Previously tested CQ range: ' + testedCQMin + ' - ' + testedCQMax);
         }
-
+        
         // Find the best (lowest CQ) that had acceptable VMAF to understand the quality floor
         var lowestValidCQ = null;
         var highestTestedVMAF = 0;
         var highestTestedCQ = null;
-
+        
         for (var j = 0; j < aggregatedResults.length; j++) {
             var res = aggregatedResults[j];
             if (res.parameterSet && res.parameterSet.quality !== undefined) {
@@ -479,14 +479,14 @@ var plugin = function (args) {
                 }
             }
         }
-
+        
         args.jobLog('Highest VMAF achieved: ' + highestTestedVMAF.toFixed(2) + ' at CQ ' + highestTestedCQ);
         if (lowestValidCQ) {
             args.jobLog('Lowest valid CQ (meets threshold): ' + lowestValidCQ.cq + ' with VMAF ' + lowestValidCQ.vmaf.toFixed(2));
         } else {
             args.jobLog('⚠ No tested CQ value met the VMAF threshold');
         }
-
+        
         // Determine retry direction based on VMAF results
         // Retry if: avgVMAF below threshold OR avgVMAF meets threshold but no params passed.
         // The latter can happen for more than minFrameVMAF: selectBestParameters may reject
@@ -498,7 +498,7 @@ var plugin = function (args) {
             // Determine the failure reason
             var isAvgVmafFailure = highestTestedVMAF < minVMAF;
             var isMinFrameFailure = !isAvgVmafFailure && lowestValidCQ === null;
-
+            
             if (isAvgVmafFailure) {
                 // Even the best (lowest CQ) didn't meet threshold - need lower CQ (higher quality)
                 if (isSignificantlyBelowThreshold(highestTestedVMAF)) {
@@ -506,13 +506,13 @@ var plugin = function (args) {
                     args.jobLog('');
                     args.jobLog('⚠ Best VMAF (' + highestTestedVMAF.toFixed(2) + ') is significantly below threshold (' + minVMAF + ')');
                     args.jobLog('  Deficit: ' + (minVMAF - highestTestedVMAF).toFixed(1) + ' points');
-
+                    
                     // Check if we've exhausted lower CQ options
                     if (testedCQMin <= 18) {
                         args.jobLog('⚠ Already tested very low CQ (' + testedCQMin + ') - limited improvement possible');
                     }
                 }
-
+                
                 // Try lower CQ (higher quality)
                 retryReason = 'No parameters met VMAF threshold - trying lower CQ for higher quality';
             } else if (isMinFrameFailure) {
@@ -520,7 +520,7 @@ var plugin = function (args) {
                 args.jobLog('');
                 args.jobLog('⚠ Average VMAF (' + highestTestedVMAF.toFixed(2) + ') meets threshold but per-frame quality too low');
                 args.jobLog('  Some frames fail minFrameVMAF threshold - trying lower CQ to improve worst-case frames');
-
+                
                 retryReason = 'Average VMAF meets threshold but per-frame quality too low - trying lower CQ to improve worst-case frames';
             } else {
                 // Base VMAF passed, but all candidates were rejected by secondary quality guards
@@ -531,18 +531,18 @@ var plugin = function (args) {
 
                 retryReason = 'Selection guards rejected all candidates - trying lower CQ for more bits and safer quality';
             }
-
+            
             shouldRetry = true;
-
+            
             var shiftAmount = 4;
             if (hasTranscodeFailures) {
                 shiftAmount = 6;
                 args.jobLog('Transcode failures detected - using larger CQ shift');
             }
-
+            
             var proposedCQMin = Math.max(16, testedCQMin - shiftAmount);
             var proposedCQMax = Math.max(16, testedCQMax - shiftAmount);
-
+            
             // Filter out already-tested CQ values
             var untestedCQs = [];
             for (var cq = proposedCQMin; cq <= proposedCQMax; cq += 2) {
@@ -550,7 +550,7 @@ var plugin = function (args) {
                     untestedCQs.push(cq);
                 }
             }
-
+            
             // Expand downward if needed
             var expandedMin = proposedCQMin;
             while (expandedMin >= 16 && untestedCQs.length < 3) {
@@ -559,7 +559,7 @@ var plugin = function (args) {
                     untestedCQs.unshift(expandedMin);
                 }
             }
-
+            
             if (untestedCQs.length >= 3) {
                 newCQMin = Math.min.apply(null, untestedCQs);
                 newCQMax = Math.max.apply(null, untestedCQs);
@@ -575,12 +575,12 @@ var plugin = function (args) {
                 args.jobLog('⚠ ' + retryReason);
             }
         }
-
+        
     } else if (bestParams && sizeFlagged) {
         // Live size monitor indicated the output would be too large - try higher CQ using VMAF trend
         var currentCQForTrend = args.variables.vmafTranscodeRetryCQ || (bestParams.parameterSet && bestParams.parameterSet.quality) || suggestedCQMax || 30;
         var trendResult = calculateVMAFTrendBasedIncrement(aggregatedResults, currentCQForTrend, minVMAF, trendFudge, cqStepSize);
-
+        
         if (trendResult && trendResult.increment > 0) {
             var proposedMinSize = Math.min(51, currentCQForTrend + cqStepSize);
             var proposedMaxSize = Math.min(51, trendResult.targetCQ);
@@ -596,7 +596,7 @@ var plugin = function (args) {
                     untestedSizeCQs.push(proposedMaxSize);
                 }
             }
-
+            
             if (untestedSizeCQs.length > 0) {
                 shouldRetry = true;
                 retryReason = 'Size monitor flagged output too large - increasing CQ using VMAF trend';
@@ -612,33 +612,33 @@ var plugin = function (args) {
         } else {
             args.jobLog('? Size monitor triggered but insufficient trend data to propose higher CQ');
         }
-
+        
     } else if (bestParams && suggestedCQMin && suggestedCQMax) {
         // Parameters found but there's headroom - check if worth retrying with higher CQ
         var lowestVMAF = args.variables.vmafBestMinVMAF;
         var bestVMAF = args.variables.vmafBestVMAF || bestParams.avgVMAF;
-
+        
         args.jobLog('');
         args.jobLog('Parameters found - checking for compression headroom');
         args.jobLog('Best VMAF: ' + bestVMAF.toFixed(2) + ', Min VMAF: ' + (lowestVMAF !== null ? lowestVMAF.toFixed(2) : 'N/A'));
-
+        
         if (lowestVMAF !== null && lowestVMAF !== undefined) {
             var headroom = lowestVMAF - minVMAF;
             args.jobLog('VMAF headroom: ' + headroom.toFixed(1) + ' points above threshold');
-
+            
             if (headroom >= vmafHeadroomThreshold) {
                 // Before retrying with higher CQ, verify we have evidence it could work
                 // Check if any tested higher CQ values had acceptable VMAF
                 var currentBestCQ = bestParams.parameterSet ? bestParams.parameterSet.quality : null;
-
+                
                 if (currentBestCQ !== null) {
                     // Check what's the highest CQ that had acceptable VMAF
                     var highestValidCQ = findHighestValidCQ(aggregatedResults);
-
+                    
                     if (highestValidCQ && highestValidCQ.cq > currentBestCQ) {
                         // We have evidence that higher CQ can work
                         args.jobLog('✓ Evidence found: CQ ' + highestValidCQ.cq + ' had VMAF ' + highestValidCQ.vmaf.toFixed(2));
-
+                        
                         // Filter suggested range to exclude already-tested CQ values
                         var untestedCQs2 = [];
                         for (var cq2 = suggestedCQMin; cq2 <= suggestedCQMax; cq2 += 2) {
@@ -646,7 +646,7 @@ var plugin = function (args) {
                                 untestedCQs2.push(cq2);
                             }
                         }
-
+                        
                         // Expand upward if needed
                         var expandedMax = suggestedCQMax;
                         while (expandedMax <= 51 && untestedCQs2.length < 3) {
@@ -655,7 +655,7 @@ var plugin = function (args) {
                                 untestedCQs2.push(expandedMax);
                             }
                         }
-
+                        
                         if (untestedCQs2.length >= 3) {
                             shouldRetry = true;
                             retryReason = 'VMAF headroom of ' + headroom.toFixed(1) + ' points - testing higher CQ for better compression';
@@ -683,29 +683,29 @@ var plugin = function (args) {
             }
         }
     }
-
+    
     // Check retry count limit
     if (shouldRetry && retryCount >= maxRetries) {
         shouldRetry = false;
         retryReason = 'Maximum retries (' + maxRetries + ') reached';
         args.jobLog('⚠ ' + retryReason);
     }
-
+    
     if (shouldRetry && newCQMin !== null && newCQMax !== null) {
         // Increment retry count
         args.variables.vmafRetryCount = retryCount + 1;
-
+        
         // Set override CQ range for next test
         args.variables.vmafOverrideCQMin = newCQMin;
         args.variables.vmafOverrideCQMax = newCQMax;
-
+        
         // Clear previous test results to force re-testing
         // But preserve vmafTestedCQs to avoid retesting
         args.variables.vmafTestResults = [];
         args.variables.vmafResults = [];
         args.variables.vmafAggregatedResults = [];
         args.variables.vmafBestParameters = null;
-
+        
         // Store tracking info for learning
         if (!args.variables.vmafCQRangeRetryHistory) {
             args.variables.vmafCQRangeRetryHistory = [];
@@ -718,12 +718,12 @@ var plugin = function (args) {
             previousBestVMAF: args.variables.vmafBestVMAF || null,
             previousBestCQ: bestParams && bestParams.parameterSet ? bestParams.parameterSet.quality : null
         });
-
+        
         args.jobLog('');
         args.jobLog('✓ RETRYING with CQ range: ' + newCQMin + ' - ' + newCQMax);
         args.jobLog('Reason: ' + retryReason);
         args.jobLog('Retry attempt: ' + args.variables.vmafRetryCount + ' / ' + maxRetries);
-
+        
         return {
             outputFileObj: args.inputFileObj,
             outputNumber: 1,
@@ -733,7 +733,7 @@ var plugin = function (args) {
         // Check if we've exhausted all options
         if (!bestParams && selectOutput === 2 && retryCount >= maxRetries) {
             var cqRangeExhausted = isCQRangeExhausted(allTestedCQs);
-
+            
             // Find best VMAF achieved
             var bestVMAFAchieved = 0;
             var bestCQAchieved = null;
@@ -745,7 +745,7 @@ var plugin = function (args) {
                     }
                 }
             }
-
+            
             if (cqRangeExhausted) {
                 var errorMsg = 'IMPOSSIBLE: Cannot achieve target VMAF (' + minVMAF + ') with any CQ value in the valid range (16-51), even after ' + retryCount + ' retry attempts. ';
                 errorMsg += 'Tested CQ range: ' + (allTestedCQs.length > 0 ? Math.min.apply(null, allTestedCQs) + '-' + Math.max.apply(null, allTestedCQs) : 'unknown') + '. ';
@@ -772,7 +772,7 @@ var plugin = function (args) {
                 args.jobLog('⚠ No suitable parameters found after ' + retryCount + ' retries');
             }
         }
-
+        
         return {
             outputFileObj: args.inputFileObj,
             outputNumber: 2,

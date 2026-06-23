@@ -185,7 +185,7 @@ var plugin = async function (args) {
                     cacheDir = args.workDir || '/temp';
                     fileName = path.basename(originalFile, path.extname(originalFile));
                     container = path.extname(originalFile).slice(1);
-
+                    
                     if (!bestParams) {
                         args.jobLog('Error: No optimal parameters found. Run Select Best Parameters first.');
                         return [2 /*return*/, {
@@ -194,7 +194,7 @@ var plugin = async function (args) {
                             variables: args.variables,
                         }];
                     }
-
+                    
                     var finalGpuRequired = args.variables.vmafRequireGpuTranscode !== false;
                     if (finalGpuRequired && (!bestParams.isGPU || String(bestParams.encoder || '').indexOf('_nvenc') === -1)) {
                         args.jobLog('ERROR: GPU final transcode is required, but selected parameters are not NVENC/GPU: ' + JSON.stringify(bestParams));
@@ -206,7 +206,7 @@ var plugin = async function (args) {
                     }
                     args.variables.vmafFinalTranscodeGpuRequired = finalGpuRequired;
                     args.variables.vmafFinalTranscodeGpuEncoder = bestParams.encoder;
-
+                    
                     // Use recommended pixel format from VMAF analysis if available
                     pixFmt = args.variables.vmafRecommendedPixFmt || args.variables.pix_fmt || bestParams.pixFmt || 'yuv420p';
                     colorPrimaries = args.variables.color_primaries || bestParams.colorPrimaries || 'bt709';
@@ -215,19 +215,19 @@ var plugin = async function (args) {
                     hdrMasterDisplay = args.variables.hdr_master_display || '';
                     hdrMaxCll = args.variables.hdr_max_cll || '';
                     outputPath = cacheDir + '/' + fileName + '_vmaf_optimized.' + container;
-
+                    
                     // Check for retry CQ (from monitorTranscodeRetry)
                     var useCQ = bestParams.quality;
                     var retryCQ = args.variables.vmafTranscodeRetryCQ;
                     var retryCount = args.variables.vmafTranscodeRetryCount || 0;
                     var isRetry = retryCQ !== undefined && retryCQ !== null;
-
+                    
                     if (isRetry) {
                         useCQ = retryCQ;
                         // Store output path for cleanup on retry
                         args.variables.vmafTranscodeOutputPath = outputPath;
                     }
-
+                    
                     args.jobLog('=== VMAF Optimized Transcode ===');
                     if (isRetry) {
                         args.jobLog('⚠ RETRY ATTEMPT #' + retryCount);
@@ -249,7 +249,7 @@ var plugin = async function (args) {
                     }
                     args.jobLog('Output: ' + outputPath);
                     args.jobLog('');
-
+                    
                     // Enable live size monitoring
                     args.variables.liveSizeCompare = {
                         enabled: true,
@@ -258,7 +258,7 @@ var plugin = async function (args) {
                         checkDelaySeconds: 60, // Wait 60s before checking
                         error: false
                     };
-
+                    
                     // Build FFmpeg arguments array for CLI helper
                     spawnArgs = [];
                     if (bestParams.isGPU && bestParams.encoder.indexOf('av1_nvenc') !== -1) {
@@ -266,7 +266,7 @@ var plugin = async function (args) {
                     }
                     spawnArgs.push('-i', originalFile);
                     spawnArgs.push('-c:v', bestParams.encoder);
-
+                    
                     if (bestParams.isGPU && bestParams.encoder.indexOf('av1_nvenc') !== -1) {
                         spawnArgs.push('-pix_fmt', pixFmt);
                         spawnArgs.push('-rc', 'vbr', '-cq', String(useCQ), '-b:v', '0');
@@ -299,9 +299,9 @@ var plugin = async function (args) {
                     spawnArgs.push('-map', '0:v:0', '-map', '0:a?', '-map', '0:s?', '-map', '0:t?');
                     spawnArgs.push('-map_metadata', '0', '-map_chapters', '0', '-dn');
                     spawnArgs.push('-c:a', 'copy', '-c:s', 'copy', '-c:t', 'copy', '-y', outputPath);
-
+                    
                     args.jobLog('FFmpeg command: ' + args.ffmpegPath + ' ' + spawnArgs.join(' '));
-
+                    
                     // Update worker with CLI info for progress display
                     if (args.updateWorker) {
                         args.updateWorker({
@@ -309,9 +309,9 @@ var plugin = async function (args) {
                             preset: spawnArgs.join(' '),
                         });
                     }
-
+                    
                     _a.trys.push([0, 2, , 3]);
-
+                    
                     cli = new cliUtils_1.CLI({
                         cli: args.ffmpegPath,
                         spawnArgs: spawnArgs,
@@ -323,7 +323,7 @@ var plugin = async function (args) {
                         updateWorker: args.updateWorker,
                         args: args,
                     });
-
+                    
                     return [4 /*yield*/, cli.runCli()];
                 case 1:
                     res = _a.sent();
