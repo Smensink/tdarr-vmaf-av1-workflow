@@ -5567,6 +5567,50 @@ var plugin = function (args) {
 
 
 
+    // ── SE-based adaptive sample count (supersedes the gap-knee/coverage heuristic above) ──
+    // Targets the precision of the VMAF MEAN (SE = sigma/sqrt(N)) scaled by the content slope so
+    // the sweep curve's target-crossing is accurate to ~0.75 CQ. High-variance content gets more
+    // clips, low-variance fewer (the old coverage rule did the opposite). sigma + slope come from
+    // similar content in vmaf_training.db. Non-fatal: falls back to the value computed above.
+    try {
+        var _vdbS = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+        var _vpS = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js');
+        var _dbS = _vdbS.openDb();
+        var _strmS = (args.inputFileObj && args.inputFileObj.ffProbeData && args.inputFileObj.ffProbeData.streams) || [];
+        var _vsS = null; for (var _ssi = 0; _ssi < _strmS.length; _ssi++) { if (_strmS[_ssi].codec_type === 'video') { _vsS = _strmS[_ssi]; break; } }
+        var _wS = (_vsS && _vsS.width) || (typeof sourceWidth !== 'undefined' ? sourceWidth : 0);
+        var _hS = (_vsS && _vsS.height) || (typeof sourceHeight !== 'undefined' ? sourceHeight : 0);
+        var _tgtS = Number(args.inputs.targetMinVMAF) || Number(args.variables.vmafMinVMAF) || 95;
+        var _srcS = {
+            tier: _vdbS.tierFor(_wS, _hS),
+            source_codec: (_vsS && _vsS.codec_name) || '',
+            bits_per_pixel: (typeof bitsPerPixel !== 'undefined' && isFinite(bitsPerPixel)) ? bitsPerPixel : null,
+            media_is_animation: args.variables.vmafMediaIsAnimation === true ? 1 : 0,
+            is_hdr: args.variables.isHDR ? 1 : 0,
+            media_genre: args.variables.vmafMediaGenre || null,
+            media_type: args.variables.vmafMediaType || null,
+            media_year: args.variables.vmafMediaYear || null,
+            release_group: args.variables.vmafReleaseGroup || null,
+            network: args.variables.vmafNetwork || null,
+            original_language: args.variables.vmafOriginalLanguage || null,
+            source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null)
+        };
+        var _curvesS = _vdbS.getSimilarSweepCurves(_dbS, _srcS, { limit: 20000 });
+        var _ctrS = _vpS.predictCQCenter(_curvesS, _srcS, { targetVmaf: _tgtS }, { recencyHalfLifeDays: 0 });
+        var _slopeS = (_ctrS && _ctrS.priorSlope != null) ? _ctrS.priorSlope : -0.4;
+        var _scS = _vpS.selectSampleCount(_curvesS, {
+            slope: _slopeS, minSamples: minSegments, maxSamples: maxSegments, cqPrecision: 0.75, distMinSamples: 4
+        });
+        if (_scS && _scS.sampleCount && _scS.reason !== 'no_variance_data') {
+            var _preS = numSegments;
+            numSegments = Math.max(minSegments, Math.min(maxSegments, _scS.sampleCount));
+            args.variables.vmafAdaptiveSampleReason = 'SE-based: N=' + numSegments + ' (sigma=' + _scS.sigma + ' [' + _scS.sigmaSource + '], tol=' + _scS.tol + ' VMAF @slope ' + _scS.slope + ', CI@N=' + _scS.ciHalfWidthAtN + ')';
+            args.jobLog('Adaptive samples (SE-based): ' + numSegments + ' (was ' + _preS + ') - sigma=' + _scS.sigma + ' [' + _scS.sigmaSource + '], SE target tol=' + _scS.tol + ' VMAF (slope ' + _scS.slope + '), predicted CI@N=' + _scS.ciHalfWidthAtN);
+        }
+    } catch (_scErr) {
+        args.jobLog('SE-based sample count skipped (non-fatal, keeping ' + numSegments + '): ' + _scErr.message);
+    }
+
     // Apply scene complexity adjustment
 
 
@@ -6665,6 +6709,70 @@ for (var i = 0; i < numSegments; i++) {
     }
     args.variables.vmafSourceCAMBI = sourceCAMBI;
     args.variables.vmafSourceCAMBIP95 = sourceCAMBIP95;
+
+    // ── Source content features (for predicting which constraint binds the CQ) ──
+    // grain/noise energy, spatial (SI) + temporal (TI) complexity, dark-scene fraction, mean luma.
+    // Cheap signalstats/sobel/hqdn3d passes over a few extracted clips (every 4th frame). Grain &
+    // dark-fraction in particular drive the 1%-low ceiling that's been the binding constraint.
+    var srcGrain = null, srcSI = null, srcTI = null, srcDark = null, srcLuma = null;
+    try {
+        if (samplePaths.length > 0) {
+            var execFeat = require('child_process').execSync;
+            var fsFeat = require('fs');
+            var featIdx = [0];
+            if (samplePaths.length >= 3) { featIdx.push(Math.floor(samplePaths.length / 2)); featIdx.push(samplePaths.length - 1); }
+            else if (samplePaths.length === 2) { featIdx.push(1); }
+            var sel = 'select=not(mod(n\\,8))';
+            function _featVals(file, key) {
+                try {
+                    return fsFeat.readFileSync(file, 'utf8').split(/\r?\n/)
+                        .filter(function (l) { return l.indexOf('signalstats.' + key + '=') >= 0; })
+                        .map(function (l) { return parseFloat(l.split('=')[1]); })
+                        .filter(function (x) { return isFinite(x); });
+                } catch (e) { return []; }
+            }
+            var yavgAll = [], ydifAll = [], sobAll = [], grainAll = [];
+            for (var _fi = 0; _fi < featIdx.length; _fi++) {
+                var _sp = samplePaths[featIdx[_fi]];
+                var _f1 = '/tmp/feat1_' + Date.now() + '_' + _fi + '.txt';
+                var _f2 = '/tmp/feat2_' + Date.now() + '_' + _fi + '.txt';
+                var _f3 = '/tmp/feat3_' + Date.now() + '_' + _fi + '.txt';
+                // One decode, downscaled to 1280w for cheap CPU filters, split into 3 analysis
+                // chains: [a] luma/temporal (signalstats), [b] spatial (sobel), [c] grain (denoise
+                // difference). ~5s/clip at 4K vs ~25s for three separate passes.
+                var _fc = '[0:v]' + sel + ',format=yuv420p,scale=1280:-2,split=3[a][b][c];'
+                    + '[a]signalstats,metadata=print:file=' + _f1 + '[o1];'
+                    + '[b]sobel,signalstats,metadata=print:file=' + _f2 + ',nullsink;'
+                    + '[c]split[c1][c2];[c2]hqdn3d=4:4:6:6[cd];[c1][cd]blend=all_mode=difference,signalstats,metadata=print:file=' + _f3 + ',nullsink';
+                try {
+                    execFeat('"' + args.ffmpegPath + '" -y -hwaccel cuda -i "' + _sp + '" -filter_complex "' + _fc + '" -map "[o1]" -an -f null -',
+                        { stdio: 'pipe', timeout: 120000, shell: '/bin/sh' });
+                } catch (e) {}
+                yavgAll = yavgAll.concat(_featVals(_f1, 'YAVG'));
+                ydifAll = ydifAll.concat(_featVals(_f1, 'YDIF'));
+                sobAll = sobAll.concat(_featVals(_f2, 'YAVG'));
+                grainAll = grainAll.concat(_featVals(_f3, 'YAVG'));
+                try { fsFeat.unlinkSync(_f1); } catch (e) {} try { fsFeat.unlinkSync(_f2); } catch (e) {} try { fsFeat.unlinkSync(_f3); } catch (e) {}
+            }
+            function _featMean(a) { return a.length ? a.reduce(function (x, y) { return x + y; }, 0) / a.length : null; }
+            srcLuma = _featMean(yavgAll);
+            srcDark = yavgAll.length ? (yavgAll.filter(function (v) { return v < 60; }).length / yavgAll.length) : null;
+            srcTI = _featMean(ydifAll);
+            srcSI = _featMean(sobAll);
+            srcGrain = _featMean(grainAll);
+            args.jobLog('Source content features: grain=' + (srcGrain != null ? srcGrain.toFixed(2) : 'N/A')
+                + ', SI=' + (srcSI != null ? srcSI.toFixed(1) : 'N/A') + ', TI=' + (srcTI != null ? srcTI.toFixed(2) : 'N/A')
+                + ', dark=' + (srcDark != null ? srcDark.toFixed(3) : 'N/A') + ', luma=' + (srcLuma != null ? srcLuma.toFixed(1) : 'N/A')
+                + ' (from ' + featIdx.length + ' clips, ' + yavgAll.length + ' frames)');
+        }
+    } catch (eFeat) {
+        args.jobLog('Source content feature extraction failed (non-fatal): ' + eFeat.message);
+    }
+    args.variables.vmafSourceGrain = srcGrain;
+    args.variables.vmafSourceSI = srcSI;
+    args.variables.vmafSourceTI = srcTI;
+    args.variables.vmafSourceDarkFrac = srcDark;
+    args.variables.vmafSourceLumaAvg = srcLuma;
 
 
 

@@ -41,6 +41,87 @@ function isAnimGenre(genre) {
   return g.indexOf('animation') !== -1 || g.indexOf('anime') !== -1 || g.indexOf('cartoon') !== -1;
 }
 
+// Parse a genre value (array OR comma/pipe-delimited string) into a lowercased token set.
+function genreSet(g) {
+  if (Array.isArray(g)) g = g.join(',');
+  var out = [];
+  String(g || '').toLowerCase().replace(/\|/g, ',').split(',').forEach(function (t) {
+    t = t.trim(); if (t && out.indexOf(t) === -1) out.push(t);
+  });
+  return out;
+}
+
+/**
+ * Correlation ratio eta^2 of a numeric target grouped by a categorical label: the fraction of the
+ * target's variance EXPLAINED by the grouping. eta^2 in [0,1]; ~1 = the label nearly determines the
+ * target, ~0 = the label is uninformative. Needs >=minPerGroup members in >=2 groups to count a
+ * group, and >=minN usable points overall, else returns null (not enough data to judge).
+ */
+function correlationRatio(values, labels, opts) {
+  opts = opts || {};
+  var minPerGroup = opts.minPerGroup || 2;
+  var minN = opts.minN || 12;
+  var groups = {}, n = 0, sum = 0;
+  for (var i = 0; i < values.length; i++) {
+    var v = values[i], l = labels[i];
+    if (v == null || !isFinite(v) || l == null || l === '') continue;
+    (groups[l] = groups[l] || []).push(v); sum += v; n++;
+  }
+  if (n < minN) return null;
+  var mean = sum / n;
+  var ssTot = 0;
+  for (var k in groups) { if (!groups.hasOwnProperty(k)) continue; var a = groups[k]; for (var j = 0; j < a.length; j++) ssTot += (a[j] - mean) * (a[j] - mean); }
+  if (ssTot <= 1e-9) return null;
+  var ssBetween = 0, usableGroups = 0, usableN = 0;
+  for (var g in groups) {
+    if (!groups.hasOwnProperty(g)) continue;
+    var arr = groups[g];
+    if (arr.length < minPerGroup) continue;
+    var gm = 0; for (var m = 0; m < arr.length; m++) gm += arr[m]; gm /= arr.length;
+    ssBetween += arr.length * (gm - mean) * (gm - mean);
+    usableGroups++; usableN += arr.length;
+  }
+  if (usableGroups < 2 || usableN < minN) return null;
+  return Math.max(0, Math.min(1, ssBetween / ssTot));
+}
+
+/**
+ * LEARN the per-feature mismatch penalties for the similarity kernel from the data, instead of
+ * hand-picking them. For each categorical metadata field we measure eta^2 (how much it explains the
+ * spread of the per-job optimum CQ) and turn it into a mismatch penalty: an informative field gets a
+ * strong penalty (down to penaltyFloor) so non-matching neighbours are discounted; an uninformative
+ * field gets ~1.0 (ignored). Recomputed every prediction from the current neighbour set, so the
+ * weighting self-updates as data accrues and reveals (via etaSquared) which metadata actually matters.
+ *
+ *   items: [{opt:Number, f:{media_genre, media_type, network, original_language, source_codec}}]
+ */
+function learnFeatureWeights(items, opts) {
+  opts = opts || {};
+  var floor = opts.penaltyFloor != null ? opts.penaltyFloor : 0.15;
+  // ALL categorical/bucketable metadata covariates - the data decides which matter (no hand-picking
+  // which fields to even look at). media_year is decade-bucketed; numeric covariates (bpp,
+  // source_cambi) are handled by proximity kernels in weightForPoint, not here.
+  var fields = ['media_genre', 'media_type', 'network', 'original_language', 'source_codec',
+                'release_group', 'media_year'];
+  var vals = [];
+  for (var i = 0; i < items.length; i++) vals.push(Number(items[i].opt));
+  var penalty = {}, etaSquared = {};
+  for (var fi = 0; fi < fields.length; fi++) {
+    var ft = fields[fi];
+    var labels = items.map(function (it) {
+      var x = it.f ? it.f[ft] : null;
+      if (ft === 'media_genre') x = genreSet(x).slice().sort().join('|'); // canonical multi-genre key
+      else if (ft === 'source_codec') x = codecCategory(x);
+      else if (ft === 'media_year') { var y = Number(x); x = (isFinite(y) && y >= 1900 && y <= 2100) ? (Math.floor(y / 10) * 10) + 's' : null; }
+      return (x == null || x === '') ? null : String(x).toLowerCase();
+    });
+    var e = correlationRatio(vals, labels, opts);
+    etaSquared[ft] = e;
+    penalty[ft] = (e == null) ? null : (1 - e * (1 - floor)); // e~1 -> floor; e~0 -> 1 (no penalty)
+  }
+  return { penalty: penalty, etaSquared: etaSquared, n: items.length };
+}
+
 /**
  * Source-similarity x recency weight for one historical curve row.
  * Curves are target-INDEPENDENT, so target VMAF is intentionally NOT a weighting term.
@@ -74,6 +155,45 @@ function weightForPoint(src, row, opts) {
   if (src.is_hdr !== undefined && row.is_hdr !== undefined && src.is_hdr !== null && row.is_hdr !== null) {
     var sH = src.is_hdr ? 1 : 0, hH = row.is_hdr ? 1 : 0;
     if (sH !== hH) w *= 0.7;
+  }
+
+  // ── Metadata factors. The mismatch penalty per field is LEARNED from the data (opts.weights.penalty,
+  //    from learnFeatureWeights' eta^2) when available; the hand value is only a cold-start fallback
+  //    that fades as the learned penalty takes over. Each field is skipped when absent on either side
+  //    so sparse metadata never penalises. ──
+  var _pen = (opts.weights && opts.weights.penalty) || {};
+  var _P = function (name, dflt) { return (_pen[name] != null && isFinite(_pen[name])) ? _pen[name] : dflt; };
+  // genre overlap (Jaccard): learned floor pg when disjoint, 1.0 when identical
+  var sg = genreSet(src.media_genre), hg = genreSet(row.media_genre);
+  if (sg.length && hg.length) {
+    var inter = 0; for (var gi = 0; gi < sg.length; gi++) if (hg.indexOf(sg[gi]) !== -1) inter++;
+    var uni = sg.length + hg.length - inter;
+    var jac = uni > 0 ? inter / uni : 0;
+    var pg = _P('media_genre', 0.6);
+    w *= pg + (1 - pg) * jac;
+  }
+  if (src.media_type && row.media_type) {
+    w *= (String(src.media_type).toLowerCase() === String(row.media_type).toLowerCase()) ? 1.0 : _P('media_type', 0.85);
+  }
+  if (src.network && row.network) {
+    w *= (String(src.network).toLowerCase() === String(row.network).toLowerCase()) ? 1.0 : _P('network', 0.92);
+  }
+  if (src.original_language && row.original_language) {
+    w *= (String(src.original_language).toLowerCase() === String(row.original_language).toLowerCase()) ? 1.0 : _P('original_language', 0.94);
+  }
+  // release group = a strong encode-style proxy (NTb/FLUX/HONE etc. have characteristic grain/grade)
+  if (src.release_group && row.release_group) {
+    w *= (String(src.release_group).toLowerCase() === String(row.release_group).toLowerCase()) ? 1.0 : _P('release_group', 0.85);
+  }
+  // release year proximity (older content grades/grains differently); guard implausible parsed years
+  var syr = Number(src.media_year), hyr = Number(row.media_year);
+  if (isFinite(syr) && isFinite(hyr) && syr >= 1900 && hyr >= 1900) {
+    var dyr = syr - hyr; w *= Math.exp(-(dyr * dyr) / (2 * 15 * 15));
+  }
+  // source banding proximity (numeric; already-banded sources tolerate a lower cq before the floor binds)
+  var ssc = Number(src.source_cambi), hsc = Number(row.source_cambi);
+  if (isFinite(ssc) && isFinite(hsc)) {
+    var dsc = ssc - hsc; w *= Math.exp(-(dsc * dsc) / (2 * 3.0 * 3.0));
   }
 
   // recency (encoder settings drift). Half-life in days; disabled when recencyHalfLifeDays<=0.
@@ -235,38 +355,74 @@ function confidenceFrom(support, count, neighbours) {
 function selectSampleCount(statRows, opts) {
   opts = opts || {};
   var minN = opts.minSamples || 3;
-  var maxN = opts.maxSamples || 12;
-  var tol = opts.toleranceVmaf || 0.75;   // acceptable CI half-width on mean VMAF
-  var z = opts.z || 1.64;                  // ~90% CI
+  var maxN = opts.maxSamples || 10;
+  var z = opts.z || 1.64; // ~90% CI
 
-  // Robust (weighted-median-ish) estimate of single-sample stddev. The recorded vmaf_stddev
-  // is the across-sample SD at that row's sample_count; the single-sample SD is the same
-  // population SD, so use it directly (pooled).
-  var sds = [];
-  for (var i = 0; i < statRows.length; i++) {
-    var sd = Number(statRows[i].vmaf_stddev);
-    var sc = Number(statRows[i].sample_count);
-    if (isFinite(sd) && sd >= 0 && isFinite(sc) && sc >= 2) sds.push(sd);
+  // ── sigma: prefer THIS file's own measured per-clip VMAFs (no data-starvation, content-exact);
+  //    fall back to the 75th-pct historical stddev for similar content. ──
+  var sigma = null, sigmaSource = 'none', nObs = 0;
+  if (opts.measuredVmafs && opts.measuredVmafs.length >= 2) {
+    var vs = [];
+    for (var a = 0; a < opts.measuredVmafs.length; a++) { var x = Number(opts.measuredVmafs[a]); if (isFinite(x)) vs.push(x); }
+    nObs = vs.length;
+    if (nObs >= 2) {
+      var mean = 0; for (var b = 0; b < nObs; b++) mean += vs[b]; mean /= nObs;
+      var s2 = 0; for (var c = 0; c < nObs; c++) s2 += (vs[c] - mean) * (vs[c] - mean);
+      sigma = Math.sqrt(s2 / (nObs - 1)); sigmaSource = 'measured';
+    }
   }
-  if (sds.length === 0) {
-    return { sampleCount: opts.defaultSamples || 5, reason: 'no_stddev_data', sdEstimate: null };
+  if (sigma == null) {
+    var sds = [];
+    var sdFloor = opts.minSigmaFloor != null ? Number(opts.minSigmaFloor) : 0.05;
+    var sdCap = opts.maxPlausibleSigma != null ? Number(opts.maxPlausibleSigma) : 6.0;
+    for (var i = 0; i < (statRows || []).length; i++) {
+      var sd = Number(statRows[i].vmaf_stddev), sc = Number(statRows[i].sample_count);
+      // Need a TRUSTWORTHY per-clip-mean stddev. Three artifacts to reject:
+      //  - sd ~0 with sc>=3: stddev was never actually computed (clip means can't be identical) -> skip.
+      //  - sd from 1-2 clips: reported as ~0, also an artifact -> require sc>=3.
+      //  - sd > ~6 VMAF: that is per-FRAME spread leaked from a column-misaligned backfill row, not
+      //    the spread of clip MEANS (which is ~1-3) -> implausible, skip.
+      if (isFinite(sd) && sd > sdFloor && sd < sdCap && isFinite(sc) && sc >= 3) sds.push(sd);
+    }
+    if (sds.length >= (opts.minSigmaSamples || 5)) {
+      sds.sort(function (p, q) { return p - q; });
+      // 75th percentile = mild conservatism (sample enough for the higher-variance content in the set).
+      sigma = sds[Math.floor(0.75 * (sds.length - 1))];
+      sigmaSource = 'historical'; nObs = sds.length;
+    }
   }
-  sds.sort(function (a, b) { return a - b; });
-  // Use the 75th percentile SD (conservative: plan for harder-than-typical content).
-  var sd75 = sds[Math.min(sds.length - 1, Math.floor(0.75 * (sds.length - 1)))];
+  if (sigma == null) return { sampleCount: opts.defaultSamples || 6, reason: 'no_variance_data', sigma: null, enough: null };
 
-  var N = minN;
-  for (; N <= maxN; N++) {
-    var halfWidth = z * sd75 / Math.sqrt(N);
-    if (halfWidth <= tol) break;
-  }
-  if (N > maxN) N = maxN;
+  // ── precision target: keep the curve's target-CROSSING accurate to ~cqPrecision CQ. A steeper
+  //    slope tolerates more VMAF noise for the same CQ precision -> tol = cqPrecision*|slope|.
+  //    This is the fix for the old gap/coverage heuristic (which targeted spread, not the mean,
+  //    and over-sampled low-variance content). ──
+  var slope = isFinite(Number(opts.slope)) ? Math.abs(Number(opts.slope)) : 0.4;
+  var tol = opts.toleranceVmaf != null ? Number(opts.toleranceVmaf) : Math.max(0.3, (opts.cqPrecision || 0.75) * slope);
+
+  var nMean = minN;
+  for (; nMean <= maxN; nMean++) { if (z * sigma / Math.sqrt(nMean) <= tol) break; }
+  if (nMean > maxN) nMean = maxN;
+
+  // distribution floor: need a few clips before the 1%-low / spread is meaningful at all.
+  var distMin = Math.min(opts.distMinSamples || 4, maxN);
+  var N = Math.max(minN, Math.min(maxN, Math.max(nMean, distMin)));
+
+  // sequential mode: when fed the file's own clips, report whether THAT many is already enough.
+  var enough = (sigmaSource === 'measured')
+    ? ((z * sigma / Math.sqrt(nObs) <= tol) && nObs >= distMin)
+    : null;
+
   return {
     sampleCount: N,
-    sdEstimate: sd75,
-    ciHalfWidth: z * sd75 / Math.sqrt(N),
-    reason: 'ci_based',
-    samplesConsidered: sds.length
+    sigma: Math.round(sigma * 1000) / 1000,
+    sigmaSource: sigmaSource,
+    measuredClips: sigmaSource === 'measured' ? nObs : null,
+    slope: Math.round(slope * 1000) / 1000,
+    tol: Math.round(tol * 1000) / 1000,
+    ciHalfWidthAtN: Math.round((z * sigma / Math.sqrt(N)) * 1000) / 1000,
+    enough: enough,
+    reason: sigmaSource === 'measured' ? 'measured_ci' : 'historical_ci'
   };
 }
 
@@ -403,10 +559,37 @@ function bindingTargetCQ(pts, constraints) {
 }
 
 /**
- * Predict the sweep CENTRE + uncertainty from history (Method B: weighted distribution of
- * similar jobs' OWN optimal cq at the current target). Backtest: MAE ~3.2 CQ, the best static
- * estimator (beats pooling VMAF curves, which carry a content-offset bias). Returns the centre
- * and a spread used to seed the initial bracket; final convergence comes from nextSweepCQ.
+ * One job's local dVMAF/dcq slope near the target crossing (model-free): the slope of the
+ * measured segment that brackets VMAF==target, else the overall OLS slope. Used to build a
+ * content-specific prior slope for the FIRST sweep step (before this file's own curve exists).
+ */
+function localSlopeAtTarget(points, target) {
+  var pts = [];
+  for (var i = 0; i < points.length; i++) {
+    var cq = Number(points[i].cq), v = Number(points[i].vmaf_mean != null ? points[i].vmaf_mean : points[i].v);
+    if (isFinite(cq) && isFinite(v)) pts.push({ cq: cq, v: v });
+  }
+  if (pts.length < 2) return null;
+  pts.sort(function (a, b) { return a.cq - b.cq; });
+  for (var j = 0; j < pts.length - 1; j++) {
+    var a = pts[j], b = pts[j + 1];
+    if (a.v >= target && b.v < target && b.cq !== a.cq) { var s = (b.v - a.v) / (b.cq - a.cq); return isFinite(s) ? s : null; }
+  }
+  var n = pts.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (var k = 0; k < n; k++) { sx += pts[k].cq; sy += pts[k].v; sxx += pts[k].cq * pts[k].cq; sxy += pts[k].cq * pts[k].v; }
+  var d = n * sxx - sx * sx; if (Math.abs(d) < 1e-9) return null;
+  var slope = (n * sxy - sx * sy) / d;
+  return isFinite(slope) ? slope : null;
+}
+
+/**
+ * Predict the sweep CENTRE + uncertainty + a content-specific PRIOR SLOPE from history
+ * (Method B: weighted distribution of similar jobs' OWN optimal cq at the current target).
+ * Backtest: centre MAE ~3.2 CQ, the best static estimator (beats pooling VMAF curves, which
+ * carry a content-offset bias). priorSlope is the weighted-median local dVMAF/dcq of the same
+ * neighbours - used for the single first sweep step before this file's own curve exists
+ * (replaces the global -0.4 constant). Final convergence comes from nextSweepCQ on the file's
+ * own measured slope.
  */
 function predictCQCenter(curveRows, src, constraints, opts) {
   opts = opts || {};
@@ -417,24 +600,54 @@ function predictCQCenter(curveRows, src, constraints, opts) {
     if (!jobs[r.job_id]) jobs[r.job_id] = { rows: [], f: r };
     jobs[r.job_id].rows.push(r);
   }
-  var wOpts = { bppSigma: opts.bppSigma, recencyHalfLifeDays: opts.recencyHalfLifeDays, nowMs: opts.nowMs || Date.now() };
-  var items = [];
+  // ── Pass 1: each neighbour's own optimum cq + local slope + features (no weighting yet). ──
+  var raw = [];
   for (var jid in jobs) {
     if (!Object.prototype.hasOwnProperty.call(jobs, jid)) continue;
-    var o = curveOptimalAtTarget(jobs[jid].rows, target);
-    if (o === null) continue;
-    var w = weightForPoint(src, jobs[jid].f, wOpts);
-    if (w > 0) items.push({ v: o, w: w });
+    var o0 = curveOptimalAtTarget(jobs[jid].rows, target);
+    var sl0 = localSlopeAtTarget(jobs[jid].rows, target);
+    if (o0 === null && sl0 === null) continue;
+    raw.push({ o: o0, sl: sl0, f: jobs[jid].f });
+  }
+
+  // ── LEARN the similarity feature penalties from (optimum, features) instead of hand-setting them.
+  //    eta^2 of the optimum-cq distribution per metadata field -> mismatch penalty. Self-updates each
+  //    call; returned as featureEta so callers can log which metadata currently matters most. ──
+  var learned = (opts.learnWeights === false) ? null
+    : learnFeatureWeights(raw.filter(function (r) { return r.o !== null; }).map(function (r) { return { opt: r.o, f: r.f }; }),
+        { penaltyFloor: opts.penaltyFloor, minN: opts.learnMinN || 12 });
+
+  // ── Pass 2: weight neighbours with the LEARNED penalties, then aggregate. ──
+  var wOpts = { bppSigma: opts.bppSigma, recencyHalfLifeDays: opts.recencyHalfLifeDays, nowMs: opts.nowMs || Date.now(), weights: learned };
+  var items = [], slopes = [];
+  for (var ri = 0; ri < raw.length; ri++) {
+    var w = weightForPoint(src, raw[ri].f, wOpts);
+    if (w <= 0) continue;
+    if (raw[ri].o !== null) items.push({ v: raw[ri].o, w: w });
+    if (raw[ri].sl !== null && raw[ri].sl < -0.02) slopes.push({ v: raw[ri].sl, w: w });
   }
   if (items.length < (opts.minNeighbours || 3)) return { centerCq: null, reason: 'insufficient_neighbours', support: items.length };
   var st = weightedStats(items);
   var sigma = Math.max(st.std, (st.q75 - st.q25) / 1.35, opts.minSigma || 1.0);
+
+  // Content-specific prior slope: weighted median of neighbour local slopes, clamped to a sane
+  // band; fall back to the global -0.4 when too few slope samples.
+  var priorSlope = -0.4, slopeSupport = slopes.length;
+  if (slopes.length >= (opts.minSlopeSamples || 5)) {
+    var sm = weightedStats(slopes).median;
+    if (isFinite(sm)) priorSlope = Math.max(-1.2, Math.min(-0.1, sm));
+  }
+
   return {
     centerCq: Math.round(_clampCq(st.median) * 10) / 10,
     sigmaCq: Math.round(sigma * 10) / 10,
     support: items.length,
+    priorSlope: Math.round(priorSlope * 1000) / 1000,
+    slopeSupport: slopeSupport,
     rangeMin: _clampCq(Math.floor(st.median - (opts.z || 1.0) * sigma)),
     rangeMax: _clampCq(Math.ceil(st.median + (opts.z || 1.0) * sigma)),
+    featureEta: learned ? learned.etaSquared : null,
+    featurePenalty: learned ? learned.penalty : null,
     reason: 'ok'
   };
 }
@@ -517,6 +730,9 @@ module.exports = {
   CQ_MAX: CQ_MAX,
   codecCategory: codecCategory,
   weightForPoint: weightForPoint,
+  genreSet: genreSet,
+  correlationRatio: correlationRatio,
+  learnFeatureWeights: learnFeatureWeights,
   kernelEstimate: kernelEstimate,
   selectCQ: selectCQ,
   selectSampleCount: selectSampleCount,
@@ -527,6 +743,7 @@ module.exports = {
   effectiveCambiFloor: effectiveCambiFloor,
   bindingTargetCQ: bindingTargetCQ,
   curveOptimalAtTarget: curveOptimalAtTarget,
+  localSlopeAtTarget: localSlopeAtTarget,
   weightedStats: weightedStats,
   selectCQFromDb: selectCQFromDb,
   sampleStatsFromDb: sampleStatsFromDb,

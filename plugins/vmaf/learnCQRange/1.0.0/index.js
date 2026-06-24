@@ -2061,8 +2061,11 @@ var plugin = function (args) {
         var vmafdbL = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
         var _dbL = vmafdbL.openDb();
         var _fpL = (args.inputFileObj && args.inputFileObj._id) || '';
-        var _jobIdL = args.variables.vmafJobId
-            || vmafdbL.makeJobId(_fpL, args.variables.vmafJobStartTime || '');
+        // Derive identically to exportVMAFResults (real path + shared nonce) so outcome lands on
+        // the same jobs row as the curve/decision, regardless of the empty-path seed.
+        var _jobIdL = _fpL
+            ? vmafdbL.makeJobId(_fpL, args.variables.vmafJobStartTime || '')
+            : (args.variables.vmafJobId || vmafdbL.makeJobId('', args.variables.vmafJobStartTime || ''));
         vmafdbL.upsertJob(_dbL, {
             job_id: _jobIdL,
             timestamp: timestamp,

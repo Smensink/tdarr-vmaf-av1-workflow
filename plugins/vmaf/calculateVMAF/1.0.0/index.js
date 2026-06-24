@@ -1075,6 +1075,41 @@ var plugin = async function (args) {
     var completedCount = 0;
     var cpuFallbackQueue = [];
     var stopGpuFastPath = false;
+
+    // ── Per-file SEQUENTIAL sampling (per-CQ early stop) ──
+    // Stop measuring a parameter set's clips once THIS FILE's own per-clip VMAF spread makes the
+    // mean precise enough (CI half-width <= seqTol) AND its worst clip clears the 1%-low floor with
+    // margin (so we never under-sample a binding floor). Uses the real per-file sigma instead of the
+    // conservative between-content historical sigma, so low-variance content stops early and saves
+    // the (CQ x clip) VMAF measurements that dominate sweep cost. Fully guarded: any issue -> measure
+    // every clip. Kill switch: args.variables.vmafSequentialSampling === false.
+    var _vpSeq = null;
+    try { _vpSeq = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js'); } catch (eSeqLib) { _vpSeq = null; }
+    var seqEnabled = !!_vpSeq && (args.variables.vmafSequentialSampling !== false) && validResults.length > 0;
+    var seqTol = Number(args.variables.vmafSampleStopTol); if (!isFinite(seqTol) || seqTol <= 0) seqTol = 0.5;
+    var seqMinClips = Math.max(4, Math.min(Number(args.variables.vmafSampleStopMin) || 6, samples.length || 6));
+    var seqMaxClips = samples.length || seqMinClips;
+    var seqFrameFloor = Number(args.variables.vmafMinFrameVMAF); if (!isFinite(seqFrameFloor)) seqFrameFloor = 0;
+    var seqFloorMargin = 2.0;
+    var psSeqScores = {}, psSeqMins = {}, psSeqDone = {}, seqSkipped = 0;
+    if (seqEnabled) {
+        // RANDOMISE the clip measurement order (one shared permutation across all paramsets, so each
+        // CQ is still compared on identical clips), then process breadth-first. This removes the
+        // POSITIONAL bias an early stop would otherwise have: the first clips measured become a random
+        // sample across the whole title, not the opening minutes (often easier than the climax), so
+        // the per-file sigma / mean / 1%-low the stop relies on are unbiased estimates of the title.
+        var _nSamp = samples.length || 0;
+        var _perm = []; for (var _pi = 0; _pi < _nSamp; _pi++) _perm.push(_pi);
+        for (var _pj = _nSamp - 1; _pj > 0; _pj--) { var _pk = Math.floor(Math.random() * (_pj + 1)); var _pt = _perm[_pj]; _perm[_pj] = _perm[_pk]; _perm[_pk] = _pt; }
+        var _rank = {}; for (var _ri = 0; _ri < _perm.length; _ri++) _rank[_perm[_ri]] = _ri;
+        validResults.sort(function (a, b) {
+            var ra = (_rank[a.sampleIndex] != null ? _rank[a.sampleIndex] : a.sampleIndex);
+            var rb = (_rank[b.sampleIndex] != null ? _rank[b.sampleIndex] : b.sampleIndex);
+            if (ra !== rb) return ra - rb;
+            return String(a.parameterSetId).localeCompare(String(b.parameterSetId));
+        });
+        args.jobLog('Sequential sampling ON (randomised clip order): stop a CQ at >=' + seqMinClips + ' clips when mean CI<=' + seqTol.toFixed(2) + ' VMAF AND 1%-low>=floor+' + seqFloorMargin + ' (cap ' + seqMaxClips + '/CQ)');
+    }
     
     // GPU VMAF: Run sequentially (GPU handles parallelism internally)
     // CPU VMAF: Run in parallel batches
@@ -1086,10 +1121,16 @@ var plugin = async function (args) {
         var completed = 0;
         
         function runNext() {
-            if (queue.length === 0) return null;
             if (active >= maxParallelGpu) return null;
             if (stopGpuFastPath) return null;
-            var calcResult = queue.shift();
+            // pull the next measurable item, skipping clips of paramsets already satisfied (seq stop)
+            var calcResult = null;
+            while (queue.length > 0) {
+                var _c = queue.shift();
+                if (seqEnabled && psSeqDone[_c.parameterSetId]) { seqSkipped++; completedCount++; continue; }
+                calcResult = _c; break;
+            }
+            if (!calcResult) return null;
             active++;
             var idxLabel = completed + active;
             args.jobLog('[' + idxLabel + '/' + validResults.length + '] ' + calcResult.parameterSetId + ' sample ' + (calcResult.sampleIndex + 1) + ' (GPU queued)');
@@ -1100,8 +1141,31 @@ var plugin = async function (args) {
                     successfulCalculations++;
                     gpuVmafActuallyUsed = true;
                     completedCount++;
-                    args.jobLog('  VMAF Score: ' + vmafCalcResult.result.vmafScore.toFixed(2) + 
+                    args.jobLog('  VMAF Score: ' + vmafCalcResult.result.vmafScore.toFixed(2) +
                         ' (harmonic), Method: ' + vmafCalcResult.method + ', Time: ' + vmafCalcResult.duration.toFixed(1) + 's');
+                    if (seqEnabled) {
+                        try {
+                            var _psid = vmafCalcResult.result.parameterSetId;
+                            var _sv = Number(vmafCalcResult.result.vmafScore);
+                            if (isFinite(_sv)) (psSeqScores[_psid] = psSeqScores[_psid] || []).push(_sv);
+                            var _pmn = Number(vmafCalcResult.result.vmafMin);
+                            if (isFinite(_pmn)) (psSeqMins[_psid] = psSeqMins[_psid] || []).push(_pmn);
+                            var _nC = (psSeqScores[_psid] || []).length;
+                            if (!psSeqDone[_psid] && _nC >= seqMinClips && _nC < seqMaxClips) {
+                                var _rec = _vpSeq.selectSampleCount([], { measuredVmafs: psSeqScores[_psid], toleranceVmaf: seqTol, distMinSamples: seqMinClips, minSamples: seqMinClips, maxSamples: seqMaxClips });
+                                // only stop if the worst measured clip clears the 1%-low floor with margin -
+                                // otherwise the floor (not the mean) is binding and stays noisy, so keep sampling.
+                                var _floorOk = true;
+                                if (seqFrameFloor > 0 && psSeqMins[_psid] && psSeqMins[_psid].length) {
+                                    _floorOk = Math.min.apply(null, psSeqMins[_psid]) >= (seqFrameFloor + seqFloorMargin);
+                                }
+                                if (_rec && _rec.enough && _floorOk) {
+                                    psSeqDone[_psid] = true;
+                                    args.jobLog('  Sequential stop ' + _psid + ' at ' + _nC + ' clips (sigma=' + (_rec.sigma != null ? _rec.sigma : '?') + ' VMAF, CI<=' + seqTol.toFixed(2) + ', 1%-low clears floor)');
+                                }
+                            }
+                        } catch (eSeqT) { /* non-fatal: keep measuring all clips */ }
+                    }
                 } else {
                     args.jobLog('  FAILED (GPU fast path): ' + vmafCalcResult.error + ' - disabling GPU fast path for remaining samples');
                     stopGpuFastPath = true;
@@ -1211,9 +1275,13 @@ var plugin = async function (args) {
         }
     }
     
-    // Validation
-    var totalAttempts = validResults.length;
-    
+    // Validation. Exclude clips intentionally skipped by sequential sampling from the denominator -
+    // they were never attempted, so they must not count against the success rate.
+    var totalAttempts = Math.max(1, validResults.length - seqSkipped);
+    if (seqEnabled && seqSkipped > 0) {
+        args.jobLog('Sequential sampling skipped ' + seqSkipped + ' clip-measurements (mean precise + 1%-low clear early)');
+    }
+
     if (totalAttempts === 0) {
         throw new Error('VMAF calculation failed: No valid test results to process');
     }

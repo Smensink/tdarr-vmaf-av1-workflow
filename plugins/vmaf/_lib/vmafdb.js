@@ -17,7 +17,7 @@
  */
 
 var DEFAULT_DB_PATH = '/app/configs/vmaf_training.db';
-var SCHEMA_VERSION = 2;
+var SCHEMA_VERSION = 4;
 
 // ── Column whitelists (writers ignore unknown keys; readers map by name) ──
 var JOB_COLUMNS = [
@@ -26,8 +26,9 @@ var JOB_COLUMNS = [
   'bits_per_pixel', 'source_duration_sec', 'pixel_format', 'bit_depth', 'is_hdr',
   'color_primaries', 'color_trc', 'colorspace', 'tier',
   'media_genre', 'media_is_animation', 'media_type', 'media_year',
-  'media_metadata_source', 'media_source_type', 'release_group',
+  'media_metadata_source', 'media_source_type', 'release_group', 'network', 'original_language',
   'source_cambi', 'source_cambi_p95',
+  'grain', 'spatial_info', 'temporal_info', 'dark_fraction', 'luma_avg',
   'target_min_vmaf', 'selected_cq', 'selected_parameter_set_id',
   'selected_vmaf', 'selected_vmaf_min', 'selected_cambi', 'selected_size_mb',
   'transcode_succeeded', 'met_vmaf_target', 'met_size_target',
@@ -60,8 +61,11 @@ function openDb(dbPath) {
   var DatabaseSync = sqlite.DatabaseSync;
   var db = new DatabaseSync(dbPath);
 
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA busy_timeout = 5000;');
+  // DELETE journal (not WAL): the DB lives on a Windows bind mount, where WAL's shared-memory
+  // (-shm mmap) is fragile. Single writer (the node) + occasional readers -> a rollback journal
+  // is robust and sufficient. busy_timeout covers brief lock contention.
+  db.exec('PRAGMA journal_mode = DELETE;');
+  db.exec('PRAGMA busy_timeout = 10000;');
   db.exec('PRAGMA foreign_keys = ON;');
 
   _migrate(db);
@@ -164,6 +168,24 @@ function _migrate(db) {
     db.exec('ALTER TABLE sweep_points ADD COLUMN cambi_max REAL;');
     db.exec('PRAGMA user_version = 2;');
   }
+  if (v < 3) {
+    // Source content features (predict which constraint binds, esp. the 1%-low floor):
+    // grain/noise energy, spatial & temporal complexity (SI/TI proxies), dark-scene fraction,
+    // mean luma. Cheap to compute from the extracted clips. Null on rows from before capture.
+    db.exec('ALTER TABLE jobs ADD COLUMN grain REAL;');
+    db.exec('ALTER TABLE jobs ADD COLUMN spatial_info REAL;');
+    db.exec('ALTER TABLE jobs ADD COLUMN temporal_info REAL;');
+    db.exec('ALTER TABLE jobs ADD COLUMN dark_fraction REAL;');
+    db.exec('ALTER TABLE jobs ADD COLUMN luma_avg REAL;');
+    db.exec('PRAGMA user_version = 3;');
+  }
+  if (v < 4) {
+    // Metadata fields useful as encode-style/grain proxies (esp. cold-start): streaming network
+    // (Apple TV+ = grainy, etc.) and original language (anime vs western). media_year already exists.
+    db.exec('ALTER TABLE jobs ADD COLUMN network TEXT;');
+    db.exec('ALTER TABLE jobs ADD COLUMN original_language TEXT;');
+    db.exec('PRAGMA user_version = 4;');
+  }
 }
 
 function _coerce(v) {
@@ -265,12 +287,22 @@ function getSimilarSweepCurves(db, src, opts) {
   if (src && src.tier) { where.push('j.tier = ?'); params.push(src.tier); }
   // codec is a soft signal; do not hard-filter unless asked
   if (opts.codec && src && src.source_codec) { where.push('j.source_codec = ?'); params.push(src.source_codec); }
+  // DATA-QUALITY GUARD (default on): exclude physically-impossible rows. ~92% of the original
+  // CSV->DB backfill was column-misaligned (vmaf_min=100 > vmaf_max~5, vmaf_mean outside [min,max],
+  // per-frame spread written into vmaf_stddev) and would poison the curve fits and sigma estimate.
+  // Keep mean-only rows (min/max NULL) and fully-consistent rows; drop the swapped/garbage ones.
+  // Pass opts.includeInvalid to inspect the raw rows for forensics.
+  if (!opts.includeInvalid) {
+    where.push('s.vmaf_mean IS NOT NULL');
+    where.push('(s.vmaf_min IS NULL OR s.vmaf_max IS NULL OR (s.vmaf_min <= s.vmaf_mean AND s.vmaf_mean <= s.vmaf_max AND s.vmaf_min <= s.vmaf_max))');
+  }
 
   var sql =
     'SELECT s.cq, s.vmaf_mean, s.vmaf_harmonic_mean, s.vmaf_min, s.vmaf_max, s.vmaf_p1_low, s.vmaf_stddev,' +
     '       s.ssim, s.cambi_mean, s.cambi_max, s.cambi_p95, s.avg_size_mb, s.sample_count, s.parameter_set_id,' +
     '       j.job_id, j.timestamp, j.tier, j.source_codec, j.bits_per_pixel,' +
-    '       j.media_genre, j.media_is_animation, j.media_type, j.target_min_vmaf, j.source_cambi' +
+    '       j.media_genre, j.media_is_animation, j.media_type, j.media_year, j.release_group,' +
+    '       j.network, j.original_language, j.target_min_vmaf, j.source_cambi' +
     ' FROM sweep_points s JOIN jobs j ON s.job_id = j.job_id';
   if (where.length) sql += ' WHERE ' + where.join(' AND ');
   sql += ' ORDER BY j.timestamp DESC LIMIT ?';

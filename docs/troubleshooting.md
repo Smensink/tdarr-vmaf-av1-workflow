@@ -74,3 +74,28 @@ Leave Plex/TMDB/TVDB inputs blank in `fetchMediaMetadata`, or remove that plugin
 ## Licensing / binary image warning
 
 If your FFmpeg configure output includes `--enable-nonfree`, do not redistribute the built binary/image unless you have independently confirmed redistribution is allowed.
+
+## Verifying Phase 4 ACTING is active in a job report
+
+After the June 2026 promotion, the predictor runs in full acting mode. Confirm it in a completed job report by grepping for these markers:
+
+```
+[ACTING] Predictor-seeded                           ← selectBestParameters acting (not SHADOW)
+[PREDICT] learned metadata importance              ← η² weights computed from live DB
+Sequential sampling ON (randomised clip order)     ← calculateVMAF sequential early-stop
+Sequential stop … at N clips                      ← early-stop fired
+Source CAMBI baseline: …  (encode-delta: …)        ← holdout self-comparison active
+vmaf_min>vmaf_max rows excluded: N                 ← data integrity filter active
+```
+
+If instead you see `[SHADOW]`, the container is still running pre-June-2026 plugin code — restart the container after checking the plugin source is in `/custom-cont-init.d/vmaf-plugin-patches/`.
+
+## High CPU on the host but GPU VMAF is working
+
+Investigated June 2026: job reports show `vmafGpuVmafFallbackUsed=false` in all recent jobs, and server logs show zero GPU→CPU VMAF fallback events. The high CPU is from FFmpeg AV1 NVENC encoding, not VMAF:
+
+- Quality-maximising NVENC settings (`-tune uhq -multipass fullres -spatial-aq 1 -temporal-aq 1 -rc-lookahead 48`) push significant CPU work even when the encode itself is on the GPU.
+- HDR→SDR tonemapping runs on CPU.
+- Software audio transcoding (EAC3→AAC) is CPU-bound.
+
+To reduce CPU: lower `-rc-lookahead` (e.g. 24 instead of 48), or simplify the HDR flow if you're transcoding to SDR output.

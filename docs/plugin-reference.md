@@ -75,13 +75,14 @@ Chooses the final candidate. This is the main policy engine. It considers:
 - projected BPP and Mbps
 - output/source-size ratio
 - CAMBI/banding score where available
-- holdout validation
+- holdout validation (self-comparing: encode-introduced CAMBI delta vs holdout source CAMBI baseline)
 - learned risk policy for resolution/HDR/content class
 - constraint-aware selectCQ from `vmafpredict.js` (`plugins/vmaf/_lib/`), which picks the cheapest CQ that satisfies all constraints simultaneously
+- **learned η² similarity weights** from `learnFeatureWeights`, recomputed from the live DB on every call (self-updating)
 
 The selected CQ is the most efficient candidate that still clears the quality and safety guards. If no candidate is acceptable, retry plugins get a chance to test safer values.
 
-During Phase 3 (A/B-shadow deployment), this plugin logs a `[SHADOW]` line comparing the new constraint-aware `selectCQ` pick against the live pick — no behavior change until shadow mode is disabled.
+**Phase 4 ACTING (June 2026)** — `[SHADOW]` log mode has been disabled; the new constraint-aware `selectCQ` pick is now live.
 
 ### `vmafOptimizedTranscode`
 

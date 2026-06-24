@@ -1058,18 +1058,55 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             source_codec: (_vs && _vs.codec_name) || '',
             bits_per_pixel: (typeof bitsPerPixel !== 'undefined' && isFinite(bitsPerPixel)) ? bitsPerPixel : null,
             media_is_animation: args.variables.vmafMediaIsAnimation === true ? 1 : 0,
-            is_hdr: args.variables.isHDR ? 1 : 0
+            is_hdr: args.variables.isHDR ? 1 : 0,
+            media_genre: args.variables.vmafMediaGenre || null,
+            media_type: args.variables.vmafMediaType || null,
+            media_year: args.variables.vmafMediaYear || null,
+            release_group: args.variables.vmafReleaseGroup || null,
+            network: args.variables.vmafNetwork || null,
+            original_language: args.variables.vmafOriginalLanguage || null,
+            source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null)
         };
         var _curves = _vdb.getSimilarSweepCurves(_db, _src, { limit: 20000 });
         var _ctr = _vp.predictCQCenter(_curves, _src, { targetVmaf: _tgt }, { recencyHalfLifeDays: 0 });
-        var _sc = _vp.selectSampleCount(_curves, {});
-        args.jobLog('[SHADOW] predictCQCenter=' + (_ctr.centerCq != null ? _ctr.centerCq : 'n/a')
+        var _sc = _vp.selectSampleCount(_curves, { slope: (_ctr && _ctr.priorSlope != null) ? _ctr.priorSlope : -0.4, cqPrecision: 0.75, distMinSamples: 4 });
+        args.jobLog('[PREDICT] predictCQCenter=' + (_ctr.centerCq != null ? _ctr.centerCq : 'n/a')
             + (_ctr.sigmaCq != null ? ' +-' + _ctr.sigmaCq : '')
             + ' (range ' + _ctr.rangeMin + '-' + _ctr.rangeMax + ', support ' + _ctr.support + ' jobs, tier ' + _src.tier + ')'
+            + ' | priorSlope=' + (_ctr.priorSlope != null ? _ctr.priorSlope : 'n/a') + ' dVMAF/dCQ (from ' + (_ctr.slopeSupport || 0) + ' curves)'
             + ' | live initial crfValues=[' + crfValues.join(',') + ']'
             + ' | sampleCount suggest=' + _sc.sampleCount + ' (sdEst=' + (_sc.sdEstimate != null ? _sc.sdEstimate.toFixed(2) : 'n/a') + ', ' + _sc.reason + ')');
+        if (_ctr.featureEta) {
+            var _et = _ctr.featureEta, _ek = Object.keys(_et).filter(function (k) { return _et[k] != null; })
+                .sort(function (a, b) { return _et[b] - _et[a]; });
+            args.jobLog('[PREDICT] learned metadata importance (eta^2, higher=more weight): '
+                + _ek.map(function (k) { return k + '=' + _et[k].toFixed(3); }).join(', '));
+        }
+
+        // ── ACTING (Phase 4): on the FIRST sweep, seed crfValues from the predicted range so the
+        //    sweep starts centred on the likely optimum instead of the heuristic grid (the shadow
+        //    showed the heuristic wastes retry rounds). Retries set vmafPredictorSeeded and keep
+        //    refining via the existing checkCQRangeRetry loop. Gated on adequate neighbour support.
+        if (!args.variables.vmafPredictorSeeded && _ctr && _ctr.centerCq != null && _ctr.support >= 30
+            && _ctr.rangeMin != null && _ctr.rangeMax != null) {
+            var _cC = Math.round(_ctr.centerCq);
+            var _rlo = Math.max(16, Math.min(_cC, Math.round(_ctr.rangeMin)));
+            var _rhi = Math.min(51, Math.max(_cC, Math.round(_ctr.rangeMax)));
+            if (_rhi - _rlo > 10) { _rlo = Math.max(16, _cC - 5); _rhi = Math.min(51, _cC + 5); } // cap span
+            var _seed = [];
+            [_rlo, _cC, _rhi].forEach(function (v) { if (_seed.indexOf(v) === -1) _seed.push(v); });
+            _seed.sort(function (a, b) { return a - b; });
+            if (_seed.length >= 2) {
+                crfValues = _seed;
+                args.variables.vmafTestedCQs = crfValues.slice();
+                args.variables.vmafPredictorSeeded = true;
+                args.jobLog('[ACTING] Predictor-seeded initial sweep: crfValues=[' + crfValues.join(',')
+                    + '] (center ' + _ctr.centerCq + ', range ' + _ctr.rangeMin + '-' + _ctr.rangeMax
+                    + ', priorSlope ' + _ctr.priorSlope + ', support ' + _ctr.support + ' jobs)');
+            }
+        }
     } catch (_shErr) {
-        args.jobLog('[SHADOW] predictor shadow failed (non-fatal): ' + (_shErr && _shErr.message ? _shErr.message : String(_shErr)));
+        args.jobLog('[PREDICT] predictor calc failed (non-fatal): ' + (_shErr && _shErr.message ? _shErr.message : String(_shErr)));
     }
 
     // Generate parameter sets - all use 10-bit (p010le) format

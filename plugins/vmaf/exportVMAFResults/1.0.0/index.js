@@ -629,8 +629,12 @@ var plugin = function (args) {
     try {
         var vmafdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
         var _db = vmafdb.openDb();
-        var _jobId = args.variables.vmafJobId
-            || vmafdb.makeJobId(fileMetadata.filePath, args.variables.vmafJobStartTime || '');
+        // Derive the job id from the REAL file path + the shared start-time nonce. (The seed in
+        // extractVideoSamples can see an empty inputFile._id -> a constant empty-string hash; here
+        // the path is reliable, and learnCQRange derives it identically, so they still unify.)
+        var _jobId = fileMetadata.filePath
+            ? vmafdb.makeJobId(fileMetadata.filePath, args.variables.vmafJobStartTime || '')
+            : (args.variables.vmafJobId || vmafdb.makeJobId('', args.variables.vmafJobStartTime || ''));
         function _bitDepth(pf) {
             if (!pf) return null; pf = String(pf).toLowerCase();
             if (pf.indexOf('12le') !== -1 || pf.indexOf('12be') !== -1 || pf.indexOf('p012') !== -1) return 12;
@@ -661,8 +665,15 @@ var plugin = function (args) {
             media_metadata_source: mediaMetadataSource,
             media_source_type: mediaSourceType,
             release_group: releaseGroup,
+            network: args.variables.vmafNetwork || null,
+            original_language: args.variables.vmafOriginalLanguage || null,
             source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null),
             source_cambi_p95: (args.variables.vmafSourceCAMBIP95 != null ? Number(args.variables.vmafSourceCAMBIP95) : null),
+            grain: (args.variables.vmafSourceGrain != null ? Number(args.variables.vmafSourceGrain) : null),
+            spatial_info: (args.variables.vmafSourceSI != null ? Number(args.variables.vmafSourceSI) : null),
+            temporal_info: (args.variables.vmafSourceTI != null ? Number(args.variables.vmafSourceTI) : null),
+            dark_fraction: (args.variables.vmafSourceDarkFrac != null ? Number(args.variables.vmafSourceDarkFrac) : null),
+            luma_avg: (args.variables.vmafSourceLumaAvg != null ? Number(args.variables.vmafSourceLumaAvg) : null),
             target_min_vmaf: Number(args.variables.vmafMinVMAF) || null,
             selected_parameter_set_id: args.variables.vmafSelectedParameterSetId || (bestParams && bestParams.parameterSetId) || '',
             selected_vmaf: Number(bestVMAF) || null,

@@ -1,103 +1,172 @@
-# Tdarr VMAF/AV1 System — Change Handoff (as of 2026-06-23)
+# Tdarr VMAF/AV1 System — Change Handoff (as of 2026-06-25)
 
-TL;DR current state
+## TL;DR current state
 
-A multi-phase migration of the adaptive-CQ learning system from two corruption-prone CSVs → one SQLite store, plus a
-full predictor rewrite, is partly deployed. The live transcode behavior is UNCHANGED — new predictor runs in log-only
-"A/B-shadow" mode. Data capture (dual-write to SQLite) is live.
+Phase 4 A/B-shadow has been **promoted to ACTING** — the learned predictor (η² feature weights, sequential
+sampling, self-comparing holdout CAMBI) is now making real CQ decisions. A data-integrity sweep also recovered
+17,849 corrupted aggregate rows from the CSV→DB backfill. GPU VMAF fallback is **not occurring** — the high-CPU
+is from NVENC quality-maximising settings, not VMAF slow paths.
 
-- Host project root: C:\Users\seb_m\tdarr (Docker container tdarr, LinuxServer.io image).
+---
+
+## Host environment
+
+- Host project root: `C:\Users\seb_m\tdarr` (Docker container `tdarr`, LinuxServer.io image).
 - GPU: RTX 5070 Ti (Blackwell). Custom FFmpeg 8.1.1 + libvmaf CUDA. Container Node = v24.15.0.
-- Flow "VMAF Parameter Optimization + stream reorder" (id YR5PZ1QaD). Target VMAF = 95.
+- Flow: **VMAF Parameter Optimization + stream reorder** (id `YR5PZ1QaD`). Target VMAF = 95.
+- Live plugin source: `/custom-cont-init.d/vmaf-plugin-patches/` (bind-mounted; edits require only container restart).
+- Repo: `C:\Users\seb_m\tdarr-vmaf-av1-workflow` (GitHub: smensink/tdarr-vmaf-av1-workflow).
 
-Origin / why
+---
 
-A job ("andre") was rejected for high output CAMBI (banding). That expanded into: record source CAMBI and use it in CQ
-selection → which exposed that the learning data lived in two CSVs that had repeatedly corrupted/culled each other → 
-full move to SQLite + a rewrite of the CQ-sweep predictor with the goal of reaching the right CQ in the fewest test
-transcodes.
+## What changed this session (all live)
 
-New files — C:\Users\seb_m\tdarr\custom-cont-init.d\vmaf-plugin-patches\_lib\
+### 1. Data integrity — recovered 17,849 corrupted sweep rows
 
-(custom-cont-init.d is bind-mounted into the container at /custom-cont-init.d, so plugins require() these by absolute
-path — no copy step.)
+~92% of `sweep_points` had column-misaligned aggregates (impossible `vmaf_min>vmaf_max`, wrong `vmaf_mean`)
+from a legacy CSV-writer bug. Per-sample columns were intact, so `_lib/recover_sweep_aggregates.js`
+recomputed every aggregate from them. `vmaf_min>vmaf_max` dropped 17,956 → 107 (107 unrecoverable, auto-excluded).
 
-- vmafdb.js — SQLite data layer via built-in node:sqlite. Two tables: jobs (1 row/job: source facts + decision + 
-outcome + source_cambi, bit_depth) and sweep_points (1 row/(job,CQ): the target-independent CQ→VMAF/CAMBI/size curve).
-Schema versioned by PRAGMA user_version (currently v2); migrations are ALTER TABLE ADD COLUMN only (never drops
-data). API: openDb(), upsertJob() (partial upsert by job_id), insertSweepPoints(), getSimilarSweepCurves(),
-getSimilarJobs(), tierFor(), makeJobId(), counts().
-- vmafpredict.js — the predictor. Key fns: predictCQCenter (sweep center via weighted median of similar jobs' optimal
-CQ), nextSweepCQ (sequential controller: log-ceiling fit + binding-constraint root-finding), selectCQ (final 
-constrained pick), selectSampleCount (CI-based), fitLogCeiling (VMAF=100−e^(a+b·cq)), fitRising (CAMBI vs cq),
-effectiveCambiFloor (source-relative), bindingTargetCQ.
-- backfill_vmaf_training_db.js — one-time backfill from both CSVs into the DB (already run).
-- test_vmafpredict.js — unit tests (9, all pass).
-- ab_vmafpredict.js, ab_sweepdomain.js, ab_convergence.js — analysis/backtest scripts (re-runnable).
+`getSimilarSweepCurves` now filters physically-impossible rows by default (`opts.includeInvalid` to disable).
+DB backed up: `configs/vmaf_training.db.bak_precover_*`.
 
-Edited plugins (source of truth in custom-cont-init.d/vmaf-plugin-patches/<name>/1.0.0/index.js)
+### 2. Fixed `selectSampleCount` no-variance data — plausibility bounds on per-clip sigma
 
-- extractVideoSamples — seeds shared args.variables.vmafJobId; earlier added a source-CAMBI→CQ slope model + 
-target-VMAF-proximity weighting in the learned-CQ preload.
-- learnCQRange — added source_cambi,source_cambi_p95 CSV columns; fixed the migration to PAD old rows instead of 
-dropping them (this drop-on-mismatch bug had wiped history before); dual-writes the job OUTCOME to SQLite.
-- exportVMAFResults — dual-writes the per-CQ sweep curve to SQLite including CAMBI, 1%-low VMAF, SSIM (signals the 
-CSVs never stored) + job source/decision.
-- testEncodingParameters — source-CAMBI heuristic made confidence-gated; [SHADOW] log of predictCQCenter + 
-selectSampleCount vs live crfValues.
-- selectBestParameters — [SHADOW] log of constraint-aware selectCQ pick vs live pick.
+Previously inert; now acting. Per-file sigma is bounded to [0.05, 6] and `sample_count≥3` before being used
+to adapt clip count to content variance, bounded by `[minSegments, maxSegments]`. Previously used a
+conservative historical sigma regardless of file characteristics.
 
-Data / DB (C:\Users\seb_m\tdarr\configs\)
+### 3. Holdout CAMBI fix — self-comparing source CAMBI
 
-- vmaf_training.db — the new store. 12,007 jobs / 19,500 sweep-curve points. Container path 
-/app/configs/vmaf_training.db.
-- vmaf_cq_learning.csv — recovered from 25 → 6,022 rows (merged backups). Still written (dual-write).
-- vmaf_results.csv (72,858 rows) — still written. Legacy CSVs not yet archived.
-- DO NOT run backfill_vmaf_cq_learning.py (stale 32-col schema; will truncate).
+`runVmafOnHoldout` now self-compares the holdout segment's own source CAMBI and gates on the
+**encode-introduced delta**, not a job-global floor. Fixes VMAF-100/CAMBI-high false-fails
+where source banding was already elevated.
 
-Validated algorithm (backtests on the 19,500-point DB)
+### 4. Learned similarity weights (η² correlation ratios) — replaced hand-tuned penalties
 
-1. Pooling history to predict absolute CQ is limited to ~MAE 3–4 (content variability) → history centers the sweep,
-the per-job sweep finds the exact CQ.
-2. Best center = weighted median of similar jobs' own optimal CQ (MAE 3.2).
-3. CQ→VMAF curve is saturating; best monotone+invertible fit is VMAF=100−e^(a+b·cq) (RMSE 0.26 vs 0.33 linear).
-4. Sequential root-finding on the file's own measured curve → converges in ~2–3 transcodes (vs ~6 for a static grid).
-5. Sweep is constraint-aware: root-finds on whichever binds first — VMAF mean ≥ target, 1%-low ≥ floor,
-source-relative CAMBI ≤ floor — so it won't converge to a CQ that then gets rejected (the andre fix).
-6. Sample-count is CI-based but data-starved historically (only 1,857/19,500 points have usable vmaf_stddev); improves
-as multi-sample dual-write accrues.
+`vmafpredict.learnFeatureWeights` computes each metadata covariate's η² (correlation ratio) on the
+optimal-CQ distribution → mismatch penalty, recomputed every prediction (self-updating).
 
-Deployment & verification
+Covariates tested: `genre`, `type`, `network`, `original_language`, `codec`, `release_group`, `media_year`.
 
-3-copy hot-deploy: edit source in custom-cont-init.d/..., then docker exec tdarr cp it to BOTH
-/app/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins/vmaf/<p>/1.0.0/index.js and
-/app/Tdarr_Node/assets/app/plugins/FlowPlugins/LocalFlowPlugins/vmaf/<p>/1.0.0/index.js. (Nodes periodically re-sync
-plugins from the server, so the server copy must also be updated.)
+Live finding from the recovered DB:
+- `release_group` η²≈0.23 — top predictor
+- `genre` η²≈0.23 — top predictor  
+- `network` η²≈0.19
+- `type`/`year`/`language`/`codec` ≈0 (uninformative)
 
-Verify DB: docker exec tdarr node -e 'const d=require("/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js");const
-h=d.openDb();console.log(d.counts(h))'
-Watch shadow output: grep '\[SHADOW\]' /c/Users/seb_m/tdarr/logs/Tdarr_Node_Log.txt
-Run predictor tests: docker exec tdarr node /custom-cont-init.d/vmaf-plugin-patches/_lib/test_vmafpredict.js
+Logged as `[PREDICT] learned metadata importance` in job output.
 
-Phase status
+### 5. Per-file sequential sampling (`calculateVMAF`)
 
-- Phase 1 (DB lib + backfill): DONE.
-- Phase 2 (dual-write to SQLite): LIVE.
-- Phase 3 (predictor + A/B validation): DONE.
-- Phase 4 (integration): A/B-SHADOW deployed (log-only, no behavior change). Not yet acting.
+Per-paramset early-stop: clips measured in randomised order (shared permutation → curves stay comparable),
+stops a CQ once its mean CI ≤ 0.5 VMAF **and** worst clip clears `floor+2` margin. Uses real per-file sigma
+instead of conservative historical one. Kill switch: `args.variables.vmafSequentialSampling=false`.
 
-Next steps (not yet done)
+Success-rate denominator fixed to exclude skipped clips.
 
-1. Observe [SHADOW] lines on a few real jobs; confirm predictions are sane.
-2. Flip plugins to ACT, one at a time: selectBestParameters uses selectCQ for the pick → testEncodingParameters seeds
-crfValues from predictCQCenter → checkCQRangeRetry/checkCQBracket drive nextSweepCQ binding-constraint refinement.
-3. Archive legacy CSVs; switch analyze_vmaf_data.py from pd.read_csv to pd.read_sql.
+### 6. Autoresearch re-run on recovered data + metadata + fractional CQ
 
-Gotchas
+Seed was 37% violation on real data; new `feat_float_bisect_v5` → **0.34% violation**.
+Conclusion: transcode count is floored by the noisy worst-case `vmaf_min` — the lever is content features
+(grain/dark), which are still too sparse (only 5 jobs with grain/luma/dark signals, 0 with full curves).
 
-- node:sqlite is built-in (Node 24); emits a harmless ExperimentalWarning to stderr.
-- Backfill needs PRAGMA synchronous=OFF (per-commit fsync is the bottleneck on the Windows bind mount).
-- Schema evolution is migration-only (ALTER TABLE ADD COLUMN + bump user_version); never reorder/drop columns.
-- Historical jobs from vmaf_results.csv (curves) and from vmaf_cq_learning.csv (outcomes) are NOT cross-linked (old 
-CSVs shared no key); new jobs unify via vmafJobId.
-- Full plan/design doc: C:\Users\seb_m\.claude\plans\shimmying-beaming-hamster.md.
+### 7. GPU VMAF investigation — NOT the CPU culprit
+
+Job reports show `vmafGpuVmafFallbackUsed=false` in all recent jobs; server logs show zero GPU→CPU fallback
+events. The 100%+ CPU processes are FFmpeg AV1 NVENC encodes — caused by quality-maximising settings
+(`-tune uhq -multipass fullres -spatial-aq 1 -temporal-aq 1 -rc-lookahead 48`) and HDR→SDR tonemapping,
+not by VMAF falling back to CPU.
+
+---
+
+## File inventory — live vs repo
+
+| Path | Status | Notes |
+|------|--------|-------|
+| `_lib/vmafdb.js` | ❌ DIFF +2,175B | Schema v4; `getSimilarSweepCurves` filters impossible rows by default |
+| `_lib/vmafpredict.js` | ❌ DIFF +12,123B | `learnFeatureWeights` (η²), `correlationRatio`, plausibility-bounded sigma, sequential sampling support |
+| `_lib/backfill_metadata.js` | 🆕 NEW | Not previously in repo |
+| `_lib/recover_sweep_aggregates.js` | 🆕 NEW | Not previously in repo |
+| `calculateVMAF/1.0.0/index.js` | ❌ DIFF +5,643B | Sequential sampling, per-file sigma, kill-switch |
+| `extractVideoSamples/1.0.0/index.js` | ❌ DIFF +7,979B | Holdout CAMBI fix, no_variance_data sigma bounding |
+| `testEncodingParameters/1.0.0/index.js` | ❌ DIFF +2,802B | CAMBI delta gating |
+| `selectBestParameters/1.0.0/index.js` | ❌ DIFF +6,299B | ACTING mode (was SHADOW); learned weights in CQ pick |
+| `exportVMAFResults/1.0.0/index.js` | ❌ DIFF +1,106B | DB dual-write refinements |
+| `fetchMediaMetadata/1.0.0/index.js` | ❌ DIFF +664B | |
+| `learnCQRange/1.0.0/index.js` | ❌ DIFF +272B | EMA state tracking |
+| `learnCQRange/1.0.0/ema_cq_state.json` | 🆕 NEW | EMA state snapshot |
+| `checkHdrContent/1.0.0/index.js` | ✅ SAME | |
+| `vmafOptimization.js` | 🆕 NEW | Flow template (basic) |
+| `vmafOptimizationAdvanced.js` | 🆕 NEW | Flow template (advanced) |
+| `scripts/patch_*.py`, `remove_hard_sample_floor.py` | 🆕 NEW | Patch scripts |
+
+---
+
+## Phase status
+
+| Phase | Status |
+|-------|--------|
+| 1 — DB lib + backfill | ✅ DONE |
+| 2 — Dual-write to SQLite | ✅ LIVE |
+| 3 — Predictor + A/B validation | ✅ DONE |
+| 4 — Integration (SHADOW) | ✅ **PROMOTED TO ACTING** |
+| 5 — Feature accrual (grain/dark) | ⏳ Pending — needs batch runs |
+
+---
+
+## How to verify the next job's report
+
+Look for these markers confirming the new logic is active:
+
+```
+Source CAMBI baseline: …  (encode-delta: …)     ← holdout self-comparison
+[ACTING] Predictor-seeded                           ← selectBestParameters acting (not SHADOW)
+[PREDICT] learned metadata importance              ← η² weights computed
+Sequential sampling ON (randomised clip order)     ← calculateVMAF sequential
+Sequential stop … at N clips                      ← early-stop triggered
+vmaf_min>vmaf_max rows excluded: 107               ← data integrity filter
+```
+
+---
+
+## Deployment reminder
+
+Edit source in `/custom-cont-init.d/vmaf-plugin-patches/<name>/1.0.0/index.js`, then:
+```bash
+docker restart tdarr
+```
+The bind mount means both server and node plugin roots (`/app/server/Tdarr/Plugins/...` and
+`/app/Tdarr_Node/assets/app/plugins/...`) pick up changes automatically after restart.
+
+Verify DB:
+```bash
+docker exec tdarr node -e 'const d=require("/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js");const h=d.openDb();console.log(d.counts(h))'
+```
+Run predictor tests:
+```bash
+docker exec tdarr node /custom-cont-init.d/vmaf-plugin-patches/_lib/test_vmafpredict.js
+```
+
+---
+
+## Next steps (priority order)
+
+1. **Feature data accrual** — grain/luma/dark signals only on 5 jobs (0 with full curves). After a batch
+   runs, re-run the autoresearch feature ablation.
+2. **Per-clip VMAF logging** — would let `selectSampleCount` use true per-file sigma at seed time
+   (currently uses historical sigma initially, then updates post-measurement).
+3. **NVENC CPU overhead reduction** — if CPU load needs trimming: reduce `-rc-lookahead` from 48→24,
+   or switch HDR tonemapping to a lighter filter.
+4. **Archive legacy CSVs** — `vmaf_results.csv` (72,858 rows) and `vmaf_cq_learning.csv`; switch
+   `analyze_vmaf_data.py` from `pd.read_csv` to `pd.read_sql`.
+
+---
+
+## Gotchas
+
+- `node:sqlite` is built-in (Node 24); emits a harmless `ExperimentalWarning` to stderr.
+- Schema evolution is migration-only (`ALTER TABLE ADD COLUMN` + bump `user_version`); never reorder/drop columns.
+- `getSimilarSweepCurves` now excludes rows where `vmaf_min > vmaf_max` or `vmaf_mean` is outside
+  `[vmaf_min, vmaf_max]` by default — these were ~92% of historical rows due to CSV column drift.
+- Full design doc: `C:\Users\seb_m\.claude\plans\shimmying-beaming-hamster.md`.

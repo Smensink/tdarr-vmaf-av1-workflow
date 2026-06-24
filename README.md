@@ -40,10 +40,11 @@ This workflow uses those ideas practically inside Tdarr: VMAF estimates perceptu
 ## How the project is organized
 
 - `docker/` — compose example, Dockerfile, init hooks, and FFmpeg/libvmaf build recipe
-- `plugins/vmaf/_lib/` — shared Node.js libraries: `vmafdb.js` (SQLite data layer), `vmafpredict.js` (CQ predictor), backfill script, and analysis tools
+- `plugins/vmaf/_lib/` — shared Node.js libraries: `vmafdb.js` (SQLite data layer, v4 schema with data-integrity filters), `vmafpredict.js` (CQ predictor with η²-learned weights, sequential sampling, correlationRatio), `backfill_metadata.js`, `recover_sweep_aggregates.js`, backfill scripts, and analysis tools
+- `scripts/` — patch scripts applied during development (`patch_learning_holdout.py`, `patch_meanmin_sampling.py`, `patch_quality_guard.py`, `remove_hard_sample_floor.py`)
 - `plugins/vmaf/` — Tdarr Local Flow Plugins (`vmaf/` category)
 - `plugins/filter/checkFileAge/` — age-gate plugin (`filter/` category)
-- `flow/tdarr-flow-vmaf-av1.json` — importable Tdarr flow
+- `flow/` — importable Tdarr flow (`tdarr-flow-vmaf-av1.json`) plus alternative templates (`vmafOptimization.js`, `vmafOptimizationAdvanced.js`)
 - `data/seed/` — aggregate warm-start CQ priors
 - `tools/` — install, validation, and data-sanitization helpers
 - `docs/` — detailed architecture, plugin reference, quality policy, and troubleshooting

@@ -80,11 +80,11 @@ exports.details = details;
 var plugin = function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
-
+    
     var https = require('https');
     var http = require('http');
     var path = require('path');
-
+    
     var enableMetadata = args.inputs.enableMetadata !== false && args.inputs.enableMetadata !== 'false';
     var plexUrl = (args.inputs.plexUrl || '').trim();
     var plexToken = (args.inputs.plexToken || '').trim();
@@ -92,7 +92,7 @@ var plugin = function (args) {
     var tmdbApiKey = (args.inputs.tmdbApiKey || '').trim();
     var tvdbApiKey = (args.inputs.tvdbApiKey || '').trim();
     var logMetadata = args.inputs.logMetadata !== false && args.inputs.logMetadata !== 'false';
-
+    
     var defaultResult = {
         vmafMediaGenre: [],
         vmafMediaIsAnimation: false,
@@ -102,12 +102,12 @@ var plugin = function (args) {
         vmafMediaSourceType: 'unknown',
         vmafMediaGenresString: ''
     };
-
+    
     // Ensure defaults are set to avoid stale data
     Object.keys(defaultResult).forEach(function(key) {
         args.variables[key] = defaultResult[key];
     });
-
+    
     if (!enableMetadata) {
         args.jobLog('Metadata fetching disabled - using defaults');
         return {
@@ -116,7 +116,7 @@ var plugin = function (args) {
             variables: args.variables,
         };
     }
-
+    
     function requestJson(url, headers, timeoutMs) {
         return new Promise(function(resolve) {
             var client = url.indexOf('https://') === 0 ? https : http;
@@ -136,7 +136,7 @@ var plugin = function (args) {
             req.on('timeout', function() { req.destroy(); resolve(null); });
         });
     }
-
+    
     function requestText(url, headers, timeoutMs) {
         return new Promise(function(resolve) {
             var client = url.indexOf('https://') === 0 ? https : http;
@@ -149,7 +149,7 @@ var plugin = function (args) {
             req.on('timeout', function() { req.destroy(); resolve(''); });
         });
     }
-
+    
     var SOURCE_TYPE_PATTERNS = [
         { name: 'bluray', regex: /\b(?:blu[-]?ray|bluray|bdrip|br(?:rip)?|remux|uhdremux|bd(?:rip)?)\b/i },
         { name: 'dvd-rip', regex: /\b(?:dvdrip|dvd)\b/i },
@@ -191,7 +191,7 @@ var plugin = function (args) {
         title = title.replace(/\s+/g, ' ').trim();
         return { title: title, year: year, sourceType: sourceType };
     }
-
+    
     function normalizeGenres(genres) {
         if (!Array.isArray(genres)) return [];
         var seen = {};
@@ -205,7 +205,7 @@ var plugin = function (args) {
         }
         return out;
     }
-
+    
     function detectAnimation(genres, keywords, libraryName) {
         var lowerGenres = (genres || []).map(function(g) { return g.toLowerCase(); });
         var lowerKeywords = (keywords || []).map(function(g) { return String(g).toLowerCase(); });
@@ -219,35 +219,35 @@ var plugin = function (args) {
         }
         return hit;
     }
-
+    
     function normalizeTitle(str) {
         return String(str || '')
             .toLowerCase()
             .replace(/[^a-z0-9]+/g, ' ')
             .trim();
     }
-
+    
     function selectBestPlexMeta(metaArray, filenameMeta, inputFilePath) {
         if (!Array.isArray(metaArray) || metaArray.length === 0) return null;
         var targetYear = filenameMeta.year || null;
         var targetTitle = normalizeTitle(filenameMeta.title);
         var targetBase = normalizeTitle(require('path').basename(inputFilePath || '', require('path').extname(inputFilePath || '')));
-
+        
         var best = null;
         var bestScore = -1;
-
+        
         for (var i = 0; i < metaArray.length; i++) {
             var m = metaArray[i];
             var score = 0;
             var metaTitle = normalizeTitle(m.title || '');
             if (metaTitle === targetTitle) score += 5;
             else if (metaTitle.indexOf(targetTitle) !== -1 || targetTitle.indexOf(metaTitle) !== -1) score += 3;
-
+            
             if (targetYear && m.year) {
                 if (Number(m.year) === targetYear) score += 4;
                 else if (Math.abs(Number(m.year) - targetYear) <= 1) score += 2;
             }
-
+            
             // Prefer entries whose Part file basename matches the current file basename
             if (m.Media && Array.isArray(m.Media)) {
                 for (var mi = 0; mi < m.Media.length; mi++) {
@@ -265,16 +265,16 @@ var plugin = function (args) {
                     }
                 }
             }
-
+            
             if (score > bestScore) {
                 bestScore = score;
                 best = m;
             }
         }
-
+        
         return best || metaArray[0];
     }
-
+    
     function extractReleaseGroup(filePath) {
         if (!filePath) return '';
         var base = path.basename(filePath, path.extname(filePath));
@@ -282,7 +282,7 @@ var plugin = function (args) {
         if (parts.length === 0) return '';
         return parts[parts.length - 1];
     }
-
+    
     function parsePlexXml(xml) {
         if (!xml || xml.indexOf('<MediaContainer') === -1) return null;
         var genres = [];
@@ -302,7 +302,7 @@ var plugin = function (args) {
             libraryName: libraryMatch ? libraryMatch[1] : ''
         };
     }
-
+    
     function plexSearch(title, year) {
         if (!plexUrl || !plexToken) return Promise.resolve(null);
         var baseUrl = plexUrl.replace(/\/$/, '');
@@ -316,7 +316,7 @@ var plugin = function (args) {
             '&X-Plex-Platform=Tdarr';
         var url = baseUrl + '/search?query=' + query + sectionParam + commonQuery;
         var headers = { 'X-Plex-Token': plexToken, 'Accept': 'application/json' };
-
+        
         function attempt(urlToTry) {
             if (logMetadata) {
                 args.jobLog('Plex search: ' + urlToTry);
@@ -340,7 +340,7 @@ var plugin = function (args) {
                 });
             });
         }
-
+        
         return attempt(url).then(function(result) {
             if (result || baseUrl.indexOf('host.docker.internal') === -1) return result;
             // Dev/local fallback: try localhost when host.docker.internal is unreachable outside Docker
@@ -348,7 +348,7 @@ var plugin = function (args) {
             return attempt(fallbackUrl);
         });
     }
-
+    
     function tmdbSearch(title, year) {
         if (!tmdbApiKey) return Promise.resolve(null);
         var searchUrl = 'https://api.themoviedb.org/3/search/multi?query=' + encodeURIComponent(title || '') +
@@ -372,12 +372,14 @@ var plugin = function (args) {
                     genres: genres,
                     keywords: keywords,
                     type: type,
-                    year: yearOut ? Number(yearOut) : (year || null)
+                    year: yearOut ? Number(yearOut) : (year || null),
+                    network: ((detail.networks || [])[0] || {}).name || null,            // streaming/style proxy (Apple TV+, etc.)
+                    originalLanguage: detail.original_language || null                   // anime (ja) vs western
                 };
             });
         });
     }
-
+    
     // TVDB v4 search (simple auth flow: use API key directly in header)
     function tvdbSearch(title, year) {
         if (!tvdbApiKey) return Promise.resolve(null);
@@ -413,13 +415,13 @@ var plugin = function (args) {
             req.on('timeout', function() { req.destroy(); resolve(null); });
         });
     }
-
+    
     var filenameMeta = parseFilenameMeta(args.inputFileObj._id || '');
     var lookupChain = [];
     if (plexUrl && plexToken) lookupChain.push(function() { return plexSearch(filenameMeta.title, filenameMeta.year); });
     if (tmdbApiKey) lookupChain.push(function() { return tmdbSearch(filenameMeta.title, filenameMeta.year); });
     if (tvdbApiKey) lookupChain.push(function() { return tvdbSearch(filenameMeta.title, filenameMeta.year); });
-
+    
     function runLookup(index) {
         if (index >= lookupChain.length) return Promise.resolve(null);
         return lookupChain[index]().then(function(res) {
@@ -427,7 +429,7 @@ var plugin = function (args) {
             return runLookup(index + 1);
         });
     }
-
+    
     return runLookup(0).then(function(meta) {
         var resolved = meta || {
             source: 'none',
@@ -436,10 +438,10 @@ var plugin = function (args) {
             type: 'unknown',
             year: filenameMeta.year
         };
-
+        
         var genres = normalizeGenres(resolved.genres || []);
         var isAnimation = detectAnimation(genres, resolved.keywords || [], resolved.libraryName || '');
-
+        
         args.variables.vmafMediaGenre = genres;
         args.variables.vmafMediaGenresString = genres.join(', ');
         args.variables.vmafMediaIsAnimation = isAnimation;
@@ -448,7 +450,9 @@ var plugin = function (args) {
         args.variables.vmafMediaMetadataSource = resolved.source || 'none';
         args.variables.vmafMediaSourceType = filenameMeta.sourceType || 'unknown';
         args.variables.vmafReleaseGroup = extractReleaseGroup(args.inputFileObj._id || '');
-
+        args.variables.vmafNetwork = resolved.network || null;                 // -> jobs.network (encode-style proxy)
+        args.variables.vmafOriginalLanguage = resolved.originalLanguage || null; // -> jobs.original_language
+        
         if (logMetadata) {
             args.jobLog('Metadata search inputs: title=' + filenameMeta.title + ', year=' + filenameMeta.year);
             args.jobLog('Metadata source: ' + args.variables.vmafMediaMetadataSource + (genres.length ? (' | Genres: ' + genres.join(', ')) : ' | No genres found'));
@@ -457,7 +461,7 @@ var plugin = function (args) {
             }
             args.jobLog('Metadata details: type=' + args.variables.vmafMediaType + ', year=' + args.variables.vmafMediaYear + ', sourceType=' + args.variables.vmafMediaSourceType);
         }
-
+        
         return {
             outputFileObj: args.inputFileObj,
             outputNumber: 1,

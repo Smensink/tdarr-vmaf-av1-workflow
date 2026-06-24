@@ -37704,6 +37704,30 @@ var plugin = function (args) {
 
         try { if (fs.existsSync(distortedPath)) fs.unlinkSync(distortedPath); } catch (e4) {}
 
+        // ── Per-segment SOURCE CAMBI: self-compare the un-encoded holdout segment ──
+        // CAMBI measured on the distorted encode includes banding ALREADY present in the source.
+        // Measuring this segment's OWN source banding lets the caller gate on the encode-INTRODUCED
+        // delta, so a holdout that lands on an already-banded scene is not false-rejected. (This was
+        // the cause of VMAF=100 / CAMBI-high holdout failures: the job-global source floor came from
+        // the sweep clips, not this segment.) Self-compare => VMAF~100, cambi = source banding.
+        if (parsed) {
+            try {
+                var srcCambiLog = cacheDir + '/holdout_srccambi_' + safeId + '.json';
+                try { if (fs.existsSync(srcCambiLog)) fs.unlinkSync(srcCambiLog); } catch (e5) {}
+                var srcPix = (String(pixFmt).indexOf('10') !== -1) ? 'yuv420p10le' : 'yuv420p';
+                var srcCmd = '"' + args.ffmpegPath + '" -y -hide_banner -i "' + holdout.path + '" -i "' + holdout.path + '"'
+                    + ' -filter_complex "[0:v]format=' + srcPix + '[d];[1:v]format=' + srcPix + '[r];[d][r]libvmaf=log_fmt=json:log_path=' + srcCambiLog + ':feature=name=cambi"'
+                    + ' -f null -';
+                try { execSync(srcCmd, { stdio: 'pipe', timeout: 120000, shell: '/bin/sh', maxBuffer: 32 * 1024 * 1024 }); } catch (e6) {}
+                var srcParsed = fs.existsSync(srcCambiLog) ? parseHoldoutVmafLog(srcCambiLog, fs) : null;
+                if (srcParsed) {
+                    parsed.srcCambiMean = srcParsed.cambiMean;
+                    parsed.srcCambiP95 = srcParsed.cambiP95;
+                }
+                try { if (fs.existsSync(srcCambiLog)) fs.unlinkSync(srcCambiLog); } catch (e7) {}
+            } catch (e8) { /* non-fatal: caller falls back to the job-global source CAMBI floor */ }
+        }
+
 
 
 
@@ -244567,6 +244591,21 @@ var plugin = function (args) {
 
                     }
 
+                    // Per-segment source CAMBI (this holdout's OWN banding, self-compared in
+                    // runVmafOnHoldout). Preferred over the job-global sweep-clip source CAMBI: judge
+                    // the holdout on the banding the ENCODE added, not banding inherent to the source.
+                    var hoSrcCM = Number(holdoutData.srcCambiMean);
+
+                    var hoSrcCP = Number(holdoutData.srcCambiP95);
+
+                    var hoSrcCW = Math.max(isFinite(hoSrcCM) ? hoSrcCM : -Infinity, isFinite(hoSrcCP) ? hoSrcCP : -Infinity);
+
+                    if (isFinite(hoSrcCW)) {
+
+                        cambiLimit = Math.max(cambiLimit, hoSrcCW + 1.0);
+
+                    }
+
 
 
 
@@ -244589,7 +244628,8 @@ var plugin = function (args) {
 
 
 
-                        + ', CAMBI=' + hoCM.toFixed(3) + ' (p95=' + hoCP.toFixed(3) + ')');
+                        + ', CAMBI=' + hoCM.toFixed(3) + ' (p95=' + hoCP.toFixed(3) + ')'
+                        + (isFinite(hoSrcCW) ? ', srcCAMBI=' + hoSrcCW.toFixed(3) + ' (encode-delta=' + (hoCW - hoSrcCW).toFixed(3) + ')' : ''));
 
 
 
@@ -245034,6 +245074,50 @@ var plugin = function (args) {
                 + ') vs live pick CQ=' + _liveCq);
         } catch (_shErr2) {
             args.jobLog('[SHADOW] selectCQ shadow failed (non-fatal): ' + (_shErr2 && _shErr2.message ? _shErr2.message : String(_shErr2)));
+        }
+
+        // ── ACTING: max-compression pick. Choose the highest-CQ MEASURED candidate that meets ALL
+        //    constraints (VMAF mean >= target, 1%-low >= floor, CAMBI <= source-relative floor).
+        //    Override ONLY UPWARD vs the existing pick (higher CQ = smaller file, never lower
+        //    quality than what the existing logic already accepted). Uses the per-job MEASURED
+        //    curve (which has real 1%-low/CAMBI), not the historical pool. The final transcode is
+        //    VMAF-verified downstream (monitorTranscodeRetry), which backstops the holdout.
+        try {
+            var _vpA = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js');
+            var _aggA = args.variables.vmafAggregatedResults || [];
+            var _tgtA = Number(args.variables.vmafMinVMAF) || 95;
+            var _floorA = Number(args.variables.vmafMinFrameVMAF)
+                || (args.variables.vmafQualityRiskPolicy && Number(args.variables.vmafQualityRiskPolicy.adaptiveFrameFloor)) || null;
+            var _cambiBaseA = args.variables.isHDR ? 5.0 : (args.variables.vmafMediaIsAnimation === true ? 6.0 : 5.5);
+            var _effCambiA = _vpA.effectiveCambiFloor({ cambiFloor: _cambiBaseA, sourceCambi: args.variables.vmafSourceCAMBI, sourceCambiP95: args.variables.vmafSourceCAMBIP95 });
+            var _curCqA = (bestParams && bestParams.parameterSet)
+                ? Number(bestParams.parameterSet.cq != null ? bestParams.parameterSet.cq : bestParams.parameterSet.quality) : NaN;
+            var _bestFeasA = null;
+            for (var _ia = 0; _ia < _aggA.length; _ia++) {
+                var _aa = _aggA[_ia], _psa = _aa.parameterSet || {};
+                var _cqa = Number(_psa.cq != null ? _psa.cq : _psa.quality);
+                var _vma = (_aa.avgVMAFMean != null ? Number(_aa.avgVMAFMean) : Number(_aa.avgVMAF));
+                var _p1a = (_aa.vmafP1Low != null ? Number(_aa.vmafP1Low) : null);
+                var _cba = (_aa.p95CAMBI != null ? Number(_aa.p95CAMBI) : (_aa.maxCAMBI != null ? Number(_aa.maxCAMBI) : null));
+                if (!isFinite(_cqa) || !isFinite(_vma)) continue;
+                var _okA = (_vma >= _tgtA)
+                    && (_floorA == null || _p1a == null || _p1a >= _floorA)
+                    && (_effCambiA == null || _cba == null || _cba <= _effCambiA);
+                if (_okA && (!_bestFeasA || _cqa > _bestFeasA.cq)) _bestFeasA = { cq: _cqa, item: _aa };
+            }
+            if (_bestFeasA && isFinite(_curCqA) && _bestFeasA.cq > _curCqA) {
+                var _ni = _bestFeasA.item;
+                bestParams = _ni;
+                args.variables.vmafBestParameters = _ni.parameterSet;
+                if (_ni.avgVMAF != null) args.variables.vmafBestVMAF = _ni.avgVMAF;
+                if (_ni.minVMAF != null) args.variables.vmafBestMinVMAF = _ni.minVMAF;
+                if (_ni.avgFileSizeMB != null) args.variables.vmafBestSize = _ni.avgFileSizeMB;
+                args.jobLog('[ACTING] Max-compression override: CQ ' + _curCqA + ' -> ' + _bestFeasA.cq
+                    + ' (highest measured CQ meeting VMAF>=' + _tgtA + ', 1%low>=' + (_floorA != null ? _floorA : 'n/a')
+                    + ', CAMBI<=' + (_effCambiA != null ? _effCambiA.toFixed(1) : 'n/a') + ')');
+            }
+        } catch (_acErr) {
+            args.jobLog('[ACTING] max-compression override skipped (non-fatal): ' + (_acErr && _acErr.message ? _acErr.message : String(_acErr)));
         }
 
 

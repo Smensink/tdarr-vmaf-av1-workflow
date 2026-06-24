@@ -86,7 +86,26 @@ The learning system uses **SQLite as the primary store** for new transcode data.
 - **jobs** — one row per transcode: source facts (resolution, codec, bitrate, source CAMBI, bit depth), the CQ decision made, and the measured outcome (actual VMAF, CAMBI, output size).
 - **sweep_points** — one row per (job, CQ) pair: the measured CQ→VMAF/CAMBI/size curve for that file. These curves are content-independent and are pooled across dissimilar sources to predict a good CQ centre before a sweep runs.
 
-The predictor (`plugins/vmaf/_lib/vmafpredict.js`) uses pooled sweep curves from similar past jobs to predict a CQ centre, then runs a sequential root-finding sweep on the file's own measured curve — converging in ~2–3 transcodes instead of a static grid. Constraint-aware logic prevents converging on a CQ that would fail the CAMBI floor or 1%-low VMAF guard.
+### Phase 4 — ACTING (June 2026)
+
+The A/B-shadow predictor has been promoted to full acting mode. The current active system includes:
+
+- **Learned similarity weights (η² correlation ratios)** — `vmafpredict.learnFeatureWeights` computes each metadata covariate's η² on the optimal-CQ distribution. Live empirical findings: `release_group` and `genre` (η²≈0.23 each) are the top predictors; `network` ≈0.19; `type`/`year`/`language`/`codec` ≈0. These are recomputed from the live DB on every prediction call, so they self-update as more data accrues.
+
+- **Sequential sampling with early stop** — `calculateVMAF` now measures clips in randomised order (shared permutation across CQs so curves remain comparable) and stops a CQ once its mean CI ≤ 0.5 VMAF and the worst clip clears `floor+2` margin. Per-file sigma is plausibility-bounded (0.05–6) and fed back for future clips. Disabled via `args.variables.vmafSequentialSampling=false`.
+
+- **Holdout CAMBI self-comparison** — the holdout validation now compares the holdout segment's own source CAMBI to the encode-introduced CAMBI delta, rather than gating against a job-global floor. Fixes VMAF-100/CAMBI-high false-fails where source banding was already elevated.
+
+- **Data integrity filter** — `getSimilarSweepCurves` (v4 schema) excludes physically-impossible rows (`vmaf_min>vmaf_max` or `vmaf_mean` outside `[min,max]`) by default. ~92% of historical CSV-backfill rows had these misalignments; `recover_sweep_aggregates.js` recomputed correct aggregates from per-sample columns, reducing violations from 17,956 to 107 (auto-excluded).
+
+- **Per-file sigma bounding** — `selectSampleCount` now plausibility-bounds per-clip sigma to [0.05, 6] with a floor of 3 clips. Previously inert despite being wired in; now actively adapts clip count to content variance.
+
+### Additional _lib utilities
+
+- `backfill_metadata.js` — enriches historical jobs with metadata covariates (genre, release_group, network, codec) for the η² feature learning.
+- `recover_sweep_aggregates.js` — recomputes corrupted aggregate columns (`vmaf_mean`, `vmaf_min`, `vmaf_max`) from per-sample data already stored in `sweep_points`.
+
+### Legacy state
 
 The legacy CSV files are not cross-linked with new SQLite jobs (they shared no common key). New jobs are unified by `vmafJobId`, a shared variable seeded by `extractVideoSamples` and propagated through the full flow.
 
