@@ -248,6 +248,12 @@ function selectCQ(curveRows, src, constraints, opts) {
   var h = opts.cqBandwidth || 2.0;
   var minSupport = opts.minSupport || 0.75;
   var cambiKey = opts.cambiMetric || 'cambi_p95';
+  var cqStep = Number(opts.cqStep);
+  if (!isFinite(cqStep) || cqStep <= 0) cqStep = 1;
+  // av1_nvenc accepts fractional -cq values. 0.1 is enough precision for
+  // constraint-bound interpolation without pretending the measurements are exact.
+  cqStep = Math.max(0.1, Math.min(1, cqStep));
+  function roundCq(cq) { return Math.round(cq * 10) / 10; }
 
   // Build weighted point sets per metric.
   var vmafPts = [], p1Pts = [], cambiPts = [], sizePts = [];
@@ -271,9 +277,13 @@ function selectCQ(curveRows, src, constraints, opts) {
     return { cq: null, reason: 'no_similar_curves', support: 0, neighbours: nRows };
   }
 
-  // Evaluate each integer cq; feasibility = all KNOWN constraints satisfied with support.
+  // Evaluate each cq; feasibility = all KNOWN constraints satisfied with support.
+  // Default is integer CQ for backwards compatibility; callers can pass cqStep:0.1
+  // to exploit NVENC's fractional -cq support.
   var evals = [];
-  for (var c = CQ_MIN; c <= CQ_MAX; c++) {
+  var cqSteps = Math.round((CQ_MAX - CQ_MIN) / cqStep);
+  for (var ci = 0; ci <= cqSteps; ci++) {
+    var c = roundCq(CQ_MIN + ci * cqStep);
     var ev = { cq: c };
     var vm = kernelEstimate(vmafPts, c, h);
     ev.vmaf = vm.val; ev.support = vm.support; ev.count = vm.count;
@@ -335,7 +345,13 @@ function selectCQ(curveRows, src, constraints, opts) {
     neighbours: nRows,
     totalWeight: totalW,
     confidence: confidenceFrom(chosen.support, chosen.count, nRows),
-    bindingConstraint: bindingAt(evals[Math.min(evals.length - 1, (chosen.cq - CQ_MIN) + 1)]) || 'size_or_none',
+    bindingConstraint: (function () {
+      var next = null;
+      for (var bi = 0; bi < evals.length; bi++) {
+        if (evals[bi].cq > chosen.cq + 1e-9) { next = evals[bi]; break; }
+      }
+      return bindingAt(next || chosen) || 'size_or_none';
+    })(),
     reason: 'ok'
   };
 }

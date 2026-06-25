@@ -1804,7 +1804,9 @@ var plugin = function (args) {
 
                 + ', SSIM=' + ((cand.avgSSIM !== null && cand.avgSSIM !== undefined) ? cand.avgSSIM.toFixed(2) : 'n/a')
 
-                + ', CAMBI=' + ((cand.avgCAMBI !== null && cand.avgCAMBI !== undefined) ? cand.avgCAMBI.toFixed(2) : 'n/a')
+                + ', CAMBI(avg/p95/worst)=' + ((cand.avgCAMBI !== null && cand.avgCAMBI !== undefined) ? cand.avgCAMBI.toFixed(2) : 'n/a')
+                + '/' + ((cand.p95CAMBI !== null && cand.p95CAMBI !== undefined) ? cand.p95CAMBI.toFixed(2) : 'n/a')
+                + '/' + ((cand.avgCAMBI !== null && cand.avgCAMBI !== undefined) ? Math.max(Number(cand.avgCAMBI||0),Number(cand.p95CAMBI||0)).toFixed(2) : 'n/a')
 
                 + ', Size=' + cand.avgFileSizeMB.toFixed(2) + 'MB'
 
@@ -2514,9 +2516,10 @@ var plugin = function (args) {
 
         args.variables.vmafBestParameters = bestParams.parameterSet;
 
-        // ── A/B SHADOW (Phase 3): what the new constraint-aware selectCQ would pick from the
-        // SAME measured curve (VMAF mean + 1%-low + source-relative CAMBI), vs the live pick.
-        // No behaviour change. Lets us compare the optimizer on real data before flipping it on.
+        // ── ACTING: constraint-aware CQ selector. Uses the SAME measured per-job curve
+        // (VMAF mean + 1%-low + CAMBI p95) but interpolates on a 0.1 CQ grid, so we can land
+        // just below the binding constraint instead of falling all the way back to the previous
+        // measured CQ. This replaces the old shadow-only selectCQ path.
         try {
             var _vp = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js');
             var _agg = args.variables.vmafAggregatedResults || [];
@@ -2534,66 +2537,129 @@ var plugin = function (args) {
                     bits_per_pixel: null, source_codec: ''
                 });
             }
+            function _metricAt(cq, getter) {
+                var pts = [];
+                for (var mi = 0; mi < _agg.length; mi++) {
+                    var ma = _agg[mi], mps = ma.parameterSet || {};
+                    var mcq = Number(mps.cq != null ? mps.cq : mps.quality);
+                    var mv = getter(ma);
+                    if (isFinite(mcq) && mv != null && isFinite(Number(mv))) pts.push({ cq: mcq, v: Number(mv) });
+                }
+                if (!pts.length) return null;
+                pts.sort(function(a, b) { return a.cq - b.cq; });
+                if (cq <= pts[0].cq) return pts[0].v;
+                if (cq >= pts[pts.length - 1].cq) return pts[pts.length - 1].v;
+                for (var pi = 0; pi < pts.length - 1; pi++) {
+                    var p0 = pts[pi], p1 = pts[pi + 1];
+                    if (cq >= p0.cq && cq <= p1.cq && p1.cq !== p0.cq) {
+                        return p0.v + ((p1.v - p0.v) * (cq - p0.cq) / (p1.cq - p0.cq));
+                    }
+                }
+                return null;
+            }
             var _tgt = Number(args.variables.vmafMinVMAF) || 95;
-            var _floor = Number(args.variables.vmafMinFrameVMAF) || null; // 1%-low floor if set
-            var _cambiBase = args.variables.isHDR ? 5.0 : 5.5;
+            var _floor = Number(args.variables.vmafMinFrameVMAF)
+                || (args.variables.vmafQualityRiskPolicy && Number(args.variables.vmafQualityRiskPolicy.adaptiveFrameFloor)) || null;
+            var _cambiBase = args.variables.isHDR ? 5.0 : (args.variables.vmafMediaIsAnimation === true ? 6.0 : 5.5);
+            var _effCambi = _vp.effectiveCambiFloor({ cambiFloor: _cambiBase, sourceCambi: args.variables.vmafSourceCAMBI, sourceCambiP95: args.variables.vmafSourceCAMBIP95 });
             var _sel = _vp.selectCQ(_curve, {}, {
                 targetVmaf: _tgt, vmafFloor: _floor, cambiFloor: _cambiBase,
                 sourceCambi: args.variables.vmafSourceCAMBI, sourceCambiP95: args.variables.vmafSourceCAMBIP95
-            }, { minSupport: 0.05, cqBandwidth: 1.5 });
+            }, { minSupport: 0.05, cqBandwidth: 1.5, cqStep: 0.1 });
             var _liveCq = (bestParams.parameterSet && (bestParams.parameterSet.cq != null ? bestParams.parameterSet.cq : bestParams.parameterSet.quality));
-            args.jobLog('[SHADOW] selectCQ pick=' + (_sel.cq != null ? _sel.cq : 'none')
+            args.jobLog('[ACTING] constraint-aware selectCQ pick=' + (_sel.cq != null ? _sel.cq : 'none')
                 + ' (binding=' + _sel.bindingConstraint + ', predVMAF=' + (_sel.predictedVmaf != null ? _sel.predictedVmaf.toFixed(2) : 'n/a')
-                + ', predCAMBI=' + (_sel.predictedCambi != null ? _sel.predictedCambi.toFixed(2) : 'n/a')
-                + ', effCambiFloor=' + (_vp.effectiveCambiFloor({ cambiFloor: _cambiBase, sourceCambi: args.variables.vmafSourceCAMBI, sourceCambiP95: args.variables.vmafSourceCAMBIP95 }))
-                + ') vs live pick CQ=' + _liveCq);
-        } catch (_shErr2) {
-            args.jobLog('[SHADOW] selectCQ shadow failed (non-fatal): ' + (_shErr2 && _shErr2.message ? _shErr2.message : String(_shErr2)));
-        }
+                + ', pred1%low=' + (_sel.predictedP1Low != null ? _sel.predictedP1Low.toFixed(2) : 'n/a')
+                + ', predCAMBI_p95=' + (_sel.predictedCambi != null ? _sel.predictedCambi.toFixed(2) : 'n/a')
+                + ', effCambiFloor=' + (_effCambi != null ? _effCambi.toFixed(2) : 'n/a')
+                + ') vs measured-core pick CQ=' + _liveCq);
 
-        // ── ACTING: max-compression pick. Choose the highest-CQ MEASURED candidate that meets ALL
-        //    constraints (VMAF mean >= target, 1%-low >= floor, CAMBI <= source-relative floor).
-        //    Override ONLY UPWARD vs the existing pick (higher CQ = smaller file, never lower
-        //    quality than what the existing logic already accepted). Uses the per-job MEASURED
-        //    curve (which has real 1%-low/CAMBI), not the historical pool. The final transcode is
-        //    VMAF-verified downstream (monitorTranscodeRetry), which backstops the holdout.
-        try {
-            var _vpA = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js');
-            var _aggA = args.variables.vmafAggregatedResults || [];
-            var _tgtA = Number(args.variables.vmafMinVMAF) || 95;
-            var _floorA = Number(args.variables.vmafMinFrameVMAF)
-                || (args.variables.vmafQualityRiskPolicy && Number(args.variables.vmafQualityRiskPolicy.adaptiveFrameFloor)) || null;
-            var _cambiBaseA = args.variables.isHDR ? 5.0 : (args.variables.vmafMediaIsAnimation === true ? 6.0 : 5.5);
-            var _effCambiA = _vpA.effectiveCambiFloor({ cambiFloor: _cambiBaseA, sourceCambi: args.variables.vmafSourceCAMBI, sourceCambiP95: args.variables.vmafSourceCAMBIP95 });
-            var _curCqA = (bestParams && bestParams.parameterSet)
-                ? Number(bestParams.parameterSet.cq != null ? bestParams.parameterSet.cq : bestParams.parameterSet.quality) : NaN;
-            var _bestFeasA = null;
-            for (var _ia = 0; _ia < _aggA.length; _ia++) {
-                var _aa = _aggA[_ia], _psa = _aa.parameterSet || {};
-                var _cqa = Number(_psa.cq != null ? _psa.cq : _psa.quality);
-                var _vma = (_aa.avgVMAFMean != null ? Number(_aa.avgVMAFMean) : Number(_aa.avgVMAF));
-                var _p1a = (_aa.vmafP1Low != null ? Number(_aa.vmafP1Low) : null);
-                var _cba = (_aa.p95CAMBI != null ? Number(_aa.p95CAMBI) : (_aa.maxCAMBI != null ? Number(_aa.maxCAMBI) : null));
-                if (!isFinite(_cqa) || !isFinite(_vma)) continue;
-                var _okA = (_vma >= _tgtA)
-                    && (_floorA == null || _p1a == null || _p1a >= _floorA)
-                    && (_effCambiA == null || _cba == null || _cba <= _effCambiA);
-                if (_okA && (!_bestFeasA || _cqa > _bestFeasA.cq)) _bestFeasA = { cq: _cqa, item: _aa };
-            }
-            if (_bestFeasA && isFinite(_curCqA) && _bestFeasA.cq > _curCqA) {
-                var _ni = _bestFeasA.item;
-                bestParams = _ni;
+            if (_sel.cq != null && isFinite(Number(_sel.cq)) && isFinite(Number(_liveCq)) && Number(_sel.cq) > Number(_liveCq) + 0.05) {
+                var _preSelectParams = bestParams;
+                var _newCq = Math.round(Number(_sel.cq) * 10) / 10;
+                var _paramSet = {};
+                for (var _pk in bestParams.parameterSet) {
+                    if (Object.prototype.hasOwnProperty.call(bestParams.parameterSet, _pk)) _paramSet[_pk] = bestParams.parameterSet[_pk];
+                }
+                _paramSet.quality = _newCq;
+                if (_paramSet.cq != null) _paramSet.cq = _newCq;
+                _paramSet.id = String(bestParams.parameterSet.id || bestParams.parameterSetId || 'sel') + '_cqa' + _newCq;
+                var _predV = _sel.predictedVmaf != null ? Number(_sel.predictedVmaf) : _metricAt(_newCq, function(x) { return x.avgVMAFMean != null ? x.avgVMAFMean : x.avgVMAF; });
+                var _predP1 = _sel.predictedP1Low != null ? Number(_sel.predictedP1Low) : _metricAt(_newCq, function(x) { return x.vmafP1Low; });
+                var _predP95Cambi = _sel.predictedCambi != null ? Number(_sel.predictedCambi) : _metricAt(_newCq, function(x) { return x.p95CAMBI; });
+                var _predAvgCambi = _metricAt(_newCq, function(x) { return x.avgCAMBI; });
+                var _predSize = _sel.predictedSizeMb != null ? Number(_sel.predictedSizeMb) : _metricAt(_newCq, function(x) { return x.avgFileSizeMB; });
+                var _predSSIM = _metricAt(_newCq, function(x) { return x.avgSSIM; });
+                bestParams = Object.assign({}, bestParams, {
+                    parameterSet: _paramSet,
+                    parameterSetId: _paramSet.id,
+                    avgVMAF: _predV != null ? _predV : bestParams.avgVMAF,
+                    avgVMAFMean: _predV != null ? _predV : bestParams.avgVMAFMean,
+                    minVMAF: _predP1 != null ? _predP1 : bestParams.minVMAF,
+                    vmafP1Low: _predP1 != null ? _predP1 : bestParams.vmafP1Low,
+                    avgCAMBI: _predAvgCambi != null ? _predAvgCambi : bestParams.avgCAMBI,
+                    p95CAMBI: _predP95Cambi != null ? _predP95Cambi : bestParams.p95CAMBI,
+                    avgFileSizeMB: _predSize != null ? _predSize : bestParams.avgFileSizeMB,
+                    avgSSIM: _predSSIM != null ? _predSSIM : bestParams.avgSSIM,
+                    vmafConstraintAware: true
+                });
+                args.variables.vmafConstraintAwareCQApplied = true;
+                args.variables.vmafConstraintAwareCQ = _newCq;
                 args.variables.vmafMaxCompressionApplied = true;
-                args.variables.vmafBestParameters = _ni.parameterSet;
-                if (_ni.avgVMAF != null) args.variables.vmafBestVMAF = _ni.avgVMAF;
-                if (_ni.minVMAF != null) args.variables.vmafBestMinVMAF = _ni.minVMAF;
-                if (_ni.avgFileSizeMB != null) args.variables.vmafBestSize = _ni.avgFileSizeMB;
-                args.jobLog('[ACTING] Max-compression override: CQ ' + _curCqA + ' -> ' + _bestFeasA.cq
-                    + ' (highest measured CQ meeting VMAF>=' + _tgtA + ', 1%low>=' + (_floorA != null ? _floorA : 'n/a')
-                    + ', CAMBI<=' + (_effCambiA != null ? _effCambiA.toFixed(1) : 'n/a') + ')');
+                selectionMethod += ' + constraint-aware fractional selectCQ';
+                args.jobLog('[ACTING] Constraint-aware CQ override: CQ ' + _liveCq + ' -> ' + _newCq
+                    + ' (pred VMAF=' + (bestParams.avgVMAF != null ? bestParams.avgVMAF.toFixed(2) : 'n/a')
+                    + ', pred 1%-low=' + (bestParams.vmafP1Low != null ? bestParams.vmafP1Low.toFixed(2) : 'n/a')
+                    + ', pred CAMBI_p95=' + (bestParams.p95CAMBI != null ? bestParams.p95CAMBI.toFixed(2) : 'n/a') + ')');
+
+                // Re-run holdout against the harder fractional CQ. The earlier holdout validated
+                // the measured-core CQ; this validates the CQ that will actually be transcoded.
+                if (args.variables.vmafHoldoutSample && args.inputs.enableHoldoutValidation !== false && args.inputs.enableHoldoutValidation !== 'false') {
+                    var _ho2 = args.variables.vmafHoldoutSample;
+                    args.jobLog('');
+                    args.jobLog('=== Constraint-aware Holdout Validation ===');
+                    args.jobLog('Holdout segment at ' + (Number(_ho2.startTime || 0)).toFixed(1) + 's - validating CQ ' + _newCq);
+                    var _hd2 = runVmafOnHoldout(args, _ho2, bestParams.parameterSet, qualityRiskPolicy);
+                    if (_hd2) {
+                        var _hv2 = Number(_hd2.avgVMAF) || 0;
+                        var _hp12 = Number(_hd2.vmafP1 !== null && _hd2.vmafP1 !== undefined ? _hd2.vmafP1 : _hd2.minVMAF) || 0;
+                        var _hcm2 = Number(_hd2.cambiMean) || 0;
+                        var _hcp2 = Number(_hd2.cambiP95) || 0;
+                        var _hcw2 = Math.max(_hcm2, _hcp2);
+                        var _hsCM2 = Number(_hd2.srcCambiMean), _hsCP2 = Number(_hd2.srcCambiP95);
+                        var _hsCW2 = Math.max(isFinite(_hsCM2) ? _hsCM2 : -Infinity, isFinite(_hsCP2) ? _hsCP2 : -Infinity);
+                        var _lim2 = _effCambi;
+                        if (isFinite(_hsCW2)) _lim2 = Math.max(_lim2, _hsCW2 + 1.0);
+                        args.jobLog('Constraint-aware holdout: VMAF=' + _hv2.toFixed(2)
+                            + ', 1%-low=' + _hp12.toFixed(2)
+                            + ', CAMBI=' + _hcm2.toFixed(3) + ' (p95=' + _hcp2.toFixed(3) + ')'
+                            + (isFinite(_hsCW2) ? ', srcCAMBI=' + _hsCW2.toFixed(3) + ' (encode-delta=' + (_hcw2 - _hsCW2).toFixed(3) + ')' : ''));
+                        var _ok2 = (_hv2 >= _tgt) && (_floor == null || _hp12 >= _floor) && (_lim2 == null || _hcw2 <= _lim2);
+                        args.jobLog(' Floors: VMAF>=' + _tgt.toFixed(1)
+                            + ', 1%-low>=' + (_floor != null ? _floor.toFixed(1) : 'n/a')
+                            + ', CAMBI<=' + (_lim2 != null ? _lim2.toFixed(1) : 'n/a')
+                            + ' => ' + (_hv2 >= _tgt ? 'OK' : 'FAIL') + '/'
+                            + ((_floor == null || _hp12 >= _floor) ? 'OK' : 'FAIL') + '/'
+                            + ((_lim2 == null || _hcw2 <= _lim2) ? 'OK' : 'FAIL'));
+                        if (!_ok2) {
+                            holdoutFailReason = 'constraint_aware_holdout_failed';
+                            holdoutSuggestedCQ = Number(_preSelectParams.parameterSet.quality);
+                            bestParams = _preSelectParams;
+                            args.variables.vmafConstraintAwareCQApplied = false;
+                            args.variables.vmafConstraintAwareCQReverted = true;
+                            args.variables.vmafHoldoutFailReason = holdoutFailReason;
+                            args.variables.vmafHoldoutSuggestedCQ = holdoutSuggestedCQ;
+                            args.jobLog('Constraint-aware holdout FAILED - reverting to measured CQ ' + holdoutSuggestedCQ);
+                        } else {
+                            args.jobLog('Constraint-aware holdout PASSED');
+                        }
+                    } else {
+                        args.jobLog('Constraint-aware holdout returned no VMAF data - keeping selected CQ');
+                    }
+                }
             }
         } catch (_acErr) {
-            args.jobLog('[ACTING] max-compression override skipped (non-fatal): ' + (_acErr && _acErr.message ? _acErr.message : String(_acErr)));
+            args.jobLog('[ACTING] constraint-aware selectCQ skipped (non-fatal): ' + (_acErr && _acErr.message ? _acErr.message : String(_acErr)));
         }
 
         args.variables.vmafBestVMAF = bestParams.avgVMAF;
@@ -2645,7 +2711,8 @@ var plugin = function (args) {
 
             if (args.variables.vmafHoldoutFailReason) _guards.push('holdout step-back');
 
-            if (args.variables.vmafMaxCompressionApplied) _guards.push('max-compression override');
+            if (args.variables.vmafConstraintAwareCQApplied) _guards.push('constraint-aware fractional selectCQ');
+            if (args.variables.vmafMaxCompressionApplied && !args.variables.vmafConstraintAwareCQApplied) _guards.push('max-compression override');
 
             // The next-more-aggressive CQ tested this attempt but rejected, and why — the direct
             // answer to "why not compress harder?".
@@ -2746,7 +2813,10 @@ var plugin = function (args) {
 
         if (bestParams.avgCAMBI !== null && bestParams.avgCAMBI !== undefined) {
 
-            args.jobLog('CAMBI banding score: ' + bestParams.avgCAMBI.toFixed(2) + ' (lower is better; ~5 starts to become annoying)');
+            args.jobLog('CAMBI banding score: avg=' + bestParams.avgCAMBI.toFixed(2)
+                + (bestParams.p95CAMBI !== null && bestParams.p95CAMBI !== undefined ? ', p95=' + bestParams.p95CAMBI.toFixed(2) : '')
+                + ', worst=' + Math.max(Number(bestParams.avgCAMBI || 0), Number(bestParams.p95CAMBI || 0)).toFixed(2)
+                + ' (gate uses worst; lower is better; ~5 starts to become annoying)');
 
         }
 
