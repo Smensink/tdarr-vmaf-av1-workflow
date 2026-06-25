@@ -63,6 +63,14 @@ var details = function () { return ({
             inputUI: { type: 'text' },
             tooltip: 'Safety ceiling for a lock with missing/stale heartbeat metadata.',
         },
+        {
+            label: 'Orphan Process Grace Seconds',
+            name: 'orphanProcessGraceSeconds',
+            type: 'number',
+            defaultValue: '180',
+            inputUI: { type: 'text' },
+            tooltip: 'Break the lock after this grace period if the owning Tdarr worker PID has exited, even if a heartbeat file/process remains.',
+        },
     ],
     outputs: [
         {
@@ -120,6 +128,7 @@ var plugin = function (args) {
         maxWaitSeconds: (Number(args.inputs.maxWaitHours) || 12) * 3600,
         staleHeartbeatSeconds: (Number(args.inputs.staleHeartbeatHours) || 2) * 3600,
         maxLockAgeSeconds: (Number(args.inputs.maxLockAgeHours) || 8) * 3600,
+        orphanProcessGraceSeconds: Number(args.inputs.orphanProcessGraceSeconds) || 180,
         heartbeatIntervalSeconds: 30,
         existingToken: (args.variables.vmafGpuPipelineLockAcquired && args.variables.vmafGpuPipelineLock)
             ? args.variables.vmafGpuPipelineLock.token

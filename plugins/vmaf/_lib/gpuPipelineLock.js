@@ -195,15 +195,43 @@ function tryAcquire(lockDir, owner, opts) {
 function shouldBreakStale(lockDir, owner, opts) {
     var staleHeartbeatSeconds = Math.max(300, Number(opts.staleHeartbeatSeconds) || 7200);
     var maxLockAgeSeconds = Math.max(staleHeartbeatSeconds, Number(opts.maxLockAgeSeconds) || 28800);
+    var orphanProcessGraceSeconds = Math.max(30, Number(opts.orphanProcessGraceSeconds) || 180);
     var hbAge = heartbeatAgeSeconds(lockDir, owner);
     var lockAge = owner && owner.acquiredAt ? secondsSinceIso(owner.acquiredAt) : null;
     var heartbeat = readHeartbeat(lockDir);
+    var ownerPidAlive = owner && owner.pid ? isPidAlive(owner.pid) : null;
+    var heartbeatPidAlive = owner && owner.heartbeatPid ? isPidAlive(owner.heartbeatPid) : null;
+
+    // Critical: do not let an orphaned heartbeat or recently-written heartbeat file
+    // keep a lock forever after Tdarr has killed/lost the owning worker. This was
+    // observed when the owning job entered limbo: owner.pid had exited, no GPU
+    // ffmpeg remained, but waiters still trusted the fresh heartbeat window.
+    if (ownerPidAlive === false && (lockAge === null || lockAge >= orphanProcessGraceSeconds)) {
+        return {
+            stale: true,
+            hbAge: hbAge,
+            lockAge: lockAge,
+            reason: 'owner worker process exited' +
+                (heartbeatPidAlive === true ? ' (orphan heartbeat ignored)' : '')
+        };
+    }
+
+    if (ownerPidAlive === null && heartbeatPidAlive === false &&
+            (hbAge === null || hbAge >= orphanProcessGraceSeconds) &&
+            (lockAge === null || lockAge >= orphanProcessGraceSeconds)) {
+        return {
+            stale: true,
+            hbAge: hbAge,
+            lockAge: lockAge,
+            reason: 'owner process unknown and heartbeat process exited'
+        };
+    }
 
     if (hbAge !== null && hbAge < staleHeartbeatSeconds) {
         return { stale: false, hbAge: hbAge, lockAge: lockAge, reason: 'heartbeat fresh' };
     }
 
-    if (owner && owner.heartbeatPid && isPidAlive(owner.heartbeatPid) && lockAge !== null && lockAge < maxLockAgeSeconds) {
+    if (heartbeatPidAlive === true && lockAge !== null && lockAge < maxLockAgeSeconds) {
         return { stale: false, hbAge: hbAge, lockAge: lockAge, reason: 'heartbeat process still alive' };
     }
 
