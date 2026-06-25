@@ -116,10 +116,9 @@ function calculateSingleVmafGpuAsync(args, result, samples, cacheDir, modelPath)
         var originalSample = result.originalSamplePath || samples[result.sampleIndex];
         var logPath = cacheDir + '/vmaf_' + result.parameterSetId + '_s' + (result.sampleIndex + 1) + '.json';
         var distortedEncoder = (result.parameterSet && result.parameterSet.encoder) || args.variables.vmafTargetCodec || '';
-        var isHdr = isHdrContent(args.inputFileObj);
         
         function runOnce(useCpuFormatConversion, prevStderr) {
-            var cmd = buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, useCpuFormatConversion, distortedEncoder, isHdr);
+            var cmd = buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, useCpuFormatConversion, distortedEncoder);
             var start = Date.now();
             var child = execSpawn(cmd, {
                 shell: true,
@@ -382,32 +381,11 @@ function parseVmafLog(logPath, fs) {
     }
 }
 
-// Detect HDR (PQ or HLG) content from ffProbeData
-function isHdrContent(inputFileObj) {
-    try {
-        var streams = inputFileObj && inputFileObj.ffProbeData && inputFileObj.ffProbeData.streams;
-        if (!Array.isArray(streams)) return false;
-        for (var i = 0; i < streams.length; i++) {
-            var s = streams[i];
-            if (s.codec_type !== 'video') continue;
-            var transfer = s.profile || '';
-            var colorTransfer = (s.tags && s.tags.color_transfer) || '';
-            // PQ (SMPTE 2084) or HLG (BBC/NHK hybrid) = HDR
-            if (transfer.indexOf('pq') !== -1 || transfer.indexOf('smpte2084') !== -1 ||
-                transfer.indexOf('hlg') !== -1 || transfer.indexOf('bt2020nc') !== -1 ||
-                colorTransfer.indexOf('pq') !== -1 || colorTransfer.indexOf('smpte2084') !== -1 ||
-                colorTransfer.indexOf('hlg') !== -1) {
-                return true;
-            }
-        }
-    } catch (e) {}
-    return false;
-}
-
-// Build GPU VMAF command (libvmaf_cuda) using scale_cuda for format conversion
-// For HDR content, applies tonemap=hable pre-processing on both streams before VMAF
-// to convert PQ/HLG to BT.709 gamma so VMAF scores are calibrated correctly.
-function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, modelPath, inputFileObj, useCpuFormatConversion, distortedEncoder, isHdr) {
+// Build GPU VMAF command (libvmaf_cuda) using scale_cuda for format conversion.
+// HDR/PQ content is requantized to 8-bit (format=yuv420p) for libvmaf_cuda but NOT tonemapped:
+// the 8-bit requirement is the GPU's, tonemapping is a separate step that bands gradients (false
+// CAMBI) and measures an SDR rendition the pipeline never produces (the transcode stays 10-bit HDR).
+function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, modelPath, inputFileObj, useCpuFormatConversion, distortedEncoder) {
     function mapEncoderToCuvid(enc) {
         var lc = String(enc || '').toLowerCase();
         if (lc.indexOf('av1') !== -1) return 'av1_cuvid';
@@ -498,7 +476,13 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
     
     // Add reference file input with CUVID decoder if supported.
         // This keeps both streams in GPU memory from decode to VMAF calculation.
-        var tonemapRef = isHdr ? ',tonemap=tonemap=hable:peak=0:desat=0' : '';
+        // Do NOT tonemap. libvmaf_cuda needs 8-bit (yuv420p) — `format=yuv420p` already provides that;
+        // the 8-bit requirement does NOT need a tonemap. tonemap=hable on the PQ signal (no
+        // zscale=linear) bands smooth gradients, which CAMBI then reports as false banding, and it
+        // measures a tonemapped-SDR rendition that never exists in the pipeline (the final transcode
+        // stays 10-bit HDR). Measuring the PQ signal requantized to 8-bit is a faithful (slightly
+        // conservative) proxy for the 10-bit output's banding. Native 10-bit VMAF is CPU-only here.
+        var tonemapRef = '';
         if (referenceCuvid) {
             cmdParts.push('-hwaccel', 'cuda');
             cmdParts.push('-hwaccel_device', '0');
@@ -518,7 +502,7 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
         return cmdParts.join(' ');
 }
 
-function buildCpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, modelPath, inputFileObj, useGpuDecode, isHdr) {
+function buildCpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, modelPath, inputFileObj, useGpuDecode) {
     var modelParam = modelPath ? ':model=path=' + modelPath : '';
     var cambiFeatureParam = ':feature=name=cambi';
 
@@ -546,7 +530,7 @@ function buildCpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
             '-i', '"' + distortedPath + '"',
             '-hwaccel', 'none',
             '-i', '"' + referencePath + '"',
-            '-filter_complex', '"[0:v]settb=1/1000,setpts=N' + (isHdr ? ',tonemap=tonemap=hable:peak=0:desat=0' : '') + ',format=' + targetFormat + '[decoded];[1:v]settb=1/1000,setpts=N' + (isHdr ? ',tonemap=tonemap=hable:peak=0:desat=0' : '') + ',format=' + targetFormat + '[ref];[decoded][ref]libvmaf=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest"',
+            '-filter_complex', '"[0:v]settb=1/1000,setpts=N' + ',format=' + targetFormat + '[decoded];[1:v]settb=1/1000,setpts=N' + ',format=' + targetFormat + '[ref];[decoded][ref]libvmaf=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest"',
             '-f', 'null',
             '-'
         ].join(' ');
@@ -556,7 +540,7 @@ function buildCpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
             '"' + ffmpegPath + '"',
             '-i', '"' + distortedPath + '"',
             '-i', '"' + referencePath + '"',
-            '-filter_complex', '"[0:v]settb=1/1000,setpts=N' + (isHdr ? ',tonemap=tonemap=hable:peak=0:desat=0' : '') + ',format=' + targetFormat + '[decoded];[1:v]settb=1/1000,setpts=N' + (isHdr ? ',tonemap=tonemap=hable:peak=0:desat=0' : '') + ',format=' + targetFormat + '[ref];[decoded][ref]libvmaf=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest"',
+            '-filter_complex', '"[0:v]settb=1/1000,setpts=N' + ',format=' + targetFormat + '[decoded];[1:v]settb=1/1000,setpts=N' + ',format=' + targetFormat + '[ref];[decoded][ref]libvmaf=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest"',
             '-f', 'null',
             '-'
         ].join(' ');
@@ -571,7 +555,6 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
     var originalSample = result.originalSamplePath || samples[result.sampleIndex];
     var logPath = cacheDir + '/vmaf_' + result.parameterSetId + '_s' + (result.sampleIndex + 1) + '.json';
     var distortedEncoder = (result.parameterSet && result.parameterSet.encoder) || args.variables.vmafTargetCodec || '';
-    var isHdr = isHdrContent(args.inputFileObj);
     
     var methods = [];
     
@@ -580,7 +563,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
     if (hasGpuVmaf) {
         methods.push({
             name: 'GPU VMAF (libvmaf_cuda with scale_cuda)',
-            cmd: buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, false, distortedEncoder, isHdr),
+            cmd: buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, false, distortedEncoder),
             expectedTime: '2-5 seconds',
             isGpuVmaf: true
         });
@@ -589,7 +572,7 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
         // This may work in cases where scale_cuda has issues
         methods.push({
             name: 'GPU VMAF (libvmaf_cuda with CPU format conversion)',
-            cmd: buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, true, distortedEncoder, isHdr),
+            cmd: buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, true, distortedEncoder),
             expectedTime: '3-7 seconds',
             isGpuVmaf: true,
             isFallback: true
@@ -602,14 +585,14 @@ function calculateSingleVmaf(args, result, samples, cacheDir, modelPath, hasGpuV
     // Method 2: GPU decode + CPU VMAF
     methods.push({
         name: 'GPU decode + CPU VMAF',
-        cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, true, isHdr),
+        cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, true),
         expectedTime: '30-90 seconds'
     });
     
     // Method 3: Pure software (fallback)
     methods.push({
         name: 'Software VMAF',
-        cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, false, isHdr),
+        cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, false),
         expectedTime: '60-120 seconds'
     });
     
@@ -841,7 +824,6 @@ function calculateSingleVmafAsync(args, result, samples, cacheDir, modelPath, ha
         var fs = require('fs');
         var originalSample = result.originalSamplePath || samples[result.sampleIndex];
         var logPath = cacheDir + '/vmaf_' + result.parameterSetId + '_s' + (result.sampleIndex + 1) + '.json';
-        var isHdr = isHdrContent(args.inputFileObj);
         
         var methods = [];
         
@@ -849,13 +831,13 @@ function calculateSingleVmafAsync(args, result, samples, cacheDir, modelPath, ha
         // Method 1: GPU decode + CPU VMAF
         methods.push({
             name: 'GPU decode + CPU VMAF',
-            cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, true, isHdr)
+            cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, true)
         });
         
         // Method 2: Pure software (fallback)
         methods.push({
             name: 'Software VMAF',
-            cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, false, isHdr)
+            cmd: buildCpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample, logPath, modelPath, args.inputFileObj, false)
         });
         
         function tryMethod(methodIndex) {
@@ -950,17 +932,9 @@ var plugin = async function (args) {
     
     var hasGpuVmaf = checkGpuVmafSupport(args.ffmpegPath);
     if (hasGpuVmaf) {
-        args.jobLog('✅ GPU VMAF (libvmaf_cuda): AVAILABLE - up to 36x faster!');
-        args.jobLog('   VMAF analysis will run on GPU');
+        args.jobLog('GPU VMAF (libvmaf_cuda): available');
     } else {
-        var errorMsg = 'ERROR: GPU VMAF (libvmaf_cuda): NOT AVAILABLE - Falling back to CPU VMAF (much slower)';
-        console.error('[VMAF Plugin] ' + errorMsg);
-        console.error('[VMAF Plugin] Using FFmpeg: ' + args.ffmpegPath);
-        console.error('[VMAF Plugin] Will use CPU VMAF with ' + maxParallel + ' parallel workers');
-        console.error('[VMAF Plugin] To enable GPU VMAF, ensure FFmpeg is built with --enable-cuda-nvcc and libvmaf with CUDA support');
-        args.jobLog('⚠️  GPU VMAF (libvmaf_cuda): NOT AVAILABLE');
-        args.jobLog('   Will use CPU VMAF with ' + maxParallel + ' parallel workers');
-        args.jobLog('   To enable GPU VMAF, rebuild FFmpeg with --enable-cuda-nvcc');
+        args.jobLog('GPU VMAF (libvmaf_cuda): not available, using CPU VMAF');
     }
     
     var requireGpuVmaf = args.variables.vmafRequireGpuVmaf === true;
@@ -973,7 +947,7 @@ var plugin = async function (args) {
         throw new Error(gpuRequiredMsg);
     }
     if (args.variables.isHDR) {
-        args.variables.vmafHdrPolicy = 'PQ/HDR content is pre-processed with tonemap=hable before VMAF to convert to BT.709 gamma, making VMAF scores calibrated and cross-comparable with SDR content; HDR output metadata preserved separately in the transcode step';
+        args.variables.vmafHdrPolicy = 'HDR/PQ content is requantized to 8-bit (format=yuv420p) for libvmaf_cuda WITHOUT tonemapping. No tonemap = no false gradient banding, and the measured signal matches the 10-bit HDR transcode (just fewer bits), so VMAF/CAMBI track the real output. Native 10-bit VMAF is CPU-only in this stack.';
         args.jobLog('HDR VMAF policy: using the resolution-specific standard VMAF model on libvmaf_cuda. Native HDR VMAF is not available in this stack; scores are a consistent proxy, not a dynamic-HDR preservation guarantee.');
     }
     
@@ -1083,9 +1057,7 @@ var plugin = async function (args) {
     // conservative between-content historical sigma, so low-variance content stops early and saves
     // the (CQ x clip) VMAF measurements that dominate sweep cost. Fully guarded: any issue -> measure
     // every clip. Kill switch: args.variables.vmafSequentialSampling === false.
-    var _vpSeq = null;
-    try { _vpSeq = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js'); } catch (eSeqLib) { _vpSeq = null; }
-    var seqEnabled = !!_vpSeq && (args.variables.vmafSequentialSampling !== false) && validResults.length > 0;
+    var seqEnabled = (args.variables.vmafSequentialSampling !== false) && validResults.length > 0;
     var seqTol = Number(args.variables.vmafSampleStopTol); if (!isFinite(seqTol) || seqTol <= 0) seqTol = 0.5;
     var seqMinClips = Math.max(4, Math.min(Number(args.variables.vmafSampleStopMin) || 6, samples.length || 6));
     var seqMaxClips = samples.length || seqMinClips;
@@ -1108,7 +1080,7 @@ var plugin = async function (args) {
             if (ra !== rb) return ra - rb;
             return String(a.parameterSetId).localeCompare(String(b.parameterSetId));
         });
-        args.jobLog('Sequential sampling ON (randomised clip order): stop a CQ at >=' + seqMinClips + ' clips when mean CI<=' + seqTol.toFixed(2) + ' VMAF AND 1%-low>=floor+' + seqFloorMargin + ' (cap ' + seqMaxClips + '/CQ)');
+        args.jobLog('Sequential sampling ON (randomised clip order): stop a CQ at >=' + seqMinClips + ' clips when decision is confident (90% CI clear of target ± ' + seqTol.toFixed(2) + ') AND 1%-low>=floor+' + seqFloorMargin + ' (cap ' + seqMaxClips + '/CQ)');
     }
     
     // GPU VMAF: Run sequentially (GPU handles parallelism internally)
@@ -1152,16 +1124,36 @@ var plugin = async function (args) {
                             if (isFinite(_pmn)) (psSeqMins[_psid] = psSeqMins[_psid] || []).push(_pmn);
                             var _nC = (psSeqScores[_psid] || []).length;
                             if (!psSeqDone[_psid] && _nC >= seqMinClips && _nC < seqMaxClips) {
-                                var _rec = _vpSeq.selectSampleCount([], { measuredVmafs: psSeqScores[_psid], toleranceVmaf: seqTol, distMinSamples: seqMinClips, minSamples: seqMinClips, maxSamples: seqMaxClips });
-                                // only stop if the worst measured clip clears the 1%-low floor with margin -
-                                // otherwise the floor (not the mean) is binding and stays noisy, so keep sampling.
-                                var _floorOk = true;
-                                if (seqFrameFloor > 0 && psSeqMins[_psid] && psSeqMins[_psid].length) {
-                                    _floorOk = Math.min.apply(null, psSeqMins[_psid]) >= (seqFrameFloor + seqFloorMargin);
+                                // ── Decision-aware sequential stop ──
+                                // Instead of a fixed CI tolerance, we evaluate whether the running
+                                // estimate is confident enough to DECIDE: clearly pass the target
+                                // (lower CI bound >= target + δ) or clearly fail it (upper CI bound
+                                // <= target - δ). δ provides a small noise band so we don't oscillate
+                                // on marginal decisions. The per-file sigma automatically makes the
+                                // effective tolerance scale with margin to the constraint — far from
+                                // target → stop fast, near the binding floor → keep sampling.
+                                var _decTarget = Number(args.variables.vmafMinVMAF);
+                                if (!isFinite(_decTarget) || _decTarget <= 0) _decTarget = 95;
+                                var _decFloor = seqFrameFloor; // already set from vmafMinFrameVMAF
+                                var _z = 1.64; // 90% CI (one-sided ~95%)
+                                var _delta = 0.5; // confidence band
+                                var _svs = psSeqScores[_psid];
+                                var _sMean = _svs.reduce(function(a,b){return a+b;}, 0) / _svs.length;
+                                var _sVar = 0;
+                                if (_svs.length > 1) {
+                                    _sVar = _svs.reduce(function(ss,v){var d=v-_sMean;return ss+d*d;},0) / (_svs.length - 1);
                                 }
-                                if (_rec && _rec.enough && _floorOk) {
+                                var _sStd = Math.sqrt(_sVar);
+                                var _h = _z * _sStd / Math.sqrt(_svs.length); // CI half-width
+                                var _clearlyPasses = (_sMean - _h) >= (_decTarget + _delta);
+                                var _clearlyFails = (_sMean + _h) <= (_decTarget - _delta);
+                                var _floorOk = true;
+                                if (_decFloor > 0 && psSeqMins[_psid] && psSeqMins[_psid].length) {
+                                    _floorOk = Math.min.apply(null, psSeqMins[_psid]) >= (_decFloor + seqFloorMargin);
+                                }
+                                if ((_clearlyPasses || _clearlyFails) && _floorOk) {
                                     psSeqDone[_psid] = true;
-                                    args.jobLog('  Sequential stop ' + _psid + ' at ' + _nC + ' clips (sigma=' + (_rec.sigma != null ? _rec.sigma : '?') + ' VMAF, CI<=' + seqTol.toFixed(2) + ', 1%-low clears floor)');
+                                    args.jobLog('  Sequential stop ' + _psid + ' at ' + _nC + ' clips (mean=' + _sMean.toFixed(2) + ' ± ' + _h.toFixed(2) + ' VMAF, decision=' + (_clearlyPasses ? 'PASS' : 'FAIL') + ', 1%-low clears floor)');
                                 }
                             }
                         } catch (eSeqT) { /* non-fatal: keep measuring all clips */ }
@@ -1261,7 +1253,14 @@ var plugin = async function (args) {
                     }
                 } else {
                     failedCalculations++;
-                    args.jobLog('  CPU VMAF FAILED: ' + resCpu.error);
+                    // Include the last-per-method meaningful error (already logged via jobLog in the VMAF function)
+                    // to give the reader actionable failure info without needing the Node log.
+                    var _vmafErr = resCpu.error || 'All methods failed';
+                    // Try to find the per-method failure detail from the error object
+                    if (resCpu.lastMethodError) {
+                        _vmafErr = resCpu.lastMethodError;
+                    }
+                    args.jobLog('  CPU VMAF FAILED: ' + _vmafErr);
                 }
                 
                 var progressPercentCpu = Math.round((completedCount / validResults.length) * 100);
@@ -1398,6 +1397,7 @@ var plugin = async function (args) {
             p95CAMBI: p95CAMBI,
             sampleCount: item.vmafScores.length,
             vmafStdDev: stdDev,
+            clipVmafs: item.vmafScores,
         });
         
         args.jobLog(key + ': VMAF=' + avgVMAF.toFixed(2) + ', 1%low=' +

@@ -18,11 +18,11 @@ var details = function () { return ({
             label: 'Maximum Retries',
             name: 'maxRetries',
             type: 'number',
-            defaultValue: '2',
+            defaultValue: '4',
             inputUI: {
                 type: 'text',
             },
-            tooltip: 'Maximum number of retry attempts. Default: 2',
+            tooltip: 'Maximum number of CQ-range retry attempts. Each retry picks a new bracket when the first misses. Default: 4 (prev: 2 — increased since the learning model converges in 1-2 more steps on hard content).',
         },
         {
             label: 'VMAF Headroom Threshold',
@@ -747,12 +747,15 @@ var plugin = function (args) {
             }
             
             if (cqRangeExhausted) {
-                var errorMsg = 'IMPOSSIBLE: Cannot achieve target VMAF (' + minVMAF + ') with any CQ value in the valid range (16-51), even after ' + retryCount + ' retry attempts. ';
-                errorMsg += 'Tested CQ range: ' + (allTestedCQs.length > 0 ? Math.min.apply(null, allTestedCQs) + '-' + Math.max.apply(null, allTestedCQs) : 'unknown') + '. ';
-                errorMsg += 'Best VMAF achieved: ' + bestVMAFAchieved.toFixed(2) + ' (at CQ ' + (bestCQAchieved || 'unknown') + '). ';
-                errorMsg += 'This file cannot be transcoded to a smaller size while maintaining acceptable quality. ';
-                errorMsg += 'Consider: lowering VMAF threshold (currently ' + minVMAF + '), accepting larger file size, or skipping this file.';
-                throw new Error(errorMsg);
+                args.jobLog('CQ RANGE EXHAUSTED: Cannot achieve target VMAF (' + minVMAF + ') with any CQ value in the valid range (16-51), even after ' + retryCount + ' retry attempts.');
+                args.jobLog('Tested CQ range: ' + (allTestedCQs.length > 0 ? Math.min.apply(null, allTestedCQs) + '-' + Math.max.apply(null, allTestedCQs) : 'unknown') + '.');
+                args.jobLog('Best VMAF achieved: ' + bestVMAFAchieved.toFixed(2) + ' (at CQ ' + (bestCQAchieved || 'unknown') + ').');
+                args.jobLog('MARKING retry-eligible: this file was the best we could do; sweep data is preserved for future retries when more training data exists.');
+                args.jobLog('NON-FATAL: proceeding with best-available parameters. The file will be saved as-is and is re-queueable.');
+                // Mark file for potential re-queue
+                args.variables.vmafRetryEligible = true;
+                args.variables.vmafRetryEligibleReason = 'cq_range_exhausted';
+                // Don't throw — fall through to preserve sweep data
             } else {
                 args.jobLog('');
                 args.jobLog('⚠ No suitable parameters found after ' + retryCount + ' retries');

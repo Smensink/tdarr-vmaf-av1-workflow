@@ -374,7 +374,7 @@ var details = function () { return ({
 
 
 
-            tooltip: 'Path to VMAF results CSV used for variance priors (exportVMAFResults output).',
+            tooltip: 'Path to VMAF results CSV sidecar (SQLite is the primary store). Used for legacy fallback.',
 
 
 
@@ -574,7 +574,7 @@ var details = function () { return ({
 
 
 
-            tooltip: 'Path to CQ learning CSV written by Learn CQ Range. Used to pre-load learned CQ range before testing.',
+            tooltip: 'Path to CQ learning CSV sidecar (SQLite is the primary store). Used for legacy fallback.',
 
 
 
@@ -1186,11 +1186,11 @@ var plugin = function (args) {
 
 
 
-    //   - the CQ-learning read (this plugin, line ~430+)
+    //   - the SQLite-based CQ prior (this plugin, via getSimilarSweepCurves)
 
 
 
-    //   - the CQ-learning write (learnCQRanges plugin, end of flow)
+    //   - the SQLite training store write (exportVMAFResults plugin)
 
 
 
@@ -2386,7 +2386,7 @@ var plugin = function (args) {
 
 
 
-                args.jobLog('CQ learning CSV not found - skipping learned CQ range preload');
+                args.jobLog('CQ learning CSV path not found (SQLite DB is the primary store) - skipping legacy CSV preload');
 
 
 
@@ -2454,7 +2454,7 @@ var plugin = function (args) {
 
 
 
-                args.jobLog('CQ learning CSV empty - skipping learned CQ range preload');
+                args.jobLog('CQ learning CSV path empty (SQLite DB is the primary store) - skipping legacy CSV preload');
 
 
 
@@ -2574,7 +2574,7 @@ var plugin = function (args) {
 
 
 
-                args.jobLog('CQ learning CSV missing required columns (tier or source_width/height, source_codec, selected_cq) - skipping learned CQ range preload');
+                args.jobLog('CQ learning CSV missing required columns (SQLite DB is the primary store) - skipping legacy CSV preload');
 
 
 
@@ -3227,12 +3227,12 @@ var plugin = function (args) {
 
 
 
-            args.jobLog('CQ learning preload: learned CQ range ' + learnedMin + '-' + learnedMax
+            args.jobLog('Historical CQ prior: range ' + learnedMin + '-' + learnedMax
+                + ' (N=' + effN.toFixed(1) + ' rows, tier=' + tier + ', codec=' + srcCodecCat + ', bpp=' + (isFinite(src.bitsPerPixel) ? src.bitsPerPixel.toFixed(4) : '?') + ')')
 
 
 
-                + ' from effN=' + effN.toFixed(1) + ' (rows=' + scored.length + ', strictCodecRows=' + strictCount + ', tier=' + tier + ', codec=' + srcCodecCat + ', bpp=' + (isFinite(src.bitsPerPixel) ? src.bitsPerPixel.toFixed(4) : '?') + ')');
-
+                
 
 
 
@@ -3347,11 +3347,7 @@ var plugin = function (args) {
 
 
 
-                            args.jobLog('EMA trend adjustment: CQ ' + emaCQ.toFixed(1) + ' (N=' + emaSampleCount + ')');
-
-
-
-                            args.jobLog('Blended CQ range: ' + args.variables.vmafLearnedCQRange.min + '-' + args.variables.vmafLearnedCQRange.max);
+                            args.jobLog('EMA-adjusted CQ range: ' + args.variables.vmafLearnedCQRange.min + '-' + args.variables.vmafLearnedCQRange.max);
 
 
 
@@ -3399,7 +3395,7 @@ var plugin = function (args) {
 
 
 
-    loadLearnedCQRangeFromCsv();
+    // loadLearnedCQRangeFromCsv removed - SQLite getSimilarSweepCurves is primary
 
 
 
@@ -5099,7 +5095,7 @@ var plugin = function (args) {
 
 
 
-                args.jobLog('Adaptive samples: results CSV not found at ' + resultsCsvPath + ' (volume ./configs must be mounted to /app/configs)');
+                args.jobLog('Adaptive samples: results path not found at ' + resultsCsvPath + ' - checking SQLite training store');
 
 
 
@@ -5483,7 +5479,7 @@ var plugin = function (args) {
 
 
 
-                    args.jobLog('Adaptive samples (mean-min): ' + numSegments + ' samples (was ' + originalNum + '); knee N=' + knee + ', coverage N=' + cover + ', targetGap=' + coverageTargetGap.toFixed(2) + ' VMAF, predicted gap@N=' + preds[combinedN].toFixed(2) + ', rows=' + model.count + ', rmse=' + fitRmseStr + stdNote);
+
 
 
 
@@ -5519,7 +5515,7 @@ var plugin = function (args) {
 
 
 
-                    args.jobLog('Adaptive samples (learned std): ' + numSegments + ' samples (was ' + originalNum + '), model count ' + model.count + ', predicted std ' + chosen.pred.toFixed(3) + ', fit rmse ' + fitRmseStr);
+
 
 
 
@@ -5531,7 +5527,7 @@ var plugin = function (args) {
 
 
 
-                args.jobLog('Adaptive samples: no matching historical model, keeping ' + numSegments);
+                    args.jobLog('Adaptive samples: insufficient variance data, using ' + numSegments + ' samples');
 
 
 
@@ -5593,7 +5589,8 @@ var plugin = function (args) {
             release_group: args.variables.vmafReleaseGroup || null,
             network: args.variables.vmafNetwork || null,
             original_language: args.variables.vmafOriginalLanguage || null,
-            source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null)
+            source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null),
+            file_path: (args.inputFileObj && args.inputFileObj._id) || null
         };
         var _curvesS = _vdbS.getSimilarSweepCurves(_dbS, _srcS, { limit: 20000 });
         var _ctrS = _vpS.predictCQCenter(_curvesS, _srcS, { targetVmaf: _tgtS }, { recencyHalfLifeDays: 0 });
@@ -5631,7 +5628,7 @@ var plugin = function (args) {
 
 
 
-        args.jobLog('Scene complexity adjustment: ' + (sceneAdj > 0 ? '+' : '') + sceneAdj + ' samples (' + preSampleCount + ' → ' + numSegments + ')');
+
 
 
 

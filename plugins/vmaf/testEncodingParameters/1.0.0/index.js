@@ -339,7 +339,59 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         if (isRetry) {
             candidateList = candidateList.filter(function(cqVal) { return cqVal >= overrideCQMin && cqVal <= overrideCQMax; });
         }
-        
+
+        // ── Known-failed CQ adjustment: shift bracket below previous failures ──
+        // When a file is re-queued, any CQ that previously fell short of the VMAF target
+        // means compression was too aggressive. The fix is to try LOWER CQs (more bitrate,
+        // higher quality), not just skip the failed values.
+        var knownFailedCQs = [];
+        var lowestFailedCQ = null;
+        try {
+            var _kfVdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+            var _kfDb = _kfVdb.openDb();
+            var _kfFilePath = (args.inputFileObj && args.inputFileObj._id) || (args.inputFileObj && args.inputFileObj.file) || '';
+            if (_kfFilePath) {
+                var _kfPrev = _kfVdb.getSameFileSweepCurves(_kfDb, _kfFilePath, { limit: 200 });
+                var _kfTarget = (typeof targetMinVMAF !== 'undefined' && targetMinVMAF) || Number(args.inputs.targetMinVMAF) || Number(args.variables.vmafMinVMAF) || 95;
+                var _kfSeenCQ = {};
+                for (var _kfi = 0; _kfi < _kfPrev.length; _kfi++) {
+                    var _kfr = _kfPrev[_kfi];
+                    if (_kfr.vmaf_mean !== null && _kfr.vmaf_mean < _kfTarget && !_kfSeenCQ[_kfr.cq]) {
+                        knownFailedCQs.push(_kfr.cq);
+                        _kfSeenCQ[_kfr.cq] = true;
+                    }
+                }
+                if (knownFailedCQs.length > 0) {
+                    knownFailedCQs.sort(function(a,b){return a-b;});
+                    lowestFailedCQ = knownFailedCQs[0];
+                    args.jobLog('Same-file history: ' + knownFailedCQs.length + ' CQ(s) failed VMAF target: ' + knownFailedCQs.join(', ') + '. Lowest failed CQ=' + lowestFailedCQ);
+                }
+            }
+            // Do NOT close: openDb() returns a process-cached handle shared by every plugin/job.
+            // Closing it here left the cache holding a CLOSED handle, so every later job's
+            // predictor failed with "database is not open" (and first-attempt jobs then threw on
+            // empty crfValues). The handle is meant to live for the node's lifetime.
+        } catch (_kfE) {
+            args.jobLog('Same-file history lookup failed (non-fatal): ' + _kfE.message);
+        }
+
+        // If we know a lower bound CQ failed, cap the retry bracket so every candidate is BELOW it
+        if (lowestFailedCQ !== null && isRetry && overrideCQMax >= lowestFailedCQ) {
+            var newMax = lowestFailedCQ - 1;
+            args.jobLog('Adjusting retry bracket: capping max CQ from ' + overrideCQMax + ' to ' + newMax + ' (below known-failed CQ=' + lowestFailedCQ + ')');
+            overrideCQMax = newMax;
+            if (overrideCQMin > overrideCQMax) {
+                overrideCQMin = Math.max(16, overrideCQMax - 5);
+                args.jobLog('  Also adjusted min CQ to ' + overrideCQMin);
+            }
+            candidateList = [];
+            for (var cqAdj = overrideCQMin; cqAdj <= overrideCQMax; cqAdj += effectiveStep) {
+                candidateList.push(cqAdj);
+            }
+            // Also exclude any remaining known-failed CQs from the shifted range
+            candidateList = candidateList.filter(function(cqVal) { return cqVal >= overrideCQMin && cqVal <= overrideCQMax && knownFailedCQs.indexOf(cqVal) === -1; });
+        }
+
         var seen = {};
         candidateList.forEach(function(cqVal) {
             if (testedCQs.indexOf(cqVal) === -1 && !seen[cqVal]) {
@@ -347,18 +399,19 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 seen[cqVal] = true;
             }
         });
-        
+
         if (crfValues.length < 2 && isRetry) {
             var padLow = Math.max(16, overrideCQMin - effectiveStep);
             var padHigh = Math.min(51, overrideCQMax + effectiveStep);
+            // Skip pad values that are known to fail from previous same-file runs
             [padLow, padHigh].forEach(function(pad) {
-                if (testedCQs.indexOf(pad) === -1 && !seen[pad]) {
+                if (testedCQs.indexOf(pad) === -1 && !seen[pad] && knownFailedCQs.indexOf(pad) === -1) {
                     crfValues.push(pad);
                     seen[pad] = true;
                 }
             });
         }
-        
+
         if (crfValues.length === 0 && isRetry) {
             for (var cq4 = overrideCQMin; cq4 <= overrideCQMax; cq4 += effectiveStep) {
                 if (!seen[cq4]) {
@@ -366,48 +419,42 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 }
             }
         }
-        
+
         args.jobLog('CQ values to test (ordered): ' + crfValues.join(', '));
         args.jobLog('');
-        
+
         delete args.variables.vmafOverrideCQMin;
         delete args.variables.vmafOverrideCQMax;
         delete args.variables.vmafNextCQ;
         delete args.variables.vmafNextCQs;
-        
+
         args.variables.vmafDynamicCQ = true;
         if (isRetry) {
             args.variables.vmafCQRange = { min: overrideCQMin, max: overrideCQMax, width: overrideCQMax - overrideCQMin };
         }
     }
-    
-// Dynamic CQ range calculation
-    else if (dynamicCQ) {
-        args.jobLog('=== Dynamic CQ Range Calculation ===');
-        
-        // Get source file characteristics
+
+    // ── Source metadata extraction (for predictor) ──
         var sourceBitrateMbps = 0;
         var sourceWidth = 1920;
         var sourceHeight = 1080;
         var sourceCodec = 'unknown';
         var sourceDuration = 0;
         var sourceFileSizeMB = args.inputFileObj.file_size || 0;
-        
+
         if (args.inputFileObj.ffProbeData) {
             var format = args.inputFileObj.ffProbeData.format || {};
             var streams = args.inputFileObj.ffProbeData.streams || [];
-            
+
             sourceDuration = parseFloat(format.duration) || 0;
             var sourceBitrate = parseFloat(format.bit_rate) || 0;
             sourceBitrateMbps = sourceBitrate / 1000000;
-            
-            // Find video stream
+
             for (var i = 0; i < streams.length; i++) {
                 if (streams[i].codec_type === 'video') {
                     sourceWidth = streams[i].width || 1920;
                     sourceHeight = streams[i].height || 1080;
                     sourceCodec = streams[i].codec_name || 'unknown';
-                    // Use video stream bitrate if available and more accurate
                     if (streams[i].bit_rate) {
                         sourceBitrateMbps = parseFloat(streams[i].bit_rate) / 1000000;
                     }
@@ -415,614 +462,27 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 }
             }
         }
-        
-        // If bitrate not in metadata, calculate from file size and duration
+
         if (sourceBitrateMbps <= 0 && sourceDuration > 0 && sourceFileSizeMB > 0) {
             sourceBitrateMbps = (sourceFileSizeMB * 8) / sourceDuration;
         }
-        
-        args.jobLog('Source file: ' + sourceFileSizeMB.toFixed(2) + ' MB');
-        args.jobLog('Source codec: ' + sourceCodec);
-        args.jobLog('Source resolution: ' + sourceWidth + 'x' + sourceHeight);
-        args.jobLog('Source bitrate: ' + sourceBitrateMbps.toFixed(2) + ' Mbps');
-        args.jobLog('Source duration: ' + sourceDuration.toFixed(2) + ' seconds');
-        args.jobLog('Target VMAF: ' + targetMinVMAF);
-        args.jobLog('Target size reduction: ' + targetSizeReduction + '%');
 
-        // Check for release group profile prior
-        var releaseGroupPrior = null;
-        try {
-            var releaseGroup = args.variables.vmafReleaseGroup || args.variables.vmafReleaseGroupUsed || null;
-            if (releaseGroup) {
-                var profilesPath = '/app/configs/vmaf_release_group_profiles.json';
-                if (fs.existsSync(profilesPath)) {
-                    var profilesContent = fs.readFileSync(profilesPath, 'utf8');
-                    var profilesData = JSON.parse(profilesContent);
-
-                    var groupKey = String(releaseGroup).toUpperCase();
-                    if (profilesData.profiles && profilesData.profiles[groupKey]) {
-                        releaseGroupPrior = profilesData.profiles[groupKey];
-                        args.jobLog('');
-                        args.jobLog('Release Group Profile Found: ' + groupKey);
-                        args.jobLog('  Sample count: ' + releaseGroupPrior.sample_count);
-                        args.jobLog('  CQ median: ' + releaseGroupPrior.cq_statistics.median.toFixed(1));
-                        args.jobLog('  CQ range: ' + releaseGroupPrior.cq_statistics.min.toFixed(1) +
-                                   '-' + releaseGroupPrior.cq_statistics.max.toFixed(1));
-                        if (releaseGroupPrior.most_common_codec) {
-                            args.jobLog('  Common codec: ' + releaseGroupPrior.most_common_codec);
-                        }
-                        if (releaseGroupPrior.most_common_resolution) {
-                            args.jobLog('  Common resolution: ' + releaseGroupPrior.most_common_resolution);
-                        }
-                    }
-                }
-            }
-        } catch (rgErr) {
-            args.jobLog('Could not load release group profile: ' + rgErr.message);
-        }
-
-        // Calculate base CQ based on resolution and bitrate
-        // AV1 NVENC CQ scale: lower = higher quality, higher = more compression
-        // Typical ranges: 1080p content: CQ 24-38, 4K: CQ 20-34, 720p: CQ 28-42
-
-        var baseCQ = 30; // Default starting point
-
-        // Use release group prior if available and reliable
-        if (releaseGroupPrior && releaseGroupPrior.sample_count >= 10) {
-            baseCQ = Math.round(releaseGroupPrior.cq_statistics.median);
-            args.jobLog('Using release group prior median CQ: ' + baseCQ);
-        }
-        
-        // Adjust for resolution (pixels per frame)
         var pixelCount = sourceWidth * sourceHeight;
-        var pixelFactor = pixelCount / (1920 * 1080); // Normalize to 1080p
-        
-        if (pixelFactor >= 4) {
-            // 4K or higher - need lower CQ for quality
-            baseCQ = 26;
-        } else if (pixelFactor >= 2) {
-            // 1440p
-            baseCQ = 28;
-        } else if (pixelFactor >= 1) {
-            // 1080p
-            baseCQ = 30;
-        } else if (pixelFactor >= 0.5) {
-            // 720p
-            baseCQ = 34;
-        } else {
-            // 480p or lower
-            baseCQ = 38;
-        }
-        
-        args.jobLog('Base CQ for ' + sourceWidth + 'x' + sourceHeight + ': ' + baseCQ);
-        
-        // Adjust for source bitrate (bits per pixel per second)
-        // Higher bitrate source = more room for compression = can use higher CQ
-        var fps = 24; // Assume 24fps if not available
+        var fps = 24;
         var bitsPerPixel = (sourceBitrateMbps * 1000000) / (pixelCount * fps);
-        
-        args.jobLog('Bits per pixel: ' + bitsPerPixel.toFixed(4));
-        
-        // Typical H264 web content: 0.05-0.15 bpp
-        // High quality source: 0.15-0.30 bpp
-        // Very high quality/raw: 0.30+ bpp
-        if (bitsPerPixel < 0.05) {
-            // Already highly compressed. Beating such a source on size requires MORE
-            // compression, not less: a low starting CQ just burns sweep retries climbing
-            // back up (observed: 0.018bpp x265 720p swept 26→42, exhausted retries,
-            // hard-failed wanting 44-48). The old -4 here pointed the wrong way; the 4K
-            // empirical correction that used to cancel it out is folded in and now
-            // applies at every resolution.
-            baseCQ += 4;
-            args.jobLog('Source is highly compressed (bpp < 0.05) - increasing CQ by 4 to start in the useful high-CQ region');
-        } else if (bitsPerPixel < 0.10) {
-            // Moderately compressed - base CQ already appropriate
-            args.jobLog('Source is moderately compressed (bpp < 0.10) - keeping base CQ');
-        } else if (bitsPerPixel > 0.30) {
-            // Very high quality - more room for compression. This must be checked before >0.20.
-            baseCQ += 4;
-            args.jobLog('Source is very high quality (bpp > 0.30) - increasing CQ by 4');
-        } else if (bitsPerPixel > 0.20) {
-            // High quality source - can use higher CQ
-            baseCQ += 2;
-            args.jobLog('Source is high quality (bpp > 0.20) - increasing CQ by 2');
-        }
-        
-        // 
-        // ── Source CAMBI prior: already-banded source → higher CQ is safe ──
-        // High source CAMBI means the reference has visible banding. VMAF can't reach
-        // as high on a banded reference, and the viewer won't notice additional compression
-        // on top of existing banding. This is complementary to BPP: BPP measures bitrate
-        // compression, CAMBI measures visible artifact load.
-        var sourceCAMBIPrior = args.variables.vmafSourceCAMBI;
-        var cambiCQModel = args.variables.vmafSourceCambiCQModel;
-        if (sourceCAMBIPrior !== null && sourceCAMBIPrior !== undefined) {
-            if (cambiCQModel && isFinite(cambiCQModel.slope) && cambiCQModel.support >= 8) {
-                // Data-driven: the learning data has enough banded-source rows to estimate how
-                // CQ shifts per unit of source banding. Clamp the current source CAMBI into the
-                // observed training range (no extrapolation), shift baseCQ relative to the
-                // mean-banding source, and cap to a sane band.
-                var clampedCambi = Math.max(cambiCQModel.cambiMin, Math.min(cambiCQModel.cambiMax, sourceCAMBIPrior));
-                var rawCambiDelta = cambiCQModel.slope * (clampedCambi - cambiCQModel.meanCambi);
-                var cambiDelta = Math.round(Math.max(-2, Math.min(5, rawCambiDelta)));
-                if (cambiDelta !== 0) {
-                    baseCQ += cambiDelta;
-                    args.jobLog('Source banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + '): learned model adjusts CQ by '
-                        + (cambiDelta > 0 ? '+' : '') + cambiDelta + ' (slope ' + cambiCQModel.slope.toFixed(3)
-                        + ' CQ/CAMBI vs mean ' + cambiCQModel.meanCambi.toFixed(2) + ', support ' + cambiCQModel.support + ' rows)');
-                } else {
-                    args.jobLog('Source banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + '): learned model adjustment ~0 (near training mean ' + cambiCQModel.meanCambi.toFixed(2) + ')');
-                }
-            } else {
-                // Cold-start fallback: fixed-step heuristic, used until enough banded-source
-                // rows accrue in the learning CSV for the slope model to take over.
-                if (sourceCAMBIPrior > 5.0) {
-                    baseCQ += 3;
-                    args.jobLog('Source has high banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + ') - increasing CQ by 3 (heuristic; source already visibly degraded)');
-                } else if (sourceCAMBIPrior > 3.0) {
-                    baseCQ += 2;
-                    args.jobLog('Source has moderate banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + ') - increasing CQ by 2 (heuristic)');
-                } else if (sourceCAMBIPrior > 1.0) {
-                    baseCQ += 1;
-                    args.jobLog('Source has mild banding (CAMBI ' + sourceCAMBIPrior.toFixed(2) + ') - increasing CQ by 1 (heuristic)');
-                }
-            }
+        var isHDR = args.variables.isHDR === true || args.variables.vmafIsHDR === true;
+
+        args.jobLog('Source: ' + sourceWidth + 'x' + sourceHeight + ' | ' + sourceCodec + ' | ' + sourceBitrateMbps.toFixed(1) + ' Mbps | bpp=' + bitsPerPixel.toFixed(4) + ' | HDR=' + isHDR + ' | dur=' + sourceDuration.toFixed(0) + 's | tgt=' + targetMinVMAF);
+
+        // ── CQ selection: predictor or manual ──
+        if (!dynamicCQ) {
+            // Use manual CQ values
+            crfValues = crfValuesStr.split(',').map(function(v) { return parseInt(v.trim(), 10); }).filter(function(v) { return !isNaN(v); });
+            args.jobLog('Using manual CQ values: ' + crfValues.join(', '));
+            args.variables.vmafDynamicCQ = false;
         }
 
-        // Adjust for target size reduction
-        // Higher target reduction = need higher CQ
-        if (targetSizeReduction > 40) {
-            baseCQ += 2;
-            args.jobLog('High target reduction (' + targetSizeReduction + '%) - increasing CQ by 2');
-        } else if (targetSizeReduction < 20) {
-            baseCQ -= 2;
-            args.jobLog('Low target reduction (' + targetSizeReduction + '%) - reducing CQ by 2');
-        }
-        
-        // Adjust for VMAF target (monotonic: higher target -> lower CQ / higher quality).
-        // Finer bands so the high-quality 94-96 region pulls CQ down more than the old 93
-        // default did (old code gave the SAME -2 for 93 and 95, so raising the target never
-        // moved the cold-start sweep centre). This only seeds the initial bracket; the
-        // historical VMAF-vs-CQ curve below refines the centre per-content when history exists.
-        if (targetMinVMAF >= 96) {
-            baseCQ -= 5;
-            args.jobLog('Very high VMAF target (' + targetMinVMAF + ') - reducing CQ by 5');
-        } else if (targetMinVMAF >= 94) {
-            baseCQ -= 4;
-            args.jobLog('High VMAF target (' + targetMinVMAF + ') - reducing CQ by 4');
-        } else if (targetMinVMAF >= 92) {
-            baseCQ -= 2;
-            args.jobLog('Moderate-high VMAF target (' + targetMinVMAF + ') - reducing CQ by 2');
-        } else if (targetMinVMAF >= 90) {
-            baseCQ -= 1;
-            args.jobLog('Standard VMAF target (' + targetMinVMAF + ') - reducing CQ by 1');
-        } else if (targetMinVMAF < 88) {
-            baseCQ += 2;
-            args.jobLog('Low VMAF target (' + targetMinVMAF + ') - increasing CQ by 2');
-        }
-        
-        // Codec/tier/HDR awareness
-        var codecCat = (sourceCodec || '').toLowerCase().indexOf('av1') !== -1 ? 'av1' :
-                       ((sourceCodec || '').toLowerCase().indexOf('265') !== -1 || (sourceCodec || '').toLowerCase().indexOf('hevc') !== -1 ? 'hevc' :
-                       ((sourceCodec || '').toLowerCase().indexOf('264') !== -1 ? 'h264' : 'other'));
-        if (codecCat === 'av1') {
-            baseCQ += 1; // AV1 handles compression better
-        } else if (codecCat === 'h264') {
-            baseCQ -= 1; // Needs more quality headroom
-        }
-        
-        if (isHDR) {
-            baseCQ -= 2; // Protect highlights
-        } else if (String(pixFmt || '').toLowerCase().indexOf('10') !== -1) {
-            baseCQ -= 1; // Mild buffer for 10-bit
-        }
-        
-        // Release group profile-based adjustments
-        var releaseGroupProfiles = null;
-        try {
-            var path = require('path');
-            var profilePath = '/app/configs/release_group_profiles.json';
-            if (fs.existsSync(profilePath)) {
-                var profileContent = fs.readFileSync(profilePath, 'utf8');
-                var profileData = JSON.parse(profileContent);
-                releaseGroupProfiles = profileData.profiles || {};
-                args.jobLog('Loaded ' + Object.keys(releaseGroupProfiles).length + ' release group profiles');
-            }
-        } catch (rgErr) {
-            args.jobLog('⚠ Could not load release group profiles: ' + rgErr.message);
-        }
-
-        // Apply release group adjustment
-        if (releaseGroup && releaseGroupProfiles && releaseGroup in releaseGroupProfiles) {
-            var profile = releaseGroupProfiles[releaseGroup];
-            baseCQ += profile.cq_bias;
-
-            args.jobLog('Release group profile match: ' + releaseGroup);
-            args.jobLog('  Quality tier: ' + profile.quality_tier);
-            args.jobLog('  CQ bias: ' + profile.cq_bias + ' (median: ' + profile.median_cq.toFixed(1) + ')');
-            args.jobLog('  Confidence: ' + (profile.confidence * 100).toFixed(0) + '% (' + profile.sample_count + ' samples)');
-            args.jobLog('  Success rate: ' + (profile.success_rate * 100).toFixed(0) + '%');
-
-            // (legacy boost: declared learningWeight here so the read path at line ~802 can
-            //  later see the upstream value. The actual blend happens further down where
-            //  vmafLearnedCQRange is read; this block just makes the variable available.)
-
-            args.variables.vmafReleaseGroupProfile = profile;
-            args.variables.vmafReleaseGroupUsed = releaseGroup;
-        } else if (releaseGroup) {
-            // Fallback to simple heuristics if no profile match
-            var rg = String(releaseGroup).toLowerCase();
-            if (rg.indexOf('remux') !== -1 || rg.indexOf('bluray') !== -1) {
-                baseCQ += 1; // higher quality source, allow slightly higher CQ
-            } else if (rg.indexOf('web') !== -1 || rg.indexOf('rip') !== -1 || rg.indexOf('hone') !== -1 || rg.indexOf('hhweb') !== -1) {
-                baseCQ -= 1; // streaming/scene encodes, be a bit more conservative
-            }
-            args.jobLog('Release group: ' + releaseGroup + ' (no profile match, using heuristics)');
-            args.variables.vmafReleaseGroupUsed = releaseGroup;
-        }
-        
-        // Genre/style based adjustments (after bitrate/resolution math)
-        var mediaGenres = Array.isArray(args.variables.vmafMediaGenre) ? args.variables.vmafMediaGenre : [];
-        var mediaGenresLower = mediaGenres.map(function(g) { return String(g).toLowerCase(); });
-        var isAnimation = args.variables.vmafMediaIsAnimation === true || mediaGenresLower.indexOf('animation') !== -1 || mediaGenresLower.indexOf('anime') !== -1 || mediaGenresLower.indexOf('cartoon') !== -1;
-        var mediaType = args.variables.vmafMediaType || 'unknown';
-        var metadataSource = args.variables.vmafMediaMetadataSource || 'none';
-        
-        var genreAdjustment = 0;
-        var animationAdjustment = 0;
-        if (isAnimation) {
-            animationAdjustment = 5; // animation tolerates higher CQ
-        } else {
-            var hasAction = mediaGenresLower.some(function(g) { return g.indexOf('action') !== -1 || g.indexOf('thriller') !== -1 || g.indexOf('sport') !== -1; });
-            var hasDoc = mediaGenresLower.some(function(g) { return g.indexOf('documentary') !== -1 || g.indexOf('news') !== -1; });
-            if (hasAction) {
-                genreAdjustment = -3;
-            } else if (hasDoc) {
-                genreAdjustment = 2;
-            }
-        }
-        
-        if (mediaType === 'movie') {
-            genreAdjustment += 1; // movies usually higher quality sources
-        } else if (mediaType === 'tv') {
-            genreAdjustment += 0; // keep neutral for episodic TV
-        }
-        
-        var sourceConfidence = 0.5;
-        if (metadataSource === 'plex') sourceConfidence = 1.0;
-        else if (metadataSource === 'tmdb') sourceConfidence = 0.9;
-        else if (metadataSource === 'tvdb' || metadataSource === 'imdb') sourceConfidence = 0.8;
-        else if (metadataSource === 'none') sourceConfidence = 0.3;
-        var genrePresenceConfidence = mediaGenresLower.length > 0 ? 1.0 : 0.4;
-        var metadataConfidence = Math.max(0.3, Math.min(1.0, sourceConfidence * genrePresenceConfidence));
-        
-        var totalGenreAdjustment = (genreAdjustment + animationAdjustment) * metadataConfidence;
-        if (totalGenreAdjustment !== 0) {
-            baseCQ += totalGenreAdjustment;
-            args.jobLog('Genre/style adjustment applied (animation: ' + animationAdjustment + ', genre: ' + genreAdjustment + ', confidence: ' + metadataConfidence.toFixed(2) + '), new base CQ: ' + baseCQ.toFixed(2));
-        }
-        args.variables.vmafGenreCQAdjustment = genreAdjustment;
-        args.variables.vmafAnimationCQAdjustment = animationAdjustment;
-        
-        // Clamp baseCQ to valid range
-        baseCQ = Math.max(16, Math.min(48, baseCQ));
-        
-        // Adaptive range/step based on sample variance signal from extraction
-        args.variables.vmafCQRangeWidthUsed = effectiveRangeWidth;
-        args.variables.vmafCQStepUsed = effectiveStep;
-        
-        // Generate CQ range centered around baseCQ (heuristic), with CI-based widening if noisy
-        var heuristicCQMin = Math.max(16, baseCQ - Math.floor(effectiveRangeWidth / 2));
-        var heuristicCQMax = Math.min(51, heuristicCQMin + effectiveRangeWidth);
-        
-        // Ensure we don't go below 16 or above 51
-        if (heuristicCQMax > 51) {
-            heuristicCQMax = 51;
-            heuristicCQMin = Math.max(16, heuristicCQMax - effectiveRangeWidth);
-        }
-        
-        // Check for learned CQ range from Bayesian learning; adjust span based on confidence/sampleCount
-        var learnedCQRange = args.variables.vmafLearnedCQRange;
-        var cqMin = heuristicCQMin;
-        var cqMax = heuristicCQMax;
-        var cqSource = 'heuristic';
-        
-        // Analyze across-CQ slope/variance to adjust span/step
-        if (aggregatedResults.length >= 2) {
-            var cqPoints = aggregatedResults.filter(function(r) {
-                return r.parameterSet && r.parameterSet.quality !== undefined;
-            }).map(function(r) {
-                return {
-                    cq: r.parameterSet.quality,
-                    vmaf: r.avgVMAF,
-                    size: r.avgFileSizeMB,
-                    std: r.vmafStdDev || 0
-                };
-            }).sort(function(a, b) { return a.cq - b.cq; });
-            
-            var steep = false;
-            for (var si = 0; si < cqPoints.length - 1; si++) {
-                var a = cqPoints[si];
-                var b = cqPoints[si + 1];
-                var dv = Math.abs(a.vmaf - b.vmaf);
-                var dcq = b.cq - a.cq;
-                if (dcq > 0 && dv / dcq > 1.5) {
-                    steep = true;
-                    break;
-                }
-            }
-            var flat = false;
-            if (!steep) {
-                var vmafs = cqPoints.map(function(p) { return p.vmaf; });
-                var meanV = vmafs.reduce(function(x, y) { return x + y; }, 0) / vmafs.length;
-                var varV = vmafs.reduce(function(acc, v) {
-                    var d = v - meanV;
-                    return acc + d * d;
-                }, 0) / vmafs.length;
-                var stdV = Math.sqrt(varV);
-                if (stdV < 1.0) flat = true;
-            }
-            if (steep) {
-                effectiveRangeWidth = Math.min(14, effectiveRangeWidth + 2);
-                effectiveStep = Math.max(1, effectiveStep - 1);
-                args.jobLog('Across-CQ slope steep -> widening span to ' + effectiveRangeWidth + ', step ' + effectiveStep);
-            } else if (flat) {
-                effectiveRangeWidth = Math.max(4, effectiveRangeWidth - 2);
-                effectiveStep = Math.min(4, effectiveStep + 1);
-                args.jobLog('Across-CQ curve flat -> tightening span to ' + effectiveRangeWidth + ', step ' + effectiveStep);
-            }
-            heuristicCQMin = Math.max(16, baseCQ - Math.floor(effectiveRangeWidth / 2));
-            heuristicCQMax = Math.min(51, heuristicCQMin + effectiveRangeWidth);
-            if (heuristicCQMax > 51) {
-                heuristicCQMax = 51;
-                heuristicCQMin = Math.max(16, heuristicCQMax - effectiveRangeWidth);
-            }
-            args.variables.vmafCQRangeWidthUsed = effectiveRangeWidth;
-            args.variables.vmafCQStepUsed = effectiveStep;
-        }
-
-        // Use release group profile to narrow range if available
-        if (releaseGroupPrior && releaseGroupPrior.sample_count >= 10) {
-            var rgStats = releaseGroupPrior.cq_statistics;
-            var rgIQR = rgStats.q75 - rgStats.q25;  // Inter-quartile range
-            var rgWidth = Math.ceil(rgIQR * 1.5);  // 1.5x IQR captures outliers
-
-            // Only narrow if profile suggests tighter range
-            if (rgWidth < effectiveRangeWidth) {
-                effectiveRangeWidth = rgWidth;
-                heuristicCQMin = Math.max(16, Math.round(rgStats.median - Math.floor(rgWidth / 2)));
-                heuristicCQMax = Math.min(51, heuristicCQMin + rgWidth);
-
-                if (heuristicCQMax > 51) {
-                    heuristicCQMax = 51;
-                    heuristicCQMin = Math.max(16, heuristicCQMax - rgWidth);
-                }
-
-                args.jobLog('Release group profile narrowed CQ range to: ' + heuristicCQMin + '-' + heuristicCQMax + ' (IQR=' + rgIQR.toFixed(1) + ')');
-            }
-        }
-
-        // If we have recent per-CQ noise info from previous run, widen span slightly when noise is high
-        var previousNoise = args.variables.vmafSelectedStdDev;
-        if (previousNoise !== undefined && previousNoise !== null && !isNaN(previousNoise)) {
-            if (previousNoise > 3) {
-                effectiveRangeWidth = Math.min(14, effectiveRangeWidth + 2);
-                heuristicCQMin = Math.max(16, baseCQ - Math.floor(effectiveRangeWidth / 2));
-                heuristicCQMax = Math.min(51, heuristicCQMin + effectiveRangeWidth);
-                args.jobLog('Previous CQ noise high (' + previousNoise.toFixed(2) + '), widening heuristic span to ' + heuristicCQMin + '-' + heuristicCQMax);
-            } else if (previousNoise < 1) {
-                effectiveRangeWidth = Math.max(4, effectiveRangeWidth - 2);
-                heuristicCQMin = Math.max(16, baseCQ - Math.floor(effectiveRangeWidth / 2));
-                heuristicCQMax = Math.min(51, heuristicCQMin + effectiveRangeWidth);
-                args.jobLog('Previous CQ noise low (' + previousNoise.toFixed(2) + '), tightening heuristic span to ' + heuristicCQMin + '-' + heuristicCQMax);
-            }
-        }
-        
-        function adjustSpanWithConfidence(minVal, maxVal, confidence, sampleCount) {
-            var span = maxVal - minVal;
-            if (confidence >= 0.8 && sampleCount >= 15) {
-                span = Math.max(4, Math.round(span * 0.6));
-            } else if (confidence >= 0.6 && sampleCount >= 8) {
-                span = Math.max(4, Math.round(span * 0.8));
-            } else if (confidence < 0.4 || sampleCount < 5) {
-                span = Math.min(14, Math.round(span * 1.2));
-            }
-            var mid = Math.round((minVal + maxVal) / 2);
-            var newMin = Math.max(16, mid - Math.floor(span / 2));
-            var newMax = Math.min(51, newMin + span);
-            if (newMax > 51) {
-                newMax = 51;
-                newMin = Math.max(16, newMax - span);
-            }
-            return { min: newMin, max: newMax };
-        }
-        
-        if (learnedCQRange && learnedCQRange.min !== undefined && learnedCQRange.max !== undefined) {
-            var learnedCQMin = learnedCQRange.min;
-            var learnedCQMax = learnedCQRange.max;
-            var learningWeight = learnedCQRange.confidence || 0.5; // Use confidence as weight
-            var minSamplesForLearning = 5; // Could be from plugin input, but using default for now
-            var sampleWeight = Math.min(1, (learnedCQRange.sampleCount || 0) / 15);
-            learningWeight = Math.min(1, Math.max(learningWeight, sampleWeight));
-            
-            if (learnedCQRange.sampleCount >= minSamplesForLearning) {
-                // Blend learned range with heuristic, then adjust span by confidence/sampleCount
-                var blendedMin = Math.round(learningWeight * learnedCQMin + (1 - learningWeight) * heuristicCQMin);
-                var blendedMax = Math.round(learningWeight * learnedCQMax + (1 - learningWeight) * heuristicCQMax);
-                var adjusted = adjustSpanWithConfidence(blendedMin, blendedMax, learningWeight, learnedCQRange.sampleCount);
-                cqMin = adjusted.min;
-                cqMax = adjusted.max;
-                cqSource = 'blended (learned + heuristic, confidence-shaped span)';
-                
-                args.jobLog('');
-                args.jobLog('Learning Integration:');
-                args.jobLog('  Heuristic range: CQ ' + heuristicCQMin + '-' + heuristicCQMax);
-                args.jobLog('  Learned range: CQ ' + learnedCQMin + '-' + learnedCQMax + ' (from ' + learnedCQRange.sampleCount + ' samples)');
-                args.jobLog('  Blended range: CQ ' + cqMin + '-' + cqMax + ' (weight: ' + (learningWeight * 100).toFixed(0) + '% learned)');
-            } else {
-                args.jobLog('');
-                args.jobLog('Learning data available but insufficient samples (' + learnedCQRange.sampleCount + ' < ' + minSamplesForLearning + ') - using heuristic');
-            }
-        } else {
-            args.jobLog('');
-            args.jobLog('No learned CQ range available - using heuristic only');
-        }
-        
-        // Historical per-CQ curve: the strongest prior when enough similar sweep points exist
-        // (loaded by extractVideoSamples from vmaf_results.csv). Fit a monotonic non-increasing
-        // VMAF-vs-CQ curve via PAVA and centre the sweep where it crosses the VMAF target.
-        var histPoints = Array.isArray(args.variables.vmafHistoricalCqPoints) ? args.variables.vmafHistoricalCqPoints : [];
-        var histMeta = args.variables.vmafHistoricalCqMeta || {};
-        if (histPoints.length >= 6 && (histMeta.distinctCqCount || 0) >= 3) {
-            try {
-                var byCq = {};
-                histPoints.forEach(function(p) {
-                    var k = Math.round(Number(p.cq) * 2) / 2;
-                    if (!isFinite(k) || !isFinite(p.vmaf)) return;
-                    var wv = isFinite(p.w) && p.w > 0 ? p.w : 1;
-                    if (!byCq[k]) byCq[k] = { cq: k, sw: 0, swv: 0 };
-                    byCq[k].sw += wv;
-                    byCq[k].swv += p.vmaf * wv;
-                });
-                var hxs = Object.keys(byCq).map(function(k) { return byCq[k]; })
-                    .sort(function(a, b) { return a.cq - b.cq; });
-                var hVals = hxs.map(function(g) { return -(g.swv / g.sw); });
-                var hWts = hxs.map(function(g) { return g.sw; });
-                var hBlocks = [];
-                for (var hbi = 0; hbi < hVals.length; hbi++) {
-                    hBlocks.push({ s: hbi, e: hbi + 1, w: hWts[hbi], v: hVals[hbi] });
-                    while (hBlocks.length >= 2) {
-                        var hb0 = hBlocks[hBlocks.length - 2];
-                        var hb1 = hBlocks[hBlocks.length - 1];
-                        if (hb0.v <= hb1.v) break;
-                        var hwsum = hb0.w + hb1.w;
-                        hBlocks.splice(hBlocks.length - 2, 2, { s: hb0.s, e: hb1.e, w: hwsum, v: (hb0.v * hb0.w + hb1.v * hb1.w) / hwsum });
-                    }
-                }
-                var hyHat = new Array(hVals.length);
-                hBlocks.forEach(function(b) { for (var hj = b.s; hj < b.e; hj++) hyHat[hj] = -b.v; });
-                var hcxs = hxs.map(function(g) { return g.cq; });
-                var estCqHist = null;
-                if (hyHat.length >= 2) {
-                    if (targetMinVMAF > hyHat[0]) estCqHist = hcxs[0];
-                    else if (targetMinVMAF < hyHat[hyHat.length - 1]) estCqHist = hcxs[hcxs.length - 1];
-                    else {
-                        for (var hii = 0; hii < hcxs.length - 1; hii++) {
-                            if (hyHat[hii] >= targetMinVMAF && hyHat[hii + 1] <= targetMinVMAF) {
-                                estCqHist = hyHat[hii + 1] === hyHat[hii] ? (hcxs[hii] + hcxs[hii + 1]) / 2
-                                    : hcxs[hii] + (targetMinVMAF - hyHat[hii]) * (hcxs[hii + 1] - hcxs[hii]) / (hyHat[hii + 1] - hyHat[hii]);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (estCqHist !== null && isFinite(estCqHist)) {
-                    estCqHist = Math.max(16, Math.min(51, estCqHist));
-                    var histConf = Math.min(1, (histMeta.effN || 0) / 25);
-                    var curCenter = (cqMin + cqMax) / 2;
-                    var blendedCenter = histConf * estCqHist + (1 - histConf) * curCenter;
-                    var spanH = effectiveRangeWidth;
-                    if (histConf >= 0.6) spanH = Math.max(4, effectiveRangeWidth - 2);
-                    cqMin = Math.max(16, Math.round(blendedCenter - spanH / 2));
-                    cqMax = Math.min(51, cqMin + spanH);
-                    if (cqMax > 51) {
-                        cqMax = 51;
-                        cqMin = Math.max(16, cqMax - spanH);
-                    }
-                    cqSource = 'historical-curve (estCQ@' + targetMinVMAF + '=' + estCqHist.toFixed(1) + ', conf=' + histConf.toFixed(2) + ')';
-                    args.jobLog('Historical curve estimate: CQ ' + estCqHist.toFixed(2) + ' at VMAF ' + targetMinVMAF
-                        + ' (effN=' + (histMeta.effN || 0) + ', points=' + histPoints.length + ') -> range ' + cqMin + '-' + cqMax);
-                }
-            } catch (histErr) {
-                args.jobLog('Historical curve fit failed: ' + (histErr && histErr.message ? histErr.message : String(histErr)));
-            }
-        }
-
-        args.jobLog('');
-        args.jobLog('Final CQ range (' + cqSource + '): ' + cqMin + ' - ' + cqMax + ' (step: ' + effectiveStep + ')');
-
-        // Progressive CQ expansion or generate all values upfront
-        var progressiveExpansion = args.inputs.progressiveCQExpansion !== false && args.inputs.progressiveCQExpansion !== 'false';
-        var initialCQCount = Number(args.inputs.initialCQCount) || 3;
-
-        // Check if checkCQBracket returned with expansion CQ values
-        if (args.variables.vmafNextCQs && args.variables.vmafNextCQs.length > 0) {
-            // Progressive expansion phase 2: test additional CQ values from checkCQBracket
-            crfValues = args.variables.vmafNextCQs;
-
-            // Use override range if provided
-            if (args.variables.vmafOverrideCQMin !== undefined) {
-                cqMin = args.variables.vmafOverrideCQMin;
-            }
-            if (args.variables.vmafOverrideCQMax !== undefined) {
-                cqMax = args.variables.vmafOverrideCQMax;
-            }
-
-            args.jobLog('Progressive Expansion Phase 2: Testing additional CQ values');
-            args.jobLog('Expansion CQ values: ' + crfValues.join(', '));
-
-            // Clear expansion variables so we don't loop
-            delete args.variables.vmafNextCQs;
-            delete args.variables.vmafOverrideCQMin;
-            delete args.variables.vmafOverrideCQMax;
-
-        } else if (!progressiveExpansion || isRetry) {
-            // Standard: generate all CQ values upfront
-            for (var cq = cqMin; cq <= cqMax; cq += effectiveStep) {
-                crfValues.push(cq);
-            }
-            args.jobLog('CQ values to test: ' + crfValues.join(', '));
-        } else {
-            // Progressive: start with initial bracket around baseCQ
-            var baseCQCalc = Math.round((cqMin + cqMax) / 2);
-
-            // Generate initial points centered on baseCQ
-            var initialCQs = [];
-            for (var offset = -(Math.floor(initialCQCount / 2)); offset <= Math.floor(initialCQCount / 2); offset++) {
-                var testCQ = baseCQCalc + (offset * effectiveStep);
-                if (testCQ >= cqMin && testCQ <= cqMax) {
-                    initialCQs.push(testCQ);
-                }
-            }
-
-            // Ensure at least baseCQ is tested
-            if (initialCQs.length === 0) {
-                initialCQs = [baseCQCalc];
-            }
-
-            crfValues = initialCQs;
-
-            // Store for phase 2 expansion
-            args.variables.vmafProgressiveExpansion = {
-                enabled: true,
-                cqMin: cqMin,
-                cqMax: cqMax,
-                baseCQ: baseCQCalc,
-                step: effectiveStep,
-                initialCQs: initialCQs
-            };
-
-            args.jobLog('Progressive expansion enabled');
-            args.jobLog('Phase 1: Testing initial bracket: ' + crfValues.join(', '));
-            args.jobLog('Full range available: ' + cqMin + '-' + cqMax + ' (will expand if needed)');
-        }
-
-        args.jobLog('');
-        
-        // Store dynamic CQ info in variables for later analysis
-        args.variables.vmafDynamicCQ = true;
-        args.variables.vmafSourceBitrateMbps = sourceBitrateMbps;
-        args.variables.vmafSourceBpp = bitsPerPixel;
-        args.variables.vmafCalculatedBaseCQ = baseCQ;
-        args.variables.vmafCQRange = { min: cqMin, max: cqMax, width: cqMax - cqMin };
-    } else {
-        // Use manual CQ values
-        crfValues = crfValuesStr.split(',').map(function(v) { return parseInt(v.trim(), 10); }).filter(function(v) { return !isNaN(v); });
-        args.jobLog('Using manual CQ values: ' + crfValues.join(', '));
-        args.variables.vmafDynamicCQ = false;
-    }
-    
-    // Track tested CQ values to avoid retesting in retry loops
+        // Track tested CQ values to avoid retesting in retry loops
     if (!args.variables.vmafTestedCQs) {
         args.variables.vmafTestedCQs = [];
     }
@@ -1041,9 +501,10 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
     var parameterSets = [];
     var encodeFailures = []; // CRITICAL FIX #2: Track encoding failures
 
-    // ── A/B SHADOW (Phase 3): log the new predictor's sweep-domain decision next to the live
-    // logic. No behaviour change - the live crfValues below are still what gets tested. Lets us
-    // compare predictCQCenter / selectSampleCount against the heuristic on real jobs first.
+    // ── Predictor: compute CQ centre from historical sweep curves ──
+    // Uses learned metadata weights (eta²) and per-CQ VMAF-vs-CQ regression
+    // to predict the CQ that achieves targetVmaf, then seeds the initial sweep.
+    // Falls back gracefully on new/unusual content (< 30 neighbours support).
     try {
         var _vdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
         var _vp = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js');
@@ -1065,7 +526,8 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             release_group: args.variables.vmafReleaseGroup || null,
             network: args.variables.vmafNetwork || null,
             original_language: args.variables.vmafOriginalLanguage || null,
-            source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null)
+            source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null),
+            file_path: (args.inputFileObj && args.inputFileObj.file) || (args.inputFileObj && args.inputFileObj._id) || null
         };
         var _curves = _vdb.getSimilarSweepCurves(_db, _src, { limit: 20000 });
         var _ctr = _vp.predictCQCenter(_curves, _src, { targetVmaf: _tgt }, { recencyHalfLifeDays: 0 });
@@ -1083,10 +545,10 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
                 + _ek.map(function (k) { return k + '=' + _et[k].toFixed(3); }).join(', '));
         }
 
-        // ── ACTING (Phase 4): on the FIRST sweep, seed crfValues from the predicted range so the
-        //    sweep starts centred on the likely optimum instead of the heuristic grid (the shadow
-        //    showed the heuristic wastes retry rounds). Retries set vmafPredictorSeeded and keep
-        //    refining via the existing checkCQRangeRetry loop. Gated on adequate neighbour support.
+        // ── ACTING: seed crfValues from the predicted range so the sweep starts
+        // centred on the likely optimum. Retries set vmafPredictorSeeded and keep
+        // refining via the existing checkCQRangeRetry loop. Gated on adequate
+        // neighbour support (>= 30 similar jobs).
         if (!args.variables.vmafPredictorSeeded && _ctr && _ctr.centerCq != null && _ctr.support >= 30
             && _ctr.rangeMin != null && _ctr.rangeMax != null) {
             var _cC = Math.round(_ctr.centerCq);
@@ -1107,6 +569,24 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         }
     } catch (_shErr) {
         args.jobLog('[PREDICT] predictor calc failed (non-fatal): ' + (_shErr && _shErr.message ? _shErr.message : String(_shErr)));
+    }
+
+    // Fallback: a first-attempt dynamicCQ job has no base CQ list unless the predictor seeded one
+    // (gated on DB availability AND support>=30). If the predictor was unavailable (e.g. the shared
+    // SQLite handle was closed by an earlier job -> "database is not open") or support was thin, fall
+    // back to the configured crfValues so the sweep still runs (pre-predictor behaviour) instead of
+    // failing the whole job. The predictor is an optimisation, never a hard dependency.
+    if (crfValues.length === 0) {
+        crfValues = crfValuesStr.split(',').map(function(v) { return parseInt(v.trim(), 10); })
+            .filter(function(v) { return !isNaN(v); });
+        if (crfValues.length > 0) {
+            args.jobLog('Predictor seeded no CQ values (unavailable or low support); falling back to configured crfValues: ' + crfValues.join(', '));
+            if (!args.variables.vmafTestedCQs) args.variables.vmafTestedCQs = [];
+            for (var _fbi = 0; _fbi < crfValues.length; _fbi++) {
+                if (args.variables.vmafTestedCQs.indexOf(crfValues[_fbi]) === -1) args.variables.vmafTestedCQs.push(crfValues[_fbi]);
+            }
+            args.variables.vmafTestedCQs.sort(function(a, b) { return a - b; });
+        }
     }
 
     // Generate parameter sets - all use 10-bit (p010le) format

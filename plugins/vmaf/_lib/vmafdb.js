@@ -17,7 +17,7 @@
  */
 
 var DEFAULT_DB_PATH = '/app/configs/vmaf_training.db';
-var SCHEMA_VERSION = 4;
+var SCHEMA_VERSION = 5;
 
 // ── Column whitelists (writers ignore unknown keys; readers map by name) ──
 var JOB_COLUMNS = [
@@ -42,7 +42,8 @@ var SWEEP_COLUMNS = [
   'preset', 'tune', 'multipass', 'spatial_aq', 'temporal_aq', 'aq_strength',
   'vmaf_mean', 'vmaf_harmonic_mean', 'vmaf_min', 'vmaf_max', 'vmaf_p1_low', 'vmaf_stddev',
   'ssim', 'cambi_mean', 'cambi_max', 'cambi_p95',
-  'avg_size_mb', 'sample_count'
+  'avg_size_mb', 'sample_count',
+  'clip_vmafs'
 ];
 
 var _dbCache = {}; // path -> DatabaseSync handle (reuse across calls within a process)
@@ -55,7 +56,15 @@ function _requireSqlite() {
 
 function openDb(dbPath) {
   dbPath = dbPath || DEFAULT_DB_PATH;
-  if (_dbCache[dbPath]) return _dbCache[dbPath];
+  var cached = _dbCache[dbPath];
+  if (cached) {
+    // Self-heal: the cached handle is shared across the whole node process. If any caller ever
+    // closes it, the cache would otherwise hold a CLOSED handle and every later openDb() would
+    // hand back a dead db ("database is not open"), silently disabling the predictor for the rest
+    // of the process's life. Probe it cheaply; if it's dead, drop it and reopen transparently.
+    try { cached.prepare('SELECT 1').get(); return cached; }
+    catch (e) { try { cached.close(); } catch (e2) {} delete _dbCache[dbPath]; }
+  }
 
   var sqlite = _requireSqlite();
   var DatabaseSync = sqlite.DatabaseSync;
@@ -186,6 +195,13 @@ function _migrate(db) {
     db.exec('ALTER TABLE jobs ADD COLUMN original_language TEXT;');
     db.exec('PRAGMA user_version = 4;');
   }
+  if (v < 5) {
+    // Raw per-clip VMAF scores as JSON array. Enables backtesting the sequential sampler's stopping
+    // rule (mean CI, 1%-low coverage) against historical measured clip distributions. Null on rows
+    // from before this migration.
+    db.exec('ALTER TABLE sweep_points ADD COLUMN clip_vmafs TEXT;');
+    db.exec('PRAGMA user_version = 5;');
+  }
 }
 
 function _coerce(v) {
@@ -302,7 +318,7 @@ function getSimilarSweepCurves(db, src, opts) {
     '       s.ssim, s.cambi_mean, s.cambi_max, s.cambi_p95, s.avg_size_mb, s.sample_count, s.parameter_set_id,' +
     '       j.job_id, j.timestamp, j.tier, j.source_codec, j.bits_per_pixel,' +
     '       j.media_genre, j.media_is_animation, j.media_type, j.media_year, j.release_group,' +
-    '       j.network, j.original_language, j.target_min_vmaf, j.source_cambi' +
+    '       j.is_hdr, j.network, j.original_language, j.target_min_vmaf, j.source_cambi' +
     ' FROM sweep_points s JOIN jobs j ON s.job_id = j.job_id';
   if (where.length) sql += ' WHERE ' + where.join(' AND ');
   sql += ' ORDER BY j.timestamp DESC LIMIT ?';
@@ -310,6 +326,28 @@ function getSimilarSweepCurves(db, src, opts) {
 
   var stmt = db.prepare(sql);
   return stmt.all.apply(stmt, params);
+}
+
+/**
+ * Pull sweep curves for the exact same file_path — used as a high-weight prior
+ * when a file has been re-queued (either a re-encode trigger or a retry after
+ * previously failing to meet the VMAF target). Returns rows newest-first.
+ */
+function getSameFileSweepCurves(db, filePath, opts) {
+  opts = opts || {};
+  var limit = opts.limit || 2000;
+  if (!filePath) return [];
+  var sql =
+    'SELECT s.cq, s.vmaf_mean, s.vmaf_harmonic_mean, s.vmaf_min, s.vmaf_max, s.vmaf_p1_low, s.vmaf_stddev,' +
+    '       s.ssim, s.cambi_mean, s.cambi_max, s.cambi_p95, s.avg_size_mb, s.sample_count, s.parameter_set_id,' +
+    '       j.job_id, j.timestamp, j.tier, j.source_codec, j.bits_per_pixel,' +
+    '       j.media_genre, j.media_is_animation, j.media_type, j.media_year, j.release_group,' +
+    '       j.is_hdr, j.network, j.original_language, j.target_min_vmaf, j.source_cambi' +
+    ' FROM sweep_points s JOIN jobs j ON s.job_id = j.job_id' +
+    ' WHERE j.file_path = ? AND s.vmaf_mean IS NOT NULL' +
+    ' ORDER BY j.timestamp DESC LIMIT ?';
+  var stmt = db.prepare(sql);
+  return stmt.all(filePath, limit);
 }
 
 /** Pull similar completed jobs (selected CQ + outcome) for outcome-aware priors. */
@@ -362,6 +400,7 @@ module.exports = {
   upsertJob: upsertJob,
   insertSweepPoints: insertSweepPoints,
   getSimilarSweepCurves: getSimilarSweepCurves,
+  getSameFileSweepCurves: getSameFileSweepCurves,
   getSimilarJobs: getSimilarJobs,
   makeJobId: makeJobId,
   tierFor: tierFor,

@@ -2,11 +2,11 @@
 # Durable Tdarr FFmpeg repair.
 # Tdarr's own /etc/cont-init.d/03-setup-ffmpeg creates Jellyfin ffmpeg symlinks at startup.
 # This script runs from the host-mounted custom-cont-init.d directory after that and replaces
-# them with wrappers for the custom FFmpeg build.
+# them with wrappers for Seb's known-good custom FFmpeg build.
 
 set -u
 
-echo "=== Custom FFmpeg Setup (VMAF/NVENC build) ==="
+echo "=== Custom FFmpeg Setup (Seb VMAF/NVENC build) ==="
 
 CUSTOM_ROOT="/usr/local/ffmpeg-custom"
 CUSTOM_FFMPEG="$CUSTOM_ROOT/bin/ffmpeg"

@@ -2,8 +2,8 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.plugin = exports.details = void 0;
 var details = function () { return ({
-    name: 'Export VMAF Results to CSV',
-    description: 'Exports all VMAF calculation results, file metadata, and parameter selections to CSV for analysis.',
+    name: 'Export VMAF Results (SQLite + CSV sidecar)',
+    description: 'Exports all VMAF calculation results to SQLite training DB (primary) and CSV sidecar for analysis.',
     style: {
         borderColor: 'orange',
     },
@@ -15,14 +15,14 @@ var details = function () { return ({
     icon: 'faFileCsv',
     inputs: [
         {
-            label: 'CSV Output Path',
+            label: 'CSV Sidecar Output Path',
             name: 'csvPath',
             type: 'string',
             defaultValue: '/app/configs/vmaf_results.csv',
             inputUI: {
                 type: 'text',
             },
-            tooltip: 'Path where CSV file will be saved. Default: /app/configs/vmaf_results.csv (accessible on host)',
+            tooltip: 'Path where CSV sidecar file will be saved (SQLite is the primary store). Default: /app/configs/vmaf_results.csv (accessible on host)',
         },
     ],
     outputs: [
@@ -527,15 +527,15 @@ var plugin = function (args) {
         if (fileExists) {
             // Append to existing file (without header if file exists)
             fs.appendFileSync(csvPath, csvContent.split('\n').slice(1).join('\n'));
-            args.jobLog('Appended VMAF results to existing CSV: ' + csvPath);
+            args.jobLog('Appended to CSV sidecar (SQLite is primary): ' + csvPath);
         } else {
             // Create new file with header
             fs.writeFileSync(csvPath, csvContent, { mode: 0o644 });
-            args.jobLog('Created new CSV file with VMAF results: ' + csvPath);
+            args.jobLog('Created CSV sidecar (SQLite is primary): ' + csvPath);
         }
         
         args.jobLog('Exported ' + (vmafResults.length || aggregatedResults.length) + ' result rows to CSV');
-        args.jobLog('CSV file location: ' + csvPath);
+        args.jobLog('CSV sidecar location: ' + csvPath);
     } catch (err) {
         args.jobLog('Error writing CSV file: ' + err.message);
         args.jobLog('CSV path: ' + csvPath);
@@ -563,11 +563,11 @@ var plugin = function (args) {
             } catch (altErr) {
                 args.jobLog('Alternative path also failed: ' + altErr.message);
                 // Don't throw - just log the error and continue
-                args.jobLog('WARNING: Could not export VMAF results to CSV. Continuing without export.');
+                args.jobLog('WARNING: CSV sidecar write failed (SQLite already stored the results). Continuing.');
             }
         } else {
             // For other paths, just log and continue
-            args.jobLog('WARNING: Could not export VMAF results to CSV. Continuing without export.');
+            args.jobLog('WARNING: CSV sidecar write failed (SQLite already stored the results). Continuing.');
         }
     }
 
@@ -622,7 +622,7 @@ var plugin = function (args) {
         args.jobLog('WARNING: Could not export FFmpeg/libvmaf runtime metrics sidecar CSV: ' + runtimeErr.message);
     }
     
-    // ── Unified SQLite training store (dual-write alongside the CSV) ──
+    // ── Unified SQLite training store (primary write; CSV is a sidecar) ──
     // Writes the per-CQ sweep curve INCLUDING CAMBI (new signal) plus the job's source +
     // decision facts. Keyed by the shared vmafJobId so learnCQRange can later attach the
     // final outcome to the same row. Non-fatal: a DB failure never breaks the flow.
@@ -704,7 +704,8 @@ var plugin = function (args) {
                 cambi_max: _ar.maxCAMBI != null ? Number(_ar.maxCAMBI) : null,
                 cambi_p95: _ar.p95CAMBI != null ? Number(_ar.p95CAMBI) : null,
                 avg_size_mb: Number(_ar.avgFileSizeMB) || null,
-                sample_count: parseInt(_ar.sampleCount) || null
+                sample_count: parseInt(_ar.sampleCount) || null,
+                clip_vmafs: JSON.stringify(_ar.clipVmafs || [])
             });
         }
         var _n = vmafdb.insertSweepPoints(_db, _jobId, _pts);

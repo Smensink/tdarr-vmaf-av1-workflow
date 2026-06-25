@@ -154,6 +154,48 @@ var plugin = function (args) {
         };
     }
 
+    // ── Constraint-aware bracket: when VMAF mean is met everywhere (all above target), the
+    //    optimum is bounded by the 1%-low / CAMBI floor, NOT by the VMAF crossing. If a candidate
+    //    meets ALL constraints and a higher-CQ candidate fails one, the feasible optimum is already
+    //    bracketed within the tested CQs -> proceed to selection instead of expanding upward (the
+    //    old behaviour blew the sweep up to the whole range chasing a VMAF crossing that doesn't
+    //    bind). ──
+    try {
+        var _floor = Number(args.variables.vmafMinFrameVMAF)
+            || (args.variables.vmafQualityRiskPolicy && Number(args.variables.vmafQualityRiskPolicy.adaptiveFrameFloor))
+            || null;
+        var _cambiBase = args.variables.isHDR ? 5.0 : (args.variables.vmafMediaIsAnimation === true ? 6.0 : 5.5);
+        var _scR = Math.max(Number(args.variables.vmafSourceCAMBI) || -Infinity, Number(args.variables.vmafSourceCAMBIP95) || -Infinity);
+        var _effCambi = isFinite(_scR) ? Math.max(_cambiBase, _scR + 1.0) : _cambiBase;
+        var _feasibleCqs = [], _allCqs = [];
+        for (var _bi = 0; _bi < aggregated.length; _bi++) {
+            var _r = aggregated[_bi]; if (!_r.parameterSet || _r.parameterSet.quality === undefined) continue;
+            var _ccq = Number(_r.parameterSet.quality);
+            var _cvm = (_r.avgVMAFMean != null ? Number(_r.avgVMAFMean) : Number(_r.avgVMAF));
+            var _cp1 = (_r.vmafP1Low != null ? Number(_r.vmafP1Low) : null);
+            var _ccb = (_r.p95CAMBI != null ? Number(_r.p95CAMBI) : (_r.maxCAMBI != null ? Number(_r.maxCAMBI) : null));
+            if (!isFinite(_ccq)) continue;
+            _allCqs.push(_ccq);
+            var _ok = (isFinite(_cvm) && _cvm >= targetVMAF)
+                && (_floor == null || _cp1 == null || _cp1 >= _floor)
+                && (_ccb == null || _ccb <= _effCambi);
+            if (_ok) _feasibleCqs.push(_ccq);
+        }
+        if (_feasibleCqs.length > 0) {
+            var _maxFeas = Math.max.apply(null, _feasibleCqs);
+            var _hasHigherInfeasible = _allCqs.some(function (c) { return c > _maxFeas; });
+            if (_hasHigherInfeasible || maxCQ >= progressive.cqMax) {
+                args.jobLog('✓ Optimum bracketed by binding constraint (1%-low ' + (_floor != null ? '>=' + _floor : 'n/a')
+                    + ', CAMBI <= ' + _effCambi.toFixed(1) + ') - feasible up to CQ ' + _maxFeas
+                    + '; proceeding to selection without VMAF-mean expansion');
+                delete args.variables.vmafProgressiveExpansion;
+                return { outputFileObj: args.inputFileObj, outputNumber: 1, variables: args.variables };
+            }
+        }
+    } catch (_cbErr) {
+        args.jobLog('Constraint-aware bracket check skipped (non-fatal): ' + _cbErr.message);
+    }
+
     // Not bracketed - determine expansion direction
     args.jobLog('⚠ Target VMAF NOT bracketed - expanding range');
 

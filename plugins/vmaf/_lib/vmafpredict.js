@@ -717,11 +717,31 @@ function nextSweepCQ(measured, constraints, opts) {
 function selectCQFromDb(db, vmafdb, src, constraints, opts) {
   opts = opts || {};
   var curves = vmafdb.getSimilarSweepCurves(db, src, { limit: opts.limit || 20000, codec: opts.hardCodecFilter });
+  // ENHANCEMENT: Merge sweep curves from the exact same file_path (re-encode / retry candidates).
+  // These get boosted weight by setting their timestamp to "future" so recency weighting
+  // gives them maximum priority in the kernel estimate.
+  if (src && src.file_path) {
+    var same = vmafdb.getSameFileSweepCurves(db, src.file_path, { limit: 2000 });
+    if (same && same.length) {
+      var futureTs = (new Date(Date.now() + 86400000)).toISOString(); // +1 day = highest recency
+      same.forEach(function(r) { r.timestamp = futureTs; });
+      curves = same.concat(curves); // same-file rows go first (newest-first order, but timestamp-distinct)
+    }
+  }
   return selectCQ(curves, src, constraints, opts);
 }
 function sampleStatsFromDb(db, vmafdb, src, opts) {
   opts = opts || {};
   var curves = vmafdb.getSimilarSweepCurves(db, src, { limit: opts.limit || 20000 });
+  // Also boost same-file history for sample-size estimation
+  if (src && src.file_path) {
+    var same = vmafdb.getSameFileSweepCurves(db, src.file_path, { limit: 2000 });
+    if (same && same.length) {
+      var futureTs = (new Date(Date.now() + 86400000)).toISOString();
+      same.forEach(function(r) { r.timestamp = futureTs; });
+      curves = same.concat(curves);
+    }
+  }
   return selectSampleCount(curves, opts);
 }
 

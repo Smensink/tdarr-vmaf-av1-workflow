@@ -1,6 +1,6 @@
 # Tdarr VMAF AV1 Workflow
 
-**GitHub description:** Tdarr AV1 NVENC workflow with a matching FFmpeg/libvmaf container, VMAF/CAMBI-guided CQ sweeps, adaptive quality guards, holdout validation, and learned CQ priors.
+**GitHub description:** Tdarr AV1 NVENC workflow with FFmpeg/libvmaf CUDA container, VMAF/CAMBI-guided CQ sweeps with per-file sequential sampling, η²-learned metadata similarity weights, holdout CAMBI self-comparison, constraint-aware optimum bracketing, same-file re-encode prior, known-failed CQ avoidance, retry graceful fallback (max 4), and data-integrity-filtered SQLite learning.
 
 This project is a Tdarr workflow for people who want **measured, per-title AV1 quality decisions** instead of a fixed CRF/CQ preset. It extends the usual Tdarr pattern of "if file matches rules, run one transcode command" into a quality-search pipeline:
 
@@ -26,7 +26,7 @@ This workflow adds a feedback loop:
 | Trusts encoder settings | Measures sample output against source |
 | Usually checks size/codec after transcode | Predicts output size before final transcode |
 | No objective quality feedback | Uses VMAF, CAMBI, 1%-low frame quality, and holdout validation |
-| No memory between files | Learns CQ priors from completed runs |
+| No memory between files | Learns CQ priors from completed runs; same-file re-encode priors |
 | Any FFmpeg build might be used | Expects the provided FFmpeg/libvmaf capability set |
 
 ## Why VMAF and CAMBI?
@@ -40,7 +40,7 @@ This workflow uses those ideas practically inside Tdarr: VMAF estimates perceptu
 ## How the project is organized
 
 - `docker/` — compose example, Dockerfile, init hooks, and FFmpeg/libvmaf build recipe
-- `plugins/vmaf/_lib/` — shared Node.js libraries: `vmafdb.js` (SQLite data layer, v4 schema with data-integrity filters), `vmafpredict.js` (CQ predictor with η²-learned weights, sequential sampling, correlationRatio), `backfill_metadata.js`, `recover_sweep_aggregates.js`, backfill scripts, and analysis tools
+- `plugins/vmaf/_lib/` — shared Node.js libraries: `vmafdb.js` (SQLite data layer, v5 schema with clip_vmafs, data-integrity filters, same-file history queries, self-healing DB handle), `vmafpredict.js` (CQ predictor with η²-learned weights, sequential sampling, correlationRatio, same-file prior merging), `backfill_metadata.js`, `recover_sweep_aggregates.js`, backfill scripts, and analysis tools
 - `scripts/` — patch scripts applied during development (`patch_learning_holdout.py`, `patch_meanmin_sampling.py`, `patch_quality_guard.py`, `remove_hard_sample_floor.py`)
 - `plugins/vmaf/` — Tdarr Local Flow Plugins (`vmaf/` category)
 - `plugins/filter/checkFileAge/` — age-gate plugin (`filter/` category)
@@ -84,12 +84,15 @@ preflight checks
   → HDR / stream metadata detection
   → representative sample extraction
   → candidate AV1 NVENC sample encodes
-  → VMAF/CAMBI scoring
+  → VMAF/CAMBI scoring with sequential sampling (per-file early-stop)
+  → constraint-aware bracket check (optimum bounded by 1%-low/CAMBI floor, not VMAF crossing)
   → CQ range expansion if the target is not bracketed
   → candidate selection with quality and size guards
-  → holdout validation
+  → holdout validation (self-comparing source CAMBI)
+  → retry logic with known-failed CQ avoidance (caps bracket below previous misses)
   → final AV1 NVENC transcode
-  → result export and CQ learning
+  → result export to SQLite (primary) + CSV sidecar with per-clip VMAF logging
+  → CQ learning
   → cleanup
 ```
 
@@ -102,9 +105,12 @@ The final CQ is not chosen from VMAF mean alone. A candidate must survive severa
 - mean/harmonic VMAF target
 - 1%-low frame VMAF floor
 - projected BPP, bitrate, and output/source-size ratio
-- CAMBI/banding threshold where available
-- holdout sample validation
-- retry logic if every candidate is too risky
+- CAMBI/banding threshold (dynamic per source — self-comparing on holdout)
+- **constraint-aware bracket**: when all candidates meet quality constraints but a higher-CQ candidate fails one, the optimum is bracketed without VMAF-mean expansion
+- holdout sample validation (CAMBI delta from source, not job-global floor)
+- same-file history: re-queued files cap their bracket below known-failed CQs from prior runs
+- retry graceful fallback (max 4 retries) — sweep data preserved for future re-queues
+- **GPU VMAF without HDR tonemap**: the GPU's 8-bit requirement is met via `format=yuv420p` only — no tonemapping that would band gradients and create false CAMBI signals
 
 See [Quality policy](docs/quality-policy.md) for the decision model.
 
@@ -112,9 +118,19 @@ See [Quality policy](docs/quality-policy.md) for the decision model.
 
 The workflow writes learning data to an **SQLite database** (`vmaf_training.db`) after successful runs. Future files use that history to start with a better CQ bracket instead of cold-starting from the same wide range every time.
 
-The library `plugins/vmaf/_lib/vmafdb.js` manages two tables: `jobs` (source facts, decision, outcome) and `sweep_points` (the CQ→VMAF curve for each job). The predictor `plugins/vmaf/_lib/vmafpredict.js` pools sweep curves from similar past jobs to predict a CQ centre, then runs a sequential root-finding sweep — converging in ~2–3 transcodes. Legacy CSV files (`vmaf_results.csv`, `vmaf_cq_learning.csv`) are retained for backward compatibility.
+The library `plugins/vmaf/_lib/vmafdb.js` manages two tables: `jobs` (source facts, decision, outcome) and `sweep_points` (the CQ→VMAF curve for each job). The predictor `plugins/vmaf/_lib/vmafpredict.js` pools sweep curves from similar past jobs to predict a CQ centre, then runs a sequential root-finding sweep — converging in ~2–3 transcodes.
+
+**Same-file re-encode prior:** When a file is re-queued (manual or automatic), the predictor merges its own previous sweep curves into the similarity pool with artificially-elevated timestamps (+1 day future), giving them maximum recency weight. This makes re-encodes converge faster because the exact CQ→VMAF curve already exists.
+
+**Schema v5 — clip_vmafs:** Every sweep point now stores the raw per-clip VMAF scores as a JSON array. This enables backtesting the sequential sampler's stopping rule (mean CI, 1%-low coverage) against measured clip distributions — the key enabler for data-driven CQ budget optimisation.
+
+Legacy CSV files (`vmaf_results.csv`, `vmaf_cq_learning.csv`) are retained as sidecars; SQLite is the primary store.
 
 `data/seed/` contains aggregate warm-start priors. They are intentionally broad summaries, not raw transcode history. The seed priors help new installs avoid a completely blank model; your own local learning data should gradually become more important.
+
+## Changelog
+
+See [HANDOFF_vmaf_sqlite.md](HANDOFF_vmaf_sqlite.md) for a detailed change history.
 
 ## Documentation
 
