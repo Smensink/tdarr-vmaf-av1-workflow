@@ -28,11 +28,11 @@ var details = function () { return ({
             label: 'Max Parallel GPU VMAF',
             name: 'maxParallelGpuVmaf',
             type: 'number',
-            defaultValue: '2',
+            defaultValue: '3',
             inputUI: {
                 type: 'text',
             },
-            tooltip: 'Maximum number of GPU VMAF jobs to run concurrently (libvmaf_cuda). Keeps a small cap to avoid VRAM exhaustion. Default: 2',
+            tooltip: 'Maximum number of GPU VMAF jobs to run concurrently (libvmaf_cuda). Keep at or below testEncodingParameters pool size. RTX 5070 Ti handles 3 easily. Default: 3, clamp 1-6.',
         },
     ],
     outputs: [

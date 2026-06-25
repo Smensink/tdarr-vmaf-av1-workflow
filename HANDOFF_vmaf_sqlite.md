@@ -198,6 +198,14 @@ hand-written 3,007-line clean source. Replaced the bundled version with the clea
   `learnCQRanges` (superseded); minor echo text update.
 - `99-replace-ffmpeg.sh`: Minor echo text updates.
 
+### 18. maxParallelGpuVmaf default 2→3 — GPU VMAF parallelism
+
+`calculateVMAF` defaults to 2 concurrent GPU VMAF processes, but the testEncodingParameters encode pool is 3.
+For a job with 3 CQ candidates this means 2 batches (2+1) instead of 1 batch — adding ~290s of wait time.
+Bumped to **3** to match the encode pool. RTX 5070 Ti has VRAM headroom for 3 concurrent libvmaf_cuda instances.
+Also fixed the misleading tooltip that said "GPU VMAF always runs sequentially" (it never did; only the default
+was small).
+
 ---
 
 ## File inventory — live vs repo
@@ -208,7 +216,7 @@ hand-written 3,007-line clean source. Replaced the bundled version with the clea
 | `_lib/vmafpredict.js` | ✅ SYNCHRONISED | Same-file prior merging in selectCQFromDb + sampleStatsFromDb |
 | `_lib/backfill_metadata.js` | ✅ IN REPO | |
 | `_lib/recover_sweep_aggregates.js` | ✅ IN REPO | |
-| `calculateVMAF/1.0.0/index.js` | ✅ SYNCHRONISED | HDR tonemap removed, isHdrContent() deleted |
+|| `calculateVMAF/1.0.0/index.js` | ✅ SYNCHRONISED | HDR tonemap removed, isHdrContent() deleted, maxParallelGpuVmaf default 2→3 |
 | `extractVideoSamples/1.0.0/index.js` | ✅ SYNCHRONISED | Log cleanup (CSV→SQLite references), same-file file_path piping |
 | `testEncodingParameters/1.0.0/index.js` | ✅ SYNCHRONISED | Known-failed CQ avoidance, same-file file_path piping |
 | `selectBestParameters/1.0.0/index.js` | ✅ SYNCHRONISED | Clean source (3K lines, was 289K bundled), retry default 4 |
