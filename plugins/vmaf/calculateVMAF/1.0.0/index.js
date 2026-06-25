@@ -28,11 +28,11 @@ var details = function () { return ({
             label: 'Max Parallel GPU VMAF',
             name: 'maxParallelGpuVmaf',
             type: 'number',
-            defaultValue: '3',
+            defaultValue: '4',
             inputUI: {
                 type: 'text',
             },
-            tooltip: 'Maximum number of GPU VMAF jobs to run concurrently (libvmaf_cuda). Keep at or below testEncodingParameters pool size. RTX 5070 Ti handles 3 easily. Default: 3, clamp 1-6.',
+            tooltip: 'Maximum number of GPU VMAF jobs to run concurrently (libvmaf_cuda). Keep at or below testEncodingParameters pool size. RTX 5070 Ti handles 4 comfortably. Default: 4, clamp 1-6.',
         },
     ],
     outputs: [
@@ -912,7 +912,7 @@ var plugin = async function (args) {
     var execSync = require('child_process').execSync;
     
     var maxParallel = parseInt(args.inputs.maxParallelVmaf) || 4;
-    var maxParallelGpu = parseInt(args.inputs.maxParallelGpuVmaf) || 2;
+    var maxParallelGpu = parseInt(args.inputs.maxParallelGpuVmaf) || 4;
     if (maxParallelGpu < 1) maxParallelGpu = 1;
     if (maxParallelGpu > 6) maxParallelGpu = 6;
     var testResults = args.variables.vmafTestResults || [];
