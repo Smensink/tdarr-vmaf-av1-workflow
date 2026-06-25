@@ -294,6 +294,145 @@ var plugin = function (args) {
             pairsUsed: byCQ.length - 1
         };
     }
+
+
+    function getCQ(result) {
+        if (!result || !result.parameterSet || result.parameterSet.quality === undefined) return null;
+        var cq = Number(result.parameterSet.quality);
+        return isFinite(cq) ? cq : null;
+    }
+
+    function getCambiRisk(result) {
+        if (!result) return null;
+        var vals = [];
+        if (result.avgCAMBI !== null && result.avgCAMBI !== undefined && isFinite(Number(result.avgCAMBI))) vals.push(Number(result.avgCAMBI));
+        if (result.p95CAMBI !== null && result.p95CAMBI !== undefined && isFinite(Number(result.p95CAMBI))) vals.push(Number(result.p95CAMBI));
+        if (vals.length === 0) return null;
+        return Math.max.apply(null, vals);
+    }
+
+    function roundDownToStep(value, step) {
+        if (!isFinite(value)) return value;
+        return Math.floor(value / step) * step;
+    }
+
+    function estimateLowerCrossing(points, metricFn, limit, passWhenAtOrAbove) {
+        if (!points || points.length === 0 || !isFinite(limit)) return null;
+        var byCQ = points.filter(function(r) {
+            var cq = getCQ(r);
+            var y = metricFn(r);
+            return cq !== null && y !== null && y !== undefined && isFinite(Number(y));
+        }).sort(function(a, b) { return getCQ(a) - getCQ(b); });
+        if (byCQ.length === 0) return null;
+        function passes(y) { return passWhenAtOrAbove ? y >= limit : y <= limit; }
+        for (var i = 0; i < byCQ.length - 1; i++) {
+            var q1 = getCQ(byCQ[i]);
+            var q2 = getCQ(byCQ[i + 1]);
+            var y1 = Number(metricFn(byCQ[i]));
+            var y2 = Number(metricFn(byCQ[i + 1]));
+            if (passes(y1) !== passes(y2) && q2 !== q1 && y2 !== y1) {
+                return q1 + ((limit - y1) * (q2 - q1) / (y2 - y1));
+            }
+        }
+        var low = byCQ[0];
+        var lowCQ = getCQ(low);
+        var lowY = Number(metricFn(low));
+        if (passes(lowY)) return lowCQ;
+        if (byCQ.length >= 2) {
+            var next = byCQ[1];
+            var nextCQ = getCQ(next);
+            var nextY = Number(metricFn(next));
+            var slope = (nextY - lowY) / (nextCQ - lowCQ);
+            if (isFinite(slope) && Math.abs(slope) > 0.000001) {
+                return lowCQ + ((limit - lowY) / slope);
+            }
+        }
+        return lowCQ - cqStepSize;
+    }
+
+    function buildConstraintAwareLowerRetryPlan(results, testedCQMin, testedCQSet, cqStepSize, minVMAF, minFrameVMAF) {
+        var byCQ = (results || []).filter(function(r) { return getCQ(r) !== null; })
+            .sort(function(a, b) { return getCQ(a) - getCQ(b); });
+        if (byCQ.length === 0) return null;
+
+        var naturalMax = Math.max(16, testedCQMin - cqStepSize);
+        var maxUsefulCQ = naturalMax;
+        var notes = [];
+        var limiting = [];
+        var isHDR = args.variables.isHDR === true || args.variables.isDolbyVision === true || String(args.variables.color_trc || '').toLowerCase() === 'smpte2084';
+        var isAnimation = args.variables.vmafMediaIsAnimation === true;
+        var cambiLimit = isAnimation ? 6.0 : (isHDR ? 5.0 : 5.5);
+        var lowest = byCQ[0];
+        var lowestCQ = getCQ(lowest);
+        var lowestCambi = getCambiRisk(lowest);
+
+        if (lowest.avgVMAF !== null && lowest.avgVMAF !== undefined && Number(lowest.avgVMAF) < minVMAF) {
+            var vmafCross = estimateLowerCrossing(byCQ, function(r) { return Number(r.avgVMAF); }, minVMAF, true);
+            if (vmafCross !== null && isFinite(vmafCross)) {
+                maxUsefulCQ = Math.min(maxUsefulCQ, roundDownToStep(vmafCross, cqStepSize));
+                limiting.push('VMAF≈CQ' + vmafCross.toFixed(1));
+            }
+        }
+        if (minFrameVMAF > 0) {
+            var floorMetric = function(r) {
+                if (r.vmafP1Low !== null && r.vmafP1Low !== undefined && isFinite(Number(r.vmafP1Low))) return Number(r.vmafP1Low);
+                if (r.minVMAF !== null && r.minVMAF !== undefined && isFinite(Number(r.minVMAF))) return Number(r.minVMAF);
+                return null;
+            };
+            var lowFloor = floorMetric(lowest);
+            if (lowFloor !== null && lowFloor < minFrameVMAF) {
+                var floorCross = estimateLowerCrossing(byCQ, floorMetric, minFrameVMAF, true);
+                if (floorCross !== null && isFinite(floorCross)) {
+                    maxUsefulCQ = Math.min(maxUsefulCQ, roundDownToStep(floorCross, cqStepSize));
+                    limiting.push('1%low≈CQ' + floorCross.toFixed(1));
+                }
+            }
+        }
+        if (lowestCambi !== null && lowestCambi > cambiLimit) {
+            var cambiCross = estimateLowerCrossing(byCQ, getCambiRisk, cambiLimit, false);
+            if (cambiCross !== null && isFinite(cambiCross)) {
+                maxUsefulCQ = Math.min(maxUsefulCQ, roundDownToStep(cambiCross, cqStepSize));
+                limiting.push('CAMBI≈CQ' + cambiCross.toFixed(1));
+                notes.push('lowest tested CQ ' + lowestCQ + ' still failed CAMBI risk ' + lowestCambi.toFixed(2) + ' > ' + cambiLimit.toFixed(1));
+            }
+        }
+
+        var candidates = [];
+        var seen = {};
+        function addCandidate(cq) {
+            cq = Math.round(Number(cq));
+            if (cq < 16 || cq > 51 || testedCQSet[cq] || seen[cq]) return;
+            candidates.push(cq);
+            seen[cq] = true;
+        }
+
+        if (maxUsefulCQ < 16) {
+            notes.push('extrapolated useful CQ boundary below encoder floor; probing lowest legal CQ values only');
+            for (var lowProbe = 16; lowProbe < testedCQMin && candidates.length < 6; lowProbe += cqStepSize) {
+                addCandidate(lowProbe);
+            }
+        } else {
+            var usefulMax = Math.min(naturalMax, Math.max(16, roundDownToStep(maxUsefulCQ, cqStepSize)));
+            for (var cq = usefulMax; cq >= 16 && candidates.length < 6; cq -= cqStepSize) {
+                addCandidate(cq);
+            }
+            candidates.sort(function(a, b) { return a - b; });
+        }
+
+        // If the extrapolated boundary was very low and the first loop produced too few probes,
+        // add low-end points only. Never add points at/above the lowest known failed CQ.
+        for (var fill = 16; fill < testedCQMin && candidates.length < 3; fill += cqStepSize) {
+            addCandidate(fill);
+        }
+        candidates.sort(function(a, b) { return a - b; });
+        return {
+            candidates: candidates,
+            limiting: limiting,
+            notes: notes,
+            maxUsefulCQ: maxUsefulCQ,
+            naturalMax: naturalMax
+        };
+    }
     
     // Handle sweep retry triggered by monitorTranscodeRetry
     if (sweepRetryTriggered) {
@@ -534,44 +673,30 @@ var plugin = function (args) {
             
             shouldRetry = true;
             
-            var shiftAmount = 4;
+            var lowerPlan = buildConstraintAwareLowerRetryPlan(aggregatedResults, testedCQMin, testedCQSet, cqStepSize, minVMAF, minFrameVMAF);
+            var untestedCQs = lowerPlan && lowerPlan.candidates ? lowerPlan.candidates : [];
+            if (lowerPlan) {
+                if (lowerPlan.limiting.length > 0) {
+                    args.jobLog('Constraint-aware retry boundary: ' + lowerPlan.limiting.join(', ') +
+                        ' (natural max below tested CQ=' + lowerPlan.naturalMax + ', selected max=' + lowerPlan.maxUsefulCQ + ')');
+                }
+                for (var lp = 0; lp < lowerPlan.notes.length; lp++) {
+                    args.jobLog('  ' + lowerPlan.notes[lp]);
+                }
+            }
             if (hasTranscodeFailures) {
-                shiftAmount = 6;
-                args.jobLog('Transcode failures detected - using larger CQ shift');
+                args.jobLog('Transcode failures detected - retry candidates remain constrained below known failed/unsafe CQ values');
             }
             
-            var proposedCQMin = Math.max(16, testedCQMin - shiftAmount);
-            var proposedCQMax = Math.max(16, testedCQMax - shiftAmount);
-            
-            // Filter out already-tested CQ values
-            var untestedCQs = [];
-            for (var cq = proposedCQMin; cq <= proposedCQMax; cq += 2) {
-                if (!testedCQSet[cq]) {
-                    untestedCQs.push(cq);
-                }
-            }
-            
-            // Expand downward if needed
-            var expandedMin = proposedCQMin;
-            while (expandedMin >= 16 && untestedCQs.length < 3) {
-                expandedMin -= 2;
-                if (expandedMin >= 16 && !testedCQSet[expandedMin]) {
-                    untestedCQs.unshift(expandedMin);
-                }
-            }
-            
-            if (untestedCQs.length >= 3) {
+            if (untestedCQs.length > 0) {
                 newCQMin = Math.min.apply(null, untestedCQs);
                 newCQMax = Math.max.apply(null, untestedCQs);
-                args.jobLog('New CQ range (untested only): ' + newCQMin + ' - ' + newCQMax);
+                args.variables.vmafNextCQs = untestedCQs.slice(0, 6);
+                args.jobLog('New CQ range (constraint-aware, untested only): ' + newCQMin + ' - ' + newCQMax);
                 args.jobLog('Untested CQs: ' + untestedCQs.join(', '));
-            } else if (untestedCQs.length > 0) {
-                newCQMin = Math.min.apply(null, untestedCQs);
-                newCQMax = Math.max.apply(null, untestedCQs);
-                args.jobLog('Limited untested CQs available: ' + untestedCQs.join(', '));
             } else {
                 shouldRetry = false;
-                retryReason = 'No untested CQ values available in lower range';
+                retryReason = 'No untested CQ values available below constraint boundary';
                 args.jobLog('⚠ ' + retryReason);
             }
         }
