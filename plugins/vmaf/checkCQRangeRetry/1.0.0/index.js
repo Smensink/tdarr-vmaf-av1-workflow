@@ -357,6 +357,7 @@ var plugin = function (args) {
 
         var naturalMax = Math.max(16, testedCQMin - cqStepSize);
         var maxUsefulCQ = naturalMax;
+        var bindingCQ = naturalMax;
         var notes = [];
         var limiting = [];
         var isHDR = args.variables.isHDR === true || args.variables.isDolbyVision === true || String(args.variables.color_trc || '').toLowerCase() === 'smpte2084';
@@ -366,12 +367,15 @@ var plugin = function (args) {
         var lowestCQ = getCQ(lowest);
         var lowestCambi = getCambiRisk(lowest);
 
+        function applyBinding(rawCQ, label) {
+            if (rawCQ === null || rawCQ === undefined || !isFinite(rawCQ)) return;
+            bindingCQ = Math.min(bindingCQ, rawCQ);
+            maxUsefulCQ = Math.min(maxUsefulCQ, roundDownToStep(rawCQ, cqStepSize));
+            limiting.push(label + '≈CQ' + rawCQ.toFixed(1));
+        }
+
         if (lowest.avgVMAF !== null && lowest.avgVMAF !== undefined && Number(lowest.avgVMAF) < minVMAF) {
-            var vmafCross = estimateLowerCrossing(byCQ, function(r) { return Number(r.avgVMAF); }, minVMAF, true);
-            if (vmafCross !== null && isFinite(vmafCross)) {
-                maxUsefulCQ = Math.min(maxUsefulCQ, roundDownToStep(vmafCross, cqStepSize));
-                limiting.push('VMAF≈CQ' + vmafCross.toFixed(1));
-            }
+            applyBinding(estimateLowerCrossing(byCQ, function(r) { return Number(r.avgVMAF); }, minVMAF, true), 'VMAF');
         }
         if (minFrameVMAF > 0) {
             var floorMetric = function(r) {
@@ -381,54 +385,55 @@ var plugin = function (args) {
             };
             var lowFloor = floorMetric(lowest);
             if (lowFloor !== null && lowFloor < minFrameVMAF) {
-                var floorCross = estimateLowerCrossing(byCQ, floorMetric, minFrameVMAF, true);
-                if (floorCross !== null && isFinite(floorCross)) {
-                    maxUsefulCQ = Math.min(maxUsefulCQ, roundDownToStep(floorCross, cqStepSize));
-                    limiting.push('1%low≈CQ' + floorCross.toFixed(1));
-                }
+                applyBinding(estimateLowerCrossing(byCQ, floorMetric, minFrameVMAF, true), '1%low');
             }
         }
         if (lowestCambi !== null && lowestCambi > cambiLimit) {
-            var cambiCross = estimateLowerCrossing(byCQ, getCambiRisk, cambiLimit, false);
-            if (cambiCross !== null && isFinite(cambiCross)) {
-                maxUsefulCQ = Math.min(maxUsefulCQ, roundDownToStep(cambiCross, cqStepSize));
-                limiting.push('CAMBI≈CQ' + cambiCross.toFixed(1));
-                notes.push('lowest tested CQ ' + lowestCQ + ' still failed CAMBI risk ' + lowestCambi.toFixed(2) + ' > ' + cambiLimit.toFixed(1));
-            }
+            applyBinding(estimateLowerCrossing(byCQ, getCambiRisk, cambiLimit, false), 'CAMBI');
+            notes.push('lowest tested CQ ' + lowestCQ + ' still failed CAMBI risk ' + lowestCambi.toFixed(2) + ' > ' + cambiLimit.toFixed(1));
         }
 
         var candidates = [];
         var seen = {};
+        var maxCandidates = 4;
+        var highestAllowedCQ = Math.min(naturalMax, testedCQMin - cqStepSize);
         function addCandidate(cq) {
             cq = Math.round(Number(cq));
-            if (cq < 16 || cq > 51 || testedCQSet[cq] || seen[cq]) return;
+            if (cq < 16 || cq > highestAllowedCQ || cq > 51 || testedCQSet[cq] || seen[cq]) return;
             candidates.push(cq);
             seen[cq] = true;
         }
 
-        if (maxUsefulCQ < 16) {
-            notes.push('extrapolated useful CQ boundary below encoder floor; probing lowest legal CQ values only');
-            for (var lowProbe = 16; lowProbe < testedCQMin && candidates.length < 6; lowProbe += cqStepSize) {
-                addCandidate(lowProbe);
+        // Probe tightly around the inferred binding CQ so the next selector can interpolate
+        // the ideal transcode CQ. This is deliberately not a 6-point sweep.
+        var base = roundDownToStep(bindingCQ, cqStepSize);
+        [base - cqStepSize, base, base + cqStepSize, base + (2 * cqStepSize)].forEach(function(cq) {
+            if (candidates.length < maxCandidates) addCandidate(cq);
+        });
+
+        // If the binding CQ is outside the legal/untested interval, fill only the nearest edge
+        // values. Example: CAMBI extrapolates CQ10 but NVENC floor is 16 -> test CQ16 and CQ18,
+        // not 16..26.
+        if (candidates.length < 2 && highestAllowedCQ >= 16) {
+            var edgeStart = bindingCQ < 16 ? 16 : highestAllowedCQ;
+            if (bindingCQ < 16) {
+                for (var up = edgeStart; up <= highestAllowedCQ && candidates.length < 2; up += cqStepSize) {
+                    addCandidate(up);
+                }
+                notes.push('extrapolated binding CQ below encoder floor; probing nearest legal CQ values only');
+            } else {
+                for (var down = edgeStart; down >= 16 && candidates.length < 2; down -= cqStepSize) {
+                    addCandidate(down);
+                }
             }
-        } else {
-            var usefulMax = Math.min(naturalMax, Math.max(16, roundDownToStep(maxUsefulCQ, cqStepSize)));
-            for (var cq = usefulMax; cq >= 16 && candidates.length < 6; cq -= cqStepSize) {
-                addCandidate(cq);
-            }
-            candidates.sort(function(a, b) { return a - b; });
         }
 
-        // If the extrapolated boundary was very low and the first loop produced too few probes,
-        // add low-end points only. Never add points at/above the lowest known failed CQ.
-        for (var fill = 16; fill < testedCQMin && candidates.length < 3; fill += cqStepSize) {
-            addCandidate(fill);
-        }
         candidates.sort(function(a, b) { return a - b; });
         return {
             candidates: candidates,
             limiting: limiting,
             notes: notes,
+            bindingCQ: bindingCQ,
             maxUsefulCQ: maxUsefulCQ,
             naturalMax: naturalMax
         };
@@ -678,7 +683,7 @@ var plugin = function (args) {
             if (lowerPlan) {
                 if (lowerPlan.limiting.length > 0) {
                     args.jobLog('Constraint-aware retry boundary: ' + lowerPlan.limiting.join(', ') +
-                        ' (natural max below tested CQ=' + lowerPlan.naturalMax + ', selected max=' + lowerPlan.maxUsefulCQ + ')');
+                        ' (natural max below tested CQ=' + lowerPlan.naturalMax + ', binding CQ=' + lowerPlan.bindingCQ.toFixed(1) + ', selected max=' + lowerPlan.maxUsefulCQ + ')');
                 }
                 for (var lp = 0; lp < lowerPlan.notes.length; lp++) {
                     args.jobLog('  ' + lowerPlan.notes[lp]);
