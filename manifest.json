@@ -120,6 +120,25 @@
       "version": "1.0.0",
       "source": "tdarr-local-plugin-runtime-copy",
       "path": "plugins/filter/checkFileAge/1.0.0/index.js"
+    },
+    {
+      "name": "acquireGpuPipelineLock",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/acquireGpuPipelineLock/1.0.0/index.js"
+    },
+    {
+      "name": "releaseGpuPipelineLock",
+      "version": "1.0.0",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/releaseGpuPipelineLock/1.0.0/index.js"
+    }
+  ],
+  "support_files": [
+    {
+      "name": "_lib/gpuPipelineLock.js",
+      "source": "patched-host-source",
+      "path": "plugins/vmaf/_lib/gpuPipelineLock.js"
     }
   ]
 }

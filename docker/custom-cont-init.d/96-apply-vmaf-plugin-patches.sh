@@ -33,4 +33,12 @@ apply_patch_file 'selectBestParameters/1.0.0'
 apply_patch_file 'checkCQRangeRetry/1.0.0'
 apply_patch_file 'learnCQRange/1.0.0'
 apply_patch_file 'fetchMediaMetadata/1.0.0'
+apply_patch_file 'acquireGpuPipelineLock/1.0.0'
+apply_patch_file 'releaseGpuPipelineLock/1.0.0'
+
+if [ -d "$PATCH_ROOT/_lib" ]; then
+  chmod 666 "$PATCH_ROOT"/_lib/*.js 2>/dev/null || true
+  echo 'VMAF shared helper library available at /custom-cont-init.d/vmaf-plugin-patches/_lib'
+fi
+
 echo '=== VMAF plugin patches complete ==='
