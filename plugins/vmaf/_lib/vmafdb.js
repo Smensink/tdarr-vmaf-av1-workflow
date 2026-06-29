@@ -17,7 +17,7 @@
  */
 
 var DEFAULT_DB_PATH = '/app/configs/vmaf_training.db';
-var SCHEMA_VERSION = 5;
+var SCHEMA_VERSION = 6;
 
 // ── Column whitelists (writers ignore unknown keys; readers map by name) ──
 var JOB_COLUMNS = [
@@ -25,7 +25,7 @@ var JOB_COLUMNS = [
   'source_codec', 'source_width', 'source_height', 'source_bitrate_mbps',
   'bits_per_pixel', 'source_duration_sec', 'pixel_format', 'bit_depth', 'is_hdr',
   'color_primaries', 'color_trc', 'colorspace', 'tier',
-  'media_genre', 'media_is_animation', 'media_type', 'media_year',
+  'media_genre', 'media_is_animation', 'media_type', 'media_year', 'media_title',
   'media_metadata_source', 'media_source_type', 'release_group', 'network', 'original_language',
   'source_cambi', 'source_cambi_p95',
   'grain', 'spatial_info', 'temporal_info', 'dark_fraction', 'luma_avg',
@@ -202,6 +202,16 @@ function _migrate(db) {
     db.exec('ALTER TABLE sweep_points ADD COLUMN clip_vmafs TEXT;');
     db.exec('PRAGMA user_version = 5;');
   }
+  if (v < 6) {
+    // Series/show title (the SxxExx-stripped name for TV; movie title for film). A strong, encode-
+    // pipeline-stable similarity signal: episodes of one show share source master/grain/grade, so
+    // their CQ->VMAF curves cluster (measured within-series selected_cq std ~3.3 vs tier-wide ~6.4;
+    // eta^2 ~0.30, beats release_group/genre). Used only as a curve-pooling WEIGHT in weightForPoint,
+    // so the decision stays target-independent (re-derived from the pooled curve at the live target).
+    // Null on backfilled rows whose filename was unavailable.
+    db.exec('ALTER TABLE jobs ADD COLUMN media_title TEXT;');
+    db.exec('PRAGMA user_version = 6;');
+  }
 }
 
 function _coerce(v) {
@@ -317,8 +327,8 @@ function getSimilarSweepCurves(db, src, opts) {
     'SELECT s.cq, s.vmaf_mean, s.vmaf_harmonic_mean, s.vmaf_min, s.vmaf_max, s.vmaf_p1_low, s.vmaf_stddev,' +
     '       s.ssim, s.cambi_mean, s.cambi_max, s.cambi_p95, s.avg_size_mb, s.sample_count, s.parameter_set_id,' +
     '       j.job_id, j.timestamp, j.tier, j.source_codec, j.bits_per_pixel,' +
-    '       j.media_genre, j.media_is_animation, j.media_type, j.media_year, j.release_group,' +
-    '       j.is_hdr, j.network, j.original_language, j.target_min_vmaf, j.source_cambi' +
+    '       j.media_genre, j.media_is_animation, j.media_type, j.media_year, j.media_title, j.release_group,' +
+    '       j.is_hdr, j.network, j.original_language, j.target_min_vmaf, j.source_cambi, j.source_cambi_p95' +
     ' FROM sweep_points s JOIN jobs j ON s.job_id = j.job_id';
   if (where.length) sql += ' WHERE ' + where.join(' AND ');
   sql += ' ORDER BY j.timestamp DESC LIMIT ?';
@@ -341,8 +351,8 @@ function getSameFileSweepCurves(db, filePath, opts) {
     'SELECT s.cq, s.vmaf_mean, s.vmaf_harmonic_mean, s.vmaf_min, s.vmaf_max, s.vmaf_p1_low, s.vmaf_stddev,' +
     '       s.ssim, s.cambi_mean, s.cambi_max, s.cambi_p95, s.avg_size_mb, s.sample_count, s.parameter_set_id,' +
     '       j.job_id, j.timestamp, j.tier, j.source_codec, j.bits_per_pixel,' +
-    '       j.media_genre, j.media_is_animation, j.media_type, j.media_year, j.release_group,' +
-    '       j.is_hdr, j.network, j.original_language, j.target_min_vmaf, j.source_cambi' +
+    '       j.media_genre, j.media_is_animation, j.media_type, j.media_year, j.media_title, j.release_group,' +
+    '       j.is_hdr, j.network, j.original_language, j.target_min_vmaf, j.source_cambi, j.source_cambi_p95' +
     ' FROM sweep_points s JOIN jobs j ON s.job_id = j.job_id' +
     ' WHERE j.file_path = ? AND s.vmaf_mean IS NOT NULL' +
     ' ORDER BY j.timestamp DESC LIMIT ?';

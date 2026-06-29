@@ -1,14 +1,12 @@
-# Tdarr VMAF/AV1 System — Change Handoff (as of 2026-06-25)
+# Tdarr VMAF/AV1 System — Change Handoff (as of 2026-06-29)
 
 ## TL;DR current state
 
-Phase 4 A/B-shadow has been **promoted to ACTING** since last handoff. Since ACTING went live, seven additional
-features have been deployed: (1) schema v5 with per-clip VMAF logging, (2) same-file re-encode prior — re-queued
-files consult their own CQ→VMAF curve first, (3) known-failed CQ avoidance — retry brackets cap below previous
-misses, (4) constraint-aware optimum bracketing — stops VMAF-mean expansion when a binding constraint (1%-low
-or CAMBI) already bounds the optimum, (5) HDR tonemap removal from GPU VMAF — GPU's 8-bit req is met via
-`format=yuv420p` only, avoiding false CAMBI from tonemap banding, (6) retry limit 2→4 with graceful fallback
-(instead of `throw`), (7) DB self-healing handle — closed-DB crash after previous close() calls fixed.
+Phase 4 ACTING remains live. Newest live+repo state adds schema v6 `media_title` learning, source-CAMBI p95
+similarity, constraint-aware predictor labels, bounded parallel sample encodes, a final-transcode watchdog, and a
+live Tdarr flow fix for the GPU pipeline lock. The lock bypass was caused by three stale direct flow edges
+(`retry1→test1`, `checkCQBracket→test1`, `monitorRetry1→transcode1`) that coexisted with the lock nodes; those
+edges are now removed in live Tdarr and replaced with edges through `gpuLockAcquire1` / `gpuLockAcquireTranscode1`.
 
 GPU VMAF fallback is **not occurring** — the high-CPU is from NVENC quality-maximising settings, not VMAF slow paths.
 
@@ -198,36 +196,88 @@ hand-written 3,007-line clean source. Replaced the bundled version with the clea
   `learnCQRanges` (superseded); minor echo text update.
 - `99-replace-ffmpeg.sh`: Minor echo text updates.
 
-### 18. maxParallelGpuVmaf default 2→3 — GPU VMAF parallelism
+### 18. maxParallelGpuVmaf default 2→4 — GPU VMAF parallelism
 
-`calculateVMAF` defaults to 2 concurrent GPU VMAF processes, but the testEncodingParameters encode pool is 3.
-For a job with 3 CQ candidates this means 2 batches (2+1) instead of 1 batch — adding ~290s of wait time.
-Bumped to **3** to match the encode pool. RTX 5070 Ti has VRAM headroom for 3 concurrent libvmaf_cuda instances.
+`calculateVMAF` previously defaulted to 2 concurrent GPU VMAF processes, below the live encode pool and below the
+RTX 5070 Ti's measured safe headroom. It now defaults to **4**, giving one extra scoring slot for retry/holdout
+bursts while staying inside the 1–6 clamp.
 Also fixed the misleading tooltip that said "GPU VMAF always runs sequentially" (it never did; only the default
 was small).
 
 ---
 
+
+## What changed in the third session (live + repo, 2026-06-29)
+
+### 19. Schema v6 — canonical `media_title` similarity
+
+`vmafdb.js` bumps schema 5→6 and adds `jobs.media_title`. `fetchMediaMetadata` derives a canonical
+filename title (`SxxExx` stripped for TV, movie title for films) and `exportVMAFResults` writes it to SQLite.
+`vmafpredict.learnFeatureWeights()` and `weightForPoint()` now include `media_title`; exact same-show/movie
+matches keep full weight while other titles are discounted. This reflects the observed signal that episodes of
+one show share source master/grain/grade and have tighter CQ clustering than broad tier-wide priors.
+
+### 20. Source banding risk uses p95 CAMBI
+
+`getSimilarSweepCurves()` / `getSameFileSweepCurves()` now SELECT `source_cambi_p95` as well as mean
+`source_cambi`. Predictor similarity uses `max(source_cambi, source_cambi_p95)` so dark/gradient-heavy files
+match on the banding value that actually tends to bind the CAMBI gate. `calculateVMAF` job summaries now log
+`CAMBI(avg/p95/max)` to remove the old “mean looks fine, p95 rejected” ambiguity.
+
+### 21. Constraint-aware predictor labels + safer retry extrapolation
+
+`vmafpredict.constraintAwareOptimum()` lets each neighbour job contribute the binding CQ implied by VMAF mean,
+1%-low, and CAMBI where that neighbour has enough data; otherwise it falls back to the prior VMAF-mean crossing.
+`checkCQRangeRetry` now caps CAMBI extrapolation below the tested range (default 6 CQ) so a shallow high-CQ CAMBI
+slope cannot over-shoot to absurdly low retries such as CQ16–18 when the real boundary is near CQ30.
+
+### 22. Bounded parallel sample encodes
+
+`testEncodingParameters` is now async and uses a bounded `maxParallelEncodes` worker pool with `spawn()` instead
+of synchronous serial `execSync()` sample encodes. It records per-task failures, rejects near-empty outputs, and
+keeps Tdarr worker progress/ETA updated while preserving the existing `maxParallelEncodes` clamp.
+
+### 23. Final transcode watchdog
+
+`vmafOptimizedTranscode` sets a hard wall-clock timeout for the final FFmpeg process: `2 × source duration`,
+clamped to 30 minutes–4 hours. If a pathological final encode stalls while holding the GPU pipeline lock, Node
+SIGKILLs FFmpeg, the normal failure output routes through `releaseGpuPipelineLock`, and the queue is not wedged.
+
+### 24. GPU pipeline lock live-flow bypass fixed
+
+Investigation found the repo flow was correctly locked, but the live Tdarr DB still had stale direct edges in
+addition to the lock nodes:
+
+- removed `edge6b: retry1:1 → test1`; added `edge6b_to_gpuLockAcquire1: retry1:1 → gpuLockAcquire1`
+- removed `rLWbQzi1W: checkCQBracket:2 → test1`; added `rLWbQzi1W_to_gpuLockAcquire1`
+- removed `edge7d: monitorRetry1:1 → transcode1`; added `edge7d_to_gpuLockAcquireTranscode1`
+
+Live fix was applied through Tdarr's `/api/v2/cruddb` endpoint on port 8266 (not direct SQLite; direct opens can
+fail with `unable to open database file` while the server owns the DB). Verification after update: 42 edges,
+no missing required lock edges, and zero remaining direct bypass edges. A DB copy backup and a flow JSON backup
+were created before the live edit.
+
+---
 ## File inventory — live vs repo
 
 | Path | Status | Notes |
 |------|--------|-------|
-| `_lib/vmafdb.js` | ✅ SYNCHRONISED | Schema v5 (clip_vmafs), self-healing handle, getSameFileSweepCurves, is_hdr in SELECT |
-| `_lib/vmafpredict.js` | ✅ SYNCHRONISED | Same-file prior merging in selectCQFromDb + sampleStatsFromDb |
+| `_lib/vmafdb.js` | ✅ SYNCHRONISED | Schema v6 (`media_title`), clip_vmafs, self-healing handle, getSameFileSweepCurves, source_cambi_p95 in SELECT |
+| `_lib/vmafpredict.js` | ✅ SYNCHRONISED | Same-file prior, media_title weighting, source CAMBI p95 risk, constraint-aware neighbour labels |
 | `_lib/backfill_metadata.js` | ✅ IN REPO | |
 | `_lib/recover_sweep_aggregates.js` | ✅ IN REPO | |
-|| `calculateVMAF/1.0.0/index.js` | ✅ SYNCHRONISED | HDR tonemap removed, isHdrContent() deleted, maxParallelGpuVmaf default 2→3 |
-| `extractVideoSamples/1.0.0/index.js` | ✅ SYNCHRONISED | Log cleanup (CSV→SQLite references), same-file file_path piping |
-| `testEncodingParameters/1.0.0/index.js` | ✅ SYNCHRONISED | Known-failed CQ avoidance, same-file file_path piping |
+| `calculateVMAF/1.0.0/index.js` | ✅ SYNCHRONISED | HDR tonemap removed, CAMBI avg/p95/max logging, maxParallelGpuVmaf default 4 |
+| `extractVideoSamples/1.0.0/index.js` | ✅ SYNCHRONISED | Same-file file_path piping, source_cambi_p95 predictor input |
+| `testEncodingParameters/1.0.0/index.js` | ✅ SYNCHRONISED | Async bounded encode pool, known-failed CQ avoidance, media_title/source_cambi_p95 predictor inputs |
 | `selectBestParameters/1.0.0/index.js` | ✅ SYNCHRONISED | Clean source (3K lines, was 289K bundled), retry default 4 |
-| `exportVMAFResults/1.0.0/index.js` | ✅ SYNCHRONISED | clip_vmafs sparkline field |
+| `exportVMAFResults/1.0.0/index.js` | ✅ SYNCHRONISED | clip_vmafs, media_title write |
 | `checkCQBracket/1.0.0/index.js` | ✅ SYNCHRONISED | Constraint-aware bracket check |
-| `checkCQRangeRetry/1.0.0/index.js` | ✅ SYNCHRONISED | maxRetries 2→4, graceful fallback |
-| `fetchMediaMetadata/1.0.0/index.js` | ✅ SAME | |
+| `checkCQRangeRetry/1.0.0/index.js` | ✅ SYNCHRONISED | maxRetries 4, graceful fallback, CAMBI extrapolation cap |
+| `fetchMediaMetadata/1.0.0/index.js` | ✅ SYNCHRONISED | canonical `vmafSeriesTitle` / `media_title` extraction |
 | `learnCQRange/1.0.0/index.js` | ✅ SAME | |
 | `learnCQRange/1.0.0/ema_cq_state.json` | ✅ IN REPO | |
 | `checkHdrContent/1.0.0/index.js` | ✅ SAME | |
-| `vmafOptimizedTranscode/1.0.0/index.js` | ✅ SAME | |
+| `vmafOptimizedTranscode/1.0.0/index.js` | ✅ SYNCHRONISED | final-transcode watchdog timeout |
 | `docker/custom-cont-init.d/96-apply-vmaf-plugin-patches.sh` | ✅ SYNCHRONISED | Added fetchMediaMetadata, removed learnCQRanges |
 | `docker/custom-cont-init.d/99-replace-ffmpeg.sh` | ✅ SAME | |
 | `flow/vmafOptimization.js` | ✅ IN REPO | |
@@ -264,6 +314,9 @@ Same-file history: N CQ(s) failed VMAF target       ← known-failed CQ avoidanc
 Same-file prior merged: N rows                      ← same-file re-encode prior (vmafpredict)
 CQ RANGE EXHAUSTED (non-fatal)                      ← graceful fallback (checkCQRangeRetry)
 GPU VMAF (libvmaf_cuda): available                  ← no HDR tonemap (calculateVMAF)
+CAMBI(avg/p95/max)=…                                ← p95/worst-case CAMBI visible
+Transcode watchdog: hard timeout …                  ← final-transcode watchdog active
+=== Acquire GPU Pipeline Lock ===                   ← every retry/final-transcode entry passes through the lock
 ```
 
 ---
@@ -312,4 +365,6 @@ docker exec tdarr node /custom-cont-init.d/vmaf-plugin-patches/_lib/test_vmafpre
   `SELECT 1` before returning), but the correct pattern is to never close it at all.
 - `getSimilarSweepCurves` now excludes rows where `vmaf_min > vmaf_max` or `vmaf_mean` is outside
   `[vmaf_min, vmaf_max]` by default — these were ~92% of historical rows due to CSV column drift.
+- If two GPU workers appear to bypass the lock, inspect the live flow edges — stale direct edges can coexist with lock nodes. Required entries are `retry1:1→gpuLockAcquire1`, `checkCQBracket:2→gpuLockAcquire1`, and `monitorRetry1:1→gpuLockAcquireTranscode1`; there must be no direct `retry1→test1`, `checkCQBracket→test1`, or `monitorRetry1→transcode1`.
+- For live flow edits, prefer Tdarr's `/api/v2/cruddb` on port 8266 and back up the flow JSON first. Direct SQLite opens from sidecar scripts can fail with `unable to open database file` while Tdarr owns the DB.
 - Full design doc: `C:\\Users\\seb_m\\.claude\\plans\\shimmying-beaming-hamster.md`.

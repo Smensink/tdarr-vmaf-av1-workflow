@@ -143,12 +143,13 @@ var details = function () { return ({
     ],
 }); };
 exports.details = details;
-var plugin = function (args) {
+var plugin = async function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
     var fs = require('fs');
     var path = require('path');
     var execSync = require('child_process').execSync;
+    var spawn = require('child_process').spawn;
 
 // Maps color primaries/TRC/matrix to integer values for av1_metadata bitstream filter.
 function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
@@ -523,14 +524,24 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
             media_genre: args.variables.vmafMediaGenre || null,
             media_type: args.variables.vmafMediaType || null,
             media_year: args.variables.vmafMediaYear || null,
+            media_title: args.variables.vmafSeriesTitle || null,
             release_group: args.variables.vmafReleaseGroup || null,
             network: args.variables.vmafNetwork || null,
             original_language: args.variables.vmafOriginalLanguage || null,
             source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null),
+            source_cambi_p95: (args.variables.vmafSourceCAMBIP95 != null ? Number(args.variables.vmafSourceCAMBIP95) : null),
             file_path: (args.inputFileObj && args.inputFileObj.file) || (args.inputFileObj && args.inputFileObj._id) || null
         };
         var _curves = _vdb.getSimilarSweepCurves(_db, _src, { limit: 20000 });
-        var _ctr = _vp.predictCQCenter(_curves, _src, { targetVmaf: _tgt }, { recencyHalfLifeDays: 0 });
+        // Binding-constraint floors for the constraint-aware centre. These activate predictCQCenter's
+        // per-neighbour bindingTargetCQ ONLY for neighbours whose curve carries 1%-low / CAMBI (sparse
+        // today, accruing via the dual-write); all other neighbours keep the VMAF-mean crossing, so the
+        // centre is unchanged until the data fills in, then it self-corrects for banding/grain-bound
+        // content. Floors mirror the live selection gates (1%-low 88; CAMBI 6.0 anim / 5.0 HDR / 5.5 SDR).
+        var _vmafFloor = Number(args.variables.vmafMinFrameVMAF) || Number(args.inputs && args.inputs.minFrameVMAF) || 88;
+        var _cambiFloor = (args.variables.vmafMediaIsAnimation === true) ? 6.0 : (args.variables.isHDR ? 5.0 : 5.5);
+        var _ctr = _vp.predictCQCenter(_curves, _src, { targetVmaf: _tgt },
+            { recencyHalfLifeDays: 0, vmafFloor: _vmafFloor, cambiFloor: _cambiFloor, maxLabelExtrap: 5 });
         var _sc = _vp.selectSampleCount(_curves, { slope: (_ctr && _ctr.priorSlope != null) ? _ctr.priorSlope : -0.4, cqPrecision: 0.75, distMinSamples: 4 });
         args.jobLog('[PREDICT] predictCQCenter=' + (_ctr.centerCq != null ? _ctr.centerCq : 'n/a')
             + (_ctr.sigmaCq != null ? ' +-' + _ctr.sigmaCq : '')
@@ -658,112 +669,120 @@ function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
         args.updateWorker({ percentage: 0 });
     }
     
+    // Run every encode (paramSet x sample) through a bounded-concurrency pool so several NVENC
+    // sessions stay busy at once. A single av1_nvenc pass leaves the encoder + decoder idle during
+    // multipass passes and serial cuvid decode, so running ~3 concurrently is ~2.5x faster wall-clock
+    // than the old one-at-a-time execSync loop (benchmarked on 4K HDR). Encode FLAGS are unchanged
+    // (they MUST match the final transcode) - only scheduling changes. Tune via
+    // inputs.maxParallelEncodes / variables.vmafMaxParallelEncodes (default 3, clamped 1-6).
+    var maxParallelEncodes = Math.max(1, Math.min(6,
+        Number(args.inputs.maxParallelEncodes) || Number(args.variables.vmafMaxParallelEncodes) || 3));
+    args.jobLog('Encoding in parallel: up to ' + maxParallelEncodes + ' concurrent NVENC sessions');
+
+    var encodeTasks = [];
     for (var psi = 0; psi < parameterSets.length; psi++) {
-        var paramSet = parameterSets[psi];
         for (var si = 0; si < samples.length; si++) {
-            var sample = samples[si];
-            var container = path.extname(sample).slice(1);
-            var outputPath = cacheDir + '/test_' + paramSet.id + '_s' + (si + 1) + '.' + container;
-            
-            // Update progress at start of each encode
-            var currentProgress = Math.round((completedTests / totalTests) * 100);
-            if (args.updateWorker) {
-                args.updateWorker({ 
-                    percentage: currentProgress,
-                    ETA: Math.round((totalTests - completedTests) * 15) // Estimate ~15 seconds per encode
-                });
-            }
-            
-            var cmd = '"' + args.ffmpegPath + '"';
-            if (paramSet.isGPU && paramSet.encoder.indexOf('av1_nvenc') !== -1) {
-                cmd += ' -hwaccel cuda';
-            }
-            cmd += ' -i "' + sample + '" -c:v ' + paramSet.encoder;
-            if (paramSet.isGPU && paramSet.encoder.indexOf('av1_nvenc') !== -1) {
-                cmd += ' -pix_fmt ' + paramSet.pixFmt;
-                cmd += ' -rc vbr -cq ' + paramSet.quality + ' -b:v 0';
-                cmd += ' -preset ' + paramSet.preset + ' ' + nvencFlagArgs;
-                cmd += ' -g 96 -forced-idr 1';
-                cmd += ' -color_primaries ' + paramSet.colorPrimaries;
-                cmd += ' -color_trc ' + paramSet.colorTrc;
-                cmd += ' -colorspace ' + paramSet.colorspace;
-                var av1Meta = av1ColorMetadataArgs(paramSet.colorPrimaries, paramSet.colorTrc, paramSet.colorspace);
-                cmd += ' -bsf:v ' + av1Meta.bsf + (av1Meta.tags || '');
-                // av1_nvenc in this FFmpeg build does not expose -master_display/-max_cll encoder options.
-                // Static HDR metadata is logged/exported by the flow, while the encoded AV1 stream carries
-                // color primaries/TRC/matrix signalling via the supported color options above.
-                cmd += ' -max_muxing_queue_size 4096';
-            }
-            cmd += ' -an -y "' + outputPath + '"';
-            args.jobLog('Testing: ' + paramSet.id + ' on sample ' + (si + 1));
-            var startTime = Date.now();
-            try {
-                execSync(cmd, { stdio: 'pipe' });
-                var endTime = Date.now();
-                var encodingTime = (endTime - startTime) / 1000;
-                var fileSize = 0;
-                try {
-                    var stats = fs.statSync(outputPath);
-                    fileSize = stats.size / (1024 * 1024);
-                } catch (e) {
-                    args.jobLog('Could not get file size for ' + outputPath);
-                }
-                // A near-empty output means the encode produced no frames (e.g. the
-                // input sample had no video packets) even though ffmpeg exited 0.
-                // Treat it as a failure so it cannot poison the VMAF stage.
-                if (fileSize * 1024 * 1024 < 20000) {
-                    encodeFailures.push({
-                        parameterSetId: paramSet.id,
-                        sampleIndex: si,
-                        error: 'Output file is empty/near-empty (' + (fileSize * 1024).toFixed(1) + ' KB) - no video frames encoded',
-                        outputPath: outputPath
-                    });
-                    args.jobLog('  Failed: output is empty/near-empty (' + (fileSize * 1024).toFixed(1) + ' KB) - input sample likely has no video');
-                    completedTests++;
-                    continue;
-                }
-                testResults.push({
-                    parameterSetId: paramSet.id,
-                    sampleIndex: si,
-                    outputPath: outputPath,
-                    fileSizeMB: fileSize,
-                    encodingTimeSeconds: encodingTime,
-                    parameterSet: paramSet,
-                    originalSamplePath: sample,
-                });
-                args.jobLog('  Size: ' + fileSize.toFixed(2) + ' MB, Time: ' + encodingTime.toFixed(1) + 's');
-                completedTests++;
-                
-                // Update progress after each completed encode
-                var progressPercent = Math.round((completedTests / totalTests) * 100);
-                args.jobLog('  Progress: ' + completedTests + '/' + totalTests + ' encodes [' + progressPercent + '%]');
-                if (args.updateWorker) {
-                    args.updateWorker({ 
-                        percentage: progressPercent,
-                        ETA: Math.round((totalTests - completedTests) * encodingTime) // Use actual encode time for better ETA
-                    });
-                }
-            } catch (err) {
-                // CRITICAL FIX #2: Track encoding failures
-                var stdoutTail = err.stdout ? err.stdout.toString().slice(-1200) : '';
-                var stderrTail = err.stderr ? err.stderr.toString().slice(-1200) : '';
-                var detailedError = (stderrTail || stdoutTail || err.message).trim();
-                encodeFailures.push({
-                    parameterSetId: paramSet.id,
-                    sampleIndex: si,
-                    error: err.message,
-                    stderrTail: stderrTail,
-                    stdoutTail: stdoutTail,
-                    outputPath: outputPath
-                });
-                args.jobLog('  Failed: ' + err.message);
-                if (detailedError) {
-                    args.jobLog('  FFmpeg error tail: ' + detailedError.replace(/\s+/g, ' ').substring(0, 500));
-                }
-                completedTests++;
-            }
+            encodeTasks.push({ paramSet: parameterSets[psi], sampleIndex: si, sample: samples[si] });
         }
     }
+
+    function buildEncodeCmd(paramSet, sample, outputPath) {
+        var cmd = '"' + args.ffmpegPath + '"';
+        if (paramSet.isGPU && paramSet.encoder.indexOf('av1_nvenc') !== -1) {
+            cmd += ' -hwaccel cuda';
+        }
+        cmd += ' -i "' + sample + '" -c:v ' + paramSet.encoder;
+        if (paramSet.isGPU && paramSet.encoder.indexOf('av1_nvenc') !== -1) {
+            cmd += ' -pix_fmt ' + paramSet.pixFmt;
+            cmd += ' -rc vbr -cq ' + paramSet.quality + ' -b:v 0';
+            cmd += ' -preset ' + paramSet.preset + ' ' + nvencFlagArgs;
+            cmd += ' -g 96 -forced-idr 1';
+            cmd += ' -color_primaries ' + paramSet.colorPrimaries;
+            cmd += ' -color_trc ' + paramSet.colorTrc;
+            cmd += ' -colorspace ' + paramSet.colorspace;
+            var av1Meta = av1ColorMetadataArgs(paramSet.colorPrimaries, paramSet.colorTrc, paramSet.colorspace);
+            cmd += ' -bsf:v ' + av1Meta.bsf + (av1Meta.tags || '');
+            // av1_nvenc in this FFmpeg build does not expose -master_display/-max_cll encoder options.
+            // Static HDR metadata is logged/exported by the flow, while the encoded AV1 stream carries
+            // color primaries/TRC/matrix signalling via the supported color options above.
+            cmd += ' -max_muxing_queue_size 4096';
+        }
+        cmd += ' -an -y "' + outputPath + '"';
+        return cmd;
+    }
+
+    function runEncodeTask(task) {
+        return new Promise(function (resolve) {
+            var paramSet = task.paramSet, si = task.sampleIndex, sample = task.sample;
+            var container = path.extname(sample).slice(1);
+            var outputPath = cacheDir + '/test_' + paramSet.id + '_s' + (si + 1) + '.' + container;
+            var cmd = buildEncodeCmd(paramSet, sample, outputPath);
+            args.jobLog('Testing: ' + paramSet.id + ' on sample ' + (si + 1));
+            var startTime = Date.now();
+            var child = spawn(cmd, { shell: true });
+            var stderrTail = '';
+            if (child.stderr) child.stderr.on('data', function (d) {
+                stderrTail += d.toString();
+                if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
+            });
+            child.on('error', function (e) {
+                resolve({ paramSet: paramSet, sampleIndex: si, sample: sample, outputPath: outputPath,
+                    ok: false, error: e.message, stderrTail: stderrTail, encodingTime: (Date.now() - startTime) / 1000 });
+            });
+            child.on('close', function (code) {
+                resolve({ paramSet: paramSet, sampleIndex: si, sample: sample, outputPath: outputPath,
+                    ok: code === 0, error: code === 0 ? null : ('ffmpeg exited with code ' + code),
+                    stderrTail: stderrTail, encodingTime: (Date.now() - startTime) / 1000 });
+            });
+        });
+    }
+
+    function handleEncodeResult(r) {
+        completedTests++;
+        if (!r.ok) {
+            encodeFailures.push({ parameterSetId: r.paramSet.id, sampleIndex: r.sampleIndex,
+                error: r.error || 'encode failed', stderrTail: r.stderrTail, outputPath: r.outputPath });
+            args.jobLog('  Failed (' + r.paramSet.id + ' s' + (r.sampleIndex + 1) + '): ' + (r.error || 'encode failed'));
+            var det = (r.stderrTail || '').trim();
+            if (det) args.jobLog('  FFmpeg error tail: ' + det.replace(/\s+/g, ' ').substring(0, 500));
+        } else {
+            var fileSize = 0;
+            try { fileSize = fs.statSync(r.outputPath).size / (1024 * 1024); }
+            catch (e) { args.jobLog('Could not get file size for ' + r.outputPath); }
+            // A near-empty output means the encode produced no frames (e.g. the input sample had no
+            // video packets) even though ffmpeg exited 0. Treat as failure so it can't poison VMAF.
+            if (fileSize * 1024 * 1024 < 20000) {
+                encodeFailures.push({ parameterSetId: r.paramSet.id, sampleIndex: r.sampleIndex,
+                    error: 'Output file is empty/near-empty (' + (fileSize * 1024).toFixed(1) + ' KB) - no video frames encoded',
+                    outputPath: r.outputPath });
+                args.jobLog('  Failed: output is empty/near-empty (' + (fileSize * 1024).toFixed(1) + ' KB) - input sample likely has no video');
+            } else {
+                testResults.push({ parameterSetId: r.paramSet.id, sampleIndex: r.sampleIndex,
+                    outputPath: r.outputPath, fileSizeMB: fileSize, encodingTimeSeconds: r.encodingTime,
+                    parameterSet: r.paramSet, originalSamplePath: r.sample });
+                args.jobLog('  Done: ' + r.paramSet.id + ' s' + (r.sampleIndex + 1) + ' -> ' + fileSize.toFixed(2) + ' MB, ' + r.encodingTime.toFixed(1) + 's');
+            }
+        }
+        var progressPercent = Math.round((completedTests / totalTests) * 100);
+        args.jobLog('  Progress: ' + completedTests + '/' + totalTests + ' encodes [' + progressPercent + '%]');
+        if (args.updateWorker) {
+            args.updateWorker({ percentage: progressPercent,
+                ETA: Math.round((totalTests - completedTests) * (r.encodingTime || 15) / maxParallelEncodes) });
+        }
+    }
+
+    // Bounded-concurrency worker pool: maxParallelEncodes workers, each pulls the next task on finish.
+    var _encIdx = 0;
+    function _encWorker() {
+        if (_encIdx >= encodeTasks.length) return Promise.resolve();
+        var task = encodeTasks[_encIdx++];
+        return runEncodeTask(task).then(function (r) { handleEncodeResult(r); return _encWorker(); });
+    }
+    var _encWorkers = [];
+    for (var _ew = 0; _ew < Math.min(maxParallelEncodes, encodeTasks.length); _ew++) {
+        _encWorkers.push(_encWorker());
+    }
+    await Promise.all(_encWorkers);
     
     // Report 100% completion
     if (args.updateWorker) {

@@ -1400,11 +1400,17 @@ var plugin = async function (args) {
             clipVmafs: item.vmafScores,
         });
         
+        // Show CAMBI as avg/p95/max, not just the mean: selection rejects on the WORST-CASE
+        // (max(mean,p95)), so printing only the mean made "CAMBI=2.18" then "rejected CAMBI 5.59"
+        // look contradictory. The p95/max is the banding the selector (and the viewer) actually cares about.
         args.jobLog(key + ': VMAF=' + avgVMAF.toFixed(2) + ', 1%low=' +
             (overallP1 !== null ? overallP1.toFixed(2) : 'N/A') + ', Min=' +
             (overallMin !== null ? overallMin.toFixed(2) : 'N/A') + ', SSIM=' +
-            (avgSSIM !== null ? avgSSIM.toFixed(2) : 'N/A') + ', CAMBI=' +
-            (avgCAMBI !== null ? avgCAMBI.toFixed(2) : 'N/A') + ', Size=' + avgSize.toFixed(2) + 'MB');
+            (avgSSIM !== null ? avgSSIM.toFixed(2) : 'N/A') + ', CAMBI(avg/p95/max)=' +
+            (avgCAMBI !== null ? avgCAMBI.toFixed(2) : 'N/A') + '/' +
+            (p95CAMBI !== null ? p95CAMBI.toFixed(2) : 'N/A') + '/' +
+            (maxCAMBI !== null ? maxCAMBI.toFixed(2) : 'N/A') +
+            ', Size=' + avgSize.toFixed(2) + 'MB');
     }
     
     args.variables.vmafAggregatedResults = aggregatedResults;

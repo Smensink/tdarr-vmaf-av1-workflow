@@ -311,11 +311,23 @@ var plugin = async function (args) {
                     }
                     
                     _a.trys.push([0, 2, , 3]);
-                    
+
+                    // WATCHDOG: hard wall-clock cap on the FINAL transcode so a pathologically slow encode
+                    // (e.g. NVDEC decode-fallback to CPU software decode -> a few fps -> 10+ hours) can't run
+                    // forever holding the GPU pipeline lock and blocking the queue. Cap = 2x the source
+                    // runtime, clamped to 30min..4h. On expiry Node SIGKILLs ffmpeg -> non-zero exit ->
+                    // failure path (outputNumber 2) -> the flow's Release GPU Pipeline Lock node frees the
+                    // lock and the job fails cleanly + re-queues, instead of wedging the whole node.
+                    var _srcDur = parseFloat(args.inputFileObj && args.inputFileObj.ffProbeData
+                        && args.inputFileObj.ffProbeData.format && args.inputFileObj.ffProbeData.format.duration) || 0;
+                    var _capMs = Math.round(Math.min(14400, Math.max(1800, _srcDur * 2.0)) * 1000);
+                    args.jobLog('Transcode watchdog: hard timeout ' + Math.round(_capMs / 60000) + ' min'
+                        + ' (source ' + Math.round(_srcDur) + 's x2, clamped 30min-4h) -> SIGKILL if exceeded');
+
                     cli = new cliUtils_1.CLI({
                         cli: args.ffmpegPath,
                         spawnArgs: spawnArgs,
-                        spawnOpts: {},
+                        spawnOpts: { timeout: _capMs, killSignal: 'SIGKILL' },
                         jobLog: args.jobLog,
                         outputFilePath: outputPath,
                         inputFileObj: args.inputFileObj,

@@ -1,6 +1,6 @@
 # Tdarr VMAF AV1 Workflow
 
-**GitHub description:** Tdarr AV1 NVENC workflow with FFmpeg/libvmaf CUDA container, VMAF/CAMBI-guided CQ sweeps with per-file sequential sampling, η²-learned metadata similarity weights, holdout CAMBI self-comparison, constraint-aware optimum bracketing, same-file re-encode prior, known-failed CQ avoidance, retry graceful fallback (max 4), and data-integrity-filtered SQLite learning.
+**GitHub description:** Tdarr AV1 NVENC workflow with FFmpeg/libvmaf CUDA container, VMAF/CAMBI-guided CQ sweeps with per-file sequential sampling, η²-learned metadata/show-title similarity weights, constraint-aware quality labels, holdout CAMBI self-comparison, GPU pipeline locking, final-transcode watchdog, same-file re-encode prior, known-failed CQ avoidance, retry graceful fallback (max 4), and data-integrity-filtered SQLite learning.
 
 This project is a Tdarr workflow for people who want **measured, per-title AV1 quality decisions** instead of a fixed CRF/CQ preset. It extends the usual Tdarr pattern of "if file matches rules, run one transcode command" into a quality-search pipeline:
 
@@ -40,7 +40,7 @@ This workflow uses those ideas practically inside Tdarr: VMAF estimates perceptu
 ## How the project is organized
 
 - `docker/` — compose example, Dockerfile, init hooks, and FFmpeg/libvmaf build recipe
-- `plugins/vmaf/_lib/` — shared Node.js libraries: `vmafdb.js` (SQLite data layer, v5 schema with clip_vmafs, data-integrity filters, same-file history queries, self-healing DB handle), `vmafpredict.js` (CQ predictor with η²-learned weights, sequential sampling, correlationRatio, same-file prior merging), `backfill_metadata.js`, `recover_sweep_aggregates.js`, backfill scripts, and analysis tools
+- `plugins/vmaf/_lib/` — shared Node.js libraries: `vmafdb.js` (SQLite data layer, v6 schema with `media_title`, clip_vmafs, data-integrity filters, same-file history queries, self-healing DB handle), `vmafpredict.js` (CQ predictor with η²-learned weights, show-title similarity, constraint-aware optimum labels, sequential sampling, correlationRatio, same-file prior merging), `gpuPipelineLock.js`, backfill scripts, and analysis tools
 - `scripts/` — patch scripts applied during development (`patch_learning_holdout.py`, `patch_meanmin_sampling.py`, `patch_quality_guard.py`, `remove_hard_sample_floor.py`)
 - `plugins/vmaf/` — Tdarr Local Flow Plugins (`vmaf/` category)
 - `plugins/filter/checkFileAge/` — age-gate plugin (`filter/` category)
@@ -83,14 +83,16 @@ preflight checks
   → optional metadata lookup
   → HDR / stream metadata detection
   → representative sample extraction
-  → candidate AV1 NVENC sample encodes
+  → acquire shared GPU pipeline lock
+  → candidate AV1 NVENC sample encodes (bounded-concurrency pool)
   → VMAF/CAMBI scoring with sequential sampling (per-file early-stop)
   → constraint-aware bracket check (optimum bounded by 1%-low/CAMBI floor, not VMAF crossing)
   → CQ range expansion if the target is not bracketed
   → candidate selection with quality and size guards
   → holdout validation (self-comparing source CAMBI)
   → retry logic with known-failed CQ avoidance (caps bracket below previous misses)
-  → final AV1 NVENC transcode
+  → final AV1 NVENC transcode (watchdog-capped at 2× source duration, clamped 30 min–4 h)
+  → release shared GPU pipeline lock before post-processing
   → result export to SQLite (primary) + CSV sidecar with per-clip VMAF logging
   → CQ learning
   → cleanup
@@ -109,6 +111,8 @@ The final CQ is not chosen from VMAF mean alone. A candidate must survive severa
 - **constraint-aware bracket**: when all candidates meet quality constraints but a higher-CQ candidate fails one, the optimum is bracketed without VMAF-mean expansion
 - holdout sample validation (CAMBI delta from source, not job-global floor)
 - same-file history: re-queued files cap their bracket below known-failed CQs from prior runs
+- learned show-title similarity (`media_title`) so episodes from the same series pool curves strongly
+- source-banding risk based on `max(source_cambi, source_cambi_p95)` instead of mean alone
 - retry graceful fallback (max 4 retries) — sweep data preserved for future re-queues
 - **GPU VMAF without HDR tonemap**: the GPU's 8-bit requirement is met via `format=yuv420p` only — no tonemapping that would band gradients and create false CAMBI signals
 
@@ -122,7 +126,9 @@ The library `plugins/vmaf/_lib/vmafdb.js` manages two tables: `jobs` (source fac
 
 **Same-file re-encode prior:** When a file is re-queued (manual or automatic), the predictor merges its own previous sweep curves into the similarity pool with artificially-elevated timestamps (+1 day future), giving them maximum recency weight. This makes re-encodes converge faster because the exact CQ→VMAF curve already exists.
 
-**Schema v5 — clip_vmafs:** Every sweep point now stores the raw per-clip VMAF scores as a JSON array. This enables backtesting the sequential sampler's stopping rule (mean CI, 1%-low coverage) against measured clip distributions — the key enabler for data-driven CQ budget optimisation.
+**Schema v5 — clip_vmafs:** Every sweep point stores the raw per-clip VMAF scores as a JSON array. This enables backtesting the sequential sampler's stopping rule (mean CI, 1%-low coverage) against measured clip distributions — the key enabler for data-driven CQ budget optimisation.
+
+**Schema v6 — media_title:** Jobs now store a canonical filename-derived show/movie title. The predictor treats exact same-title matches as a strong similarity signal, because episodes from the same series tend to share source masters, grain, grade, and CQ→VMAF curve shape.
 
 Legacy CSV files (`vmaf_results.csv`, `vmaf_cq_learning.csv`) are retained as sidecars; SQLite is the primary store.
 

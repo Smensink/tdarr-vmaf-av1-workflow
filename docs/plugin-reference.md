@@ -22,7 +22,7 @@ Checks the FFmpeg encoder list for NVIDIA hardware encoders such as `av1_nvenc`.
 
 ### `fetchMediaMetadata`
 
-Optionally enriches the job with media metadata from Plex/TMDB/TVDB. The quality model can use content class signals such as animation/live-action, source type, year, and genre. If API inputs are blank or lookups fail, the workflow falls back to filename and stream-derived heuristics.
+Optionally enriches the job with media metadata from Plex/TMDB/TVDB. The quality model can use content class signals such as animation/live-action, source type, year, genre, and a canonical filename-derived `media_title` used for same-show/movie curve similarity. If API inputs are blank or lookups fail, the workflow falls back to filename and stream-derived heuristics.
 
 ### `checkHdrContent`
 
@@ -47,7 +47,7 @@ Important details:
 
 ### `testEncodingParameters`
 
-Builds candidate parameter sets and encodes the extracted samples, normally using AV1 NVENC. The main variable under test is CQ. The output is a set of small encoded samples ready for quality measurement.
+Builds candidate parameter sets and encodes the extracted samples, normally using AV1 NVENC. The main variable under test is CQ. Sample encodes run through a bounded async worker pool (`maxParallelEncodes`) and reject near-empty outputs so bad samples cannot poison later VMAF scoring.
 
 ### `calculateVMAF`
 
@@ -61,7 +61,7 @@ Looks at the measured CQ sweep and asks: did the tested values actually surround
 
 ### `checkCQRangeRetry`
 
-Handles retry decisions when the CQ range or selection result is inadequate. It is VMAF-aware: retries are based on measured quality, not just on whether FFmpeg succeeded.
+Handles retry decisions when the CQ range or selection result is inadequate. It is VMAF/1%-low/CAMBI-aware: retries are based on the measured binding quality boundary, with CAMBI extrapolation capped so a shallow high-CQ slope cannot jump to absurdly low retry CQs.
 
 ## Selection and transcode plugins
 
@@ -86,7 +86,11 @@ The selected CQ is the most efficient candidate that still clears the quality an
 
 ### `vmafOptimizedTranscode`
 
-Runs the final full-file AV1 NVENC transcode using the chosen parameters. It preserves relevant HDR/color metadata where supported and reports progress back to Tdarr.
+Runs the final full-file AV1 NVENC transcode using the chosen parameters. It preserves relevant HDR/color metadata where supported, reports progress back to Tdarr, and uses a hard watchdog timeout (`2×` source duration, clamped 30 min–4 h) so a pathological encode cannot hold the GPU pipeline lock forever.
+
+### `acquireGpuPipelineLock` / `releaseGpuPipelineLock`
+
+Serialise GPU-heavy stages across multiple Tdarr GPU workers. The flow acquires the lock before sample encodes/VMAF and before final transcode, releases it immediately after final transcode, and allows post-processing/copy/notify work to overlap the next worker's pre-GPU preparation. The acquire plugin is re-entrant for the same job token so retry loops do not self-deadlock.
 
 ### `monitorTranscodeRetry`
 
@@ -96,7 +100,7 @@ Tracks final transcode failures and decides whether a retry should use a previou
 
 ### `exportVMAFResults`
 
-Writes detailed per-candidate and per-file quality/size data to CSV (legacy path) and dual-writes the sweep curve to SQLite via `vmafdb.js`. The SQLite record includes VMAF, CAMBI, 1%-low VMAF, SSIM, and the source/decision context — signals the legacy CSV never stored. This is useful for later analysis and for improving the learning model.
+Writes detailed per-candidate and per-file quality/size data to CSV (legacy path) and dual-writes the sweep curve to SQLite via `vmafdb.js`. The SQLite record includes VMAF, CAMBI, 1%-low VMAF, SSIM, clip-level VMAF arrays, `media_title`, and the source/decision context — signals the legacy CSV never stored. This is useful for later analysis and for improving the learning model.
 
 ### `learnCQRange`
 

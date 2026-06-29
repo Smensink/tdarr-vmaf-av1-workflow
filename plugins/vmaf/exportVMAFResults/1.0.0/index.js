@@ -662,6 +662,7 @@ var plugin = function (args) {
             media_is_animation: mediaIsAnimation ? 1 : 0,
             media_type: mediaType,
             media_year: parseInt(mediaYear) || null,
+            media_title: args.variables.vmafSeriesTitle || null,
             media_metadata_source: mediaMetadataSource,
             media_source_type: mediaSourceType,
             release_group: releaseGroup,

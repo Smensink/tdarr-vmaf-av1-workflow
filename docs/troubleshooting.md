@@ -71,6 +71,18 @@ Start with a small test set before applying the flow to a large library.
 
 Leave Plex/TMDB/TVDB inputs blank in `fetchMediaMetadata`, or remove that plugin from your flow. The rest of the workflow has filename/stream-metadata fallbacks, though quality decisions may be less content-aware.
 
+## GPU workers appear to bypass the pipeline lock
+
+Do not just check that the lock nodes exist — stale direct edges can coexist with them. In the active flow, these entries must route through acquire nodes:
+
+```text
+retry1:1          -> gpuLockAcquire1 -> test1
+checkCQBracket:2 -> gpuLockAcquire1 -> test1
+monitorRetry1:1  -> gpuLockAcquireTranscode1 -> transcode1
+```
+
+There must be no direct `retry1 -> test1`, `checkCQBracket -> test1`, or `monitorRetry1 -> transcode1` edges. If the live Tdarr DB needs patching, back up the flow JSON and use Tdarr's `/api/v2/cruddb` endpoint on port 8266; sidecar direct SQLite writes may fail while Tdarr owns the DB.
+
 ## Licensing / binary image warning
 
 If your FFmpeg configure output includes `--enable-nonfree`, do not redistribute the built binary/image unless you have independently confirmed redistribution is allowed.

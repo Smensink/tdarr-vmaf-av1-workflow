@@ -5590,6 +5590,7 @@ var plugin = function (args) {
             network: args.variables.vmafNetwork || null,
             original_language: args.variables.vmafOriginalLanguage || null,
             source_cambi: (args.variables.vmafSourceCAMBI != null ? Number(args.variables.vmafSourceCAMBI) : null),
+            source_cambi_p95: (args.variables.vmafSourceCAMBIP95 != null ? Number(args.variables.vmafSourceCAMBIP95) : null),
             file_path: (args.inputFileObj && args.inputFileObj._id) || null
         };
         var _curvesS = _vdbS.getSimilarSweepCurves(_dbS, _srcS, { limit: 20000 });

@@ -102,7 +102,7 @@ function learnFeatureWeights(items, opts) {
   // which fields to even look at). media_year is decade-bucketed; numeric covariates (bpp,
   // source_cambi) are handled by proximity kernels in weightForPoint, not here.
   var fields = ['media_genre', 'media_type', 'network', 'original_language', 'source_codec',
-                'release_group', 'media_year'];
+                'release_group', 'media_year', 'media_title'];
   var vals = [];
   for (var i = 0; i < items.length; i++) vals.push(Number(items[i].opt));
   var penalty = {}, etaSquared = {};
@@ -185,14 +185,29 @@ function weightForPoint(src, row, opts) {
   if (src.release_group && row.release_group) {
     w *= (String(src.release_group).toLowerCase() === String(row.release_group).toLowerCase()) ? 1.0 : _P('release_group', 0.85);
   }
+  // series/show title = the strongest available similarity signal: episodes of one show share the
+  // same source master/grain/grade, so their CQ->VMAF curves cluster (within-series selected_cq std
+  // ~3.3 vs tier-wide ~6.4; eta^2 ~0.30). Exact match (same show) keeps full weight; other shows are
+  // discounted to the learned penalty (cold-start 0.75 ~= the eta^2-derived value so it's continuous).
+  if (src.media_title && row.media_title) {
+    w *= (String(src.media_title).toLowerCase() === String(row.media_title).toLowerCase()) ? 1.0 : _P('media_title', 0.75);
+  }
   // release year proximity (older content grades/grains differently); guard implausible parsed years
   var syr = Number(src.media_year), hyr = Number(row.media_year);
   if (isFinite(syr) && isFinite(hyr) && syr >= 1900 && hyr >= 1900) {
     var dyr = syr - hyr; w *= Math.exp(-(dyr * dyr) / (2 * 15 * 15));
   }
-  // source banding proximity (numeric; already-banded sources tolerate a lower cq before the floor binds)
-  var ssc = Number(src.source_cambi), hsc = Number(row.source_cambi);
-  if (isFinite(ssc) && isFinite(hsc)) {
+  // Source banding proximity (numeric). Use worst-case source banding risk,
+  // max(mean CAMBI, p95 CAMBI), not mean alone: p95 is what usually binds the
+  // CAMBI gate on dark/gradient-heavy content. Older rows may only have mean.
+  function _sourceCambiRisk(obj) {
+    var m = Number(obj && obj.source_cambi);
+    var p95 = Number(obj && obj.source_cambi_p95);
+    var r = Math.max(isFinite(m) ? m : -Infinity, isFinite(p95) ? p95 : -Infinity);
+    return isFinite(r) ? r : null;
+  }
+  var ssc = _sourceCambiRisk(src), hsc = _sourceCambiRisk(row);
+  if (ssc !== null && hsc !== null) {
     var dsc = ssc - hsc; w *= Math.exp(-(dsc * dsc) / (2 * 3.0 * 3.0));
   }
 
@@ -599,6 +614,53 @@ function localSlopeAtTarget(points, target) {
 }
 
 /**
+ * One neighbour job's CONSTRAINT-AWARE optimum cq (the label predictCQCenter aggregates).
+ *
+ * STRICTLY GUARDED so it is a no-op on today's data: only when the neighbour's own curve actually
+ * carries the binding signal (>=2 points with vmaf_p1_low, or >=2 with CAMBI) AND the caller passed
+ * the matching floor does it use bindingTargetCQ = min(cq@vmaf_mean=target, cq@1%-low=floor,
+ * cq@CAMBI=floor) - the same fitted, target-independent binding the autoresearch harness validated.
+ * Otherwise (the ~99% of historical rows with no 1%-low/CAMBI yet) it falls back to the existing
+ * VMAF-mean crossing, so behaviour is unchanged until the dual-write data accrues, then it
+ * self-activates and pulls the centre down for the banding/grain-bound content the VMAF mean misses.
+ * The fitted binding is extrapolation-gated (maxLabelExtrap, default 5 CQ beyond the tested range)
+ * so a wild fit can't produce a garbage label - it falls back instead.
+ */
+function constraintAwareOptimum(rows, target, opts) {
+  opts = opts || {};
+  var nP1 = 0, nCambi = 0;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].vmaf_p1_low != null) nP1++;
+    if (rows[i].cambi_p95 != null || rows[i].cambi_mean != null) nCambi++;
+  }
+  var useP1 = nP1 >= 2 && opts.vmafFloor != null;
+  var useCambi = nCambi >= 2 && opts.cambiFloor != null;
+  if (useP1 || useCambi) {
+    var pts = rows.map(function (r) {
+      return {
+        cq: Number(r.cq), vmaf_mean: r.vmaf_mean, v: r.vmaf_mean,
+        vmaf_p1_low: r.vmaf_p1_low,
+        cambi: (r.cambi_p95 != null ? r.cambi_p95 : r.cambi_mean), cambi_p95: r.cambi_p95
+      };
+    });
+    var bt = bindingTargetCQ(pts, {
+      targetVmaf: target,
+      vmafFloor: useP1 ? Number(opts.vmafFloor) : null,
+      cambiFloor: useCambi ? Number(opts.cambiFloor) : null,
+      sourceCambi: rows[0].source_cambi, sourceCambiP95: rows[0].source_cambi_p95,
+      cambiTolerance: opts.cambiTolerance
+    });
+    if (bt && bt.cq != null && isFinite(bt.cq)) {
+      var cmin = Infinity, cmax = -Infinity;
+      for (var k = 0; k < pts.length; k++) { var c = pts[k].cq; if (isFinite(c)) { if (c < cmin) cmin = c; if (c > cmax) cmax = c; } }
+      var extrap = Math.max(0, cmin - bt.cq, bt.cq - cmax);
+      if (extrap <= (opts.maxLabelExtrap != null ? opts.maxLabelExtrap : 5)) return _clampCq(bt.cq);
+    }
+  }
+  return curveOptimalAtTarget(rows, target);
+}
+
+/**
  * Predict the sweep CENTRE + uncertainty + a content-specific PRIOR SLOPE from history
  * (Method B: weighted distribution of similar jobs' OWN optimal cq at the current target).
  * Backtest: centre MAE ~3.2 CQ, the best static estimator (beats pooling VMAF curves, which
@@ -620,7 +682,7 @@ function predictCQCenter(curveRows, src, constraints, opts) {
   var raw = [];
   for (var jid in jobs) {
     if (!Object.prototype.hasOwnProperty.call(jobs, jid)) continue;
-    var o0 = curveOptimalAtTarget(jobs[jid].rows, target);
+    var o0 = constraintAwareOptimum(jobs[jid].rows, target, opts);
     var sl0 = localSlopeAtTarget(jobs[jid].rows, target);
     if (o0 === null && sl0 === null) continue;
     raw.push({ o: o0, sl: sl0, f: jobs[jid].f });
@@ -779,6 +841,7 @@ module.exports = {
   effectiveCambiFloor: effectiveCambiFloor,
   bindingTargetCQ: bindingTargetCQ,
   curveOptimalAtTarget: curveOptimalAtTarget,
+  constraintAwareOptimum: constraintAwareOptimum,
   localSlopeAtTarget: localSlopeAtTarget,
   weightedStats: weightedStats,
   selectCQFromDb: selectCQFromDb,

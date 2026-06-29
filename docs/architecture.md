@@ -24,7 +24,7 @@ A usual Tdarr install often applies a static preset. This workflow instead build
 └──────────────────────┘
 ```
 
-The plugin code communicates through `args.variables`. Longer-lived learning state is stored in Tdarr's config directory as CSV/JSON files.
+The plugin code communicates through `args.variables`. Longer-lived learning state is stored in Tdarr's config directory, primarily in SQLite (`vmaf_training.db`), with legacy CSV/JSON sidecars retained for compatibility.
 
 ## High-level flow
 
@@ -34,12 +34,14 @@ preflight checks
   → HDR / stream metadata detection
   → sample extraction
   → candidate CQ range selection
+  → acquire shared GPU pipeline lock
   → sample encodes with AV1 NVENC
   → VMAF/CAMBI scoring
   → bracket expansion if needed
   → best-candidate selection
   → holdout validation
   → final full-file transcode
+  → release shared GPU pipeline lock before post-processing
   → result export
   → CQ-learning update
   → cleanup / retry bookkeeping
@@ -99,6 +101,10 @@ The A/B-shadow predictor has been promoted to full acting mode. The current acti
 - **Data integrity filter** — `getSimilarSweepCurves` (v4 schema) excludes physically-impossible rows (`vmaf_min>vmaf_max` or `vmaf_mean` outside `[min,max]`) by default. ~92% of historical CSV-backfill rows had these misalignments; `recover_sweep_aggregates.js` recomputed correct aggregates from per-sample columns, reducing violations from 17,956 to 107 (auto-excluded).
 
 - **Per-file sigma bounding** — `selectSampleCount` now plausibility-bounds per-clip sigma to [0.05, 6] with a floor of 3 clips. Previously inert despite being wired in; now actively adapts clip count to content variance.
+
+- **Show-title and source-banding similarity** — schema v6 adds `media_title`; the predictor treats exact same-show/movie matches as a strong prior and compares source banding by `max(source_cambi, source_cambi_p95)`.
+
+- **GPU pipeline lock** — flows can safely run two GPU workers for pipeline overlap while serialising GPU-heavy sections (`testEncodingParameters`, `calculateVMAF`, `vmafOptimizedTranscode`) through `acquireGpuPipelineLock` / `releaseGpuPipelineLock`.
 
 ### Additional _lib utilities
 

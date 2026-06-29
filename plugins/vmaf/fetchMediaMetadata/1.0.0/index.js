@@ -452,6 +452,18 @@ var plugin = function (args) {
         args.variables.vmafReleaseGroup = extractReleaseGroup(args.inputFileObj._id || '');
         args.variables.vmafNetwork = resolved.network || null;                 // -> jobs.network (encode-style proxy)
         args.variables.vmafOriginalLanguage = resolved.originalLanguage || null; // -> jobs.original_language
+        // Series/show title (SxxExx-stripped for TV, movie name for film) -> jobs.media_title. The
+        // strongest curve-pooling similarity signal: same-show episodes share source master/grain.
+        // Use the filename-derived title (not the API title) so it matches the filename-based backfill
+        // key. canonTitle collapses punctuation/separators + lowercases so dot- vs dash-delimited
+        // releases of one show share a key, and so the live path and the backfill are robust to any
+        // minor parser drift. KEEP canonTitle IN SYNC with _lib/backfill_media_title.js.
+        var canonTitle = function (t) {
+            if (!t) return null;
+            var s = String(t).toLowerCase().replace(/[\s._-]+/g, ' ').replace(/[^a-z0-9 ]+/g, '').replace(/\s+/g, ' ').trim();
+            return s || null;
+        };
+        args.variables.vmafSeriesTitle = canonTitle(filenameMeta.title);
         
         if (logMetadata) {
             args.jobLog('Metadata search inputs: title=' + filenameMeta.title + ', year=' + filenameMeta.year);

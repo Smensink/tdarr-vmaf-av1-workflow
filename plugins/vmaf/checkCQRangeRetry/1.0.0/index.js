@@ -316,7 +316,7 @@ var plugin = function (args) {
         return Math.floor(value / step) * step;
     }
 
-    function estimateLowerCrossing(points, metricFn, limit, passWhenAtOrAbove) {
+    function estimateLowerCrossing(points, metricFn, limit, passWhenAtOrAbove, maxExtrap) {
         if (!points || points.length === 0 || !isFinite(limit)) return null;
         var byCQ = points.filter(function(r) {
             var cq = getCQ(r);
@@ -344,7 +344,19 @@ var plugin = function (args) {
             var nextY = Number(metricFn(next));
             var slope = (nextY - lowY) / (nextCQ - lowCQ);
             if (isFinite(slope) && Math.abs(slope) > 0.000001) {
-                return lowCQ + ((limit - lowY) / slope);
+                var crossing = lowCQ + ((limit - lowY) / slope);
+                // EXTRAPOLATION CAP (no measured bracket -> projecting BELOW the tested range).
+                // The CQ->metric curves steepen toward lower CQ; CAMBI especially is nearly flat at
+                // high CQ then rises fast lower down. So the slope between the two LOWEST TESTED points
+                // is the shallowest part and badly over-extrapolates the crossing far too low (observed:
+                // CAMBI 5.59@CQ31 / 5.76@CQ36 -> extrapolated crossing ~CQ14 while the true binding was
+                // ~CQ29.6, which sent the retry overshooting to 16-18). Don't trust an extrapolation more
+                // than `maxExtrap` CQ below the lowest tested point; probe near the tested edge first and
+                // let the iterative retry walk lower if it still fails. Default loose (12) for the
+                // saturating VMAF metrics; CAMBI passes a tight 6.
+                var cap = isFinite(Number(maxExtrap)) ? Number(maxExtrap) : 12;
+                if (crossing < lowCQ - cap) crossing = lowCQ - cap;
+                return crossing;
             }
         }
         return lowCQ - cqStepSize;
@@ -389,7 +401,7 @@ var plugin = function (args) {
             }
         }
         if (lowestCambi !== null && lowestCambi > cambiLimit) {
-            applyBinding(estimateLowerCrossing(byCQ, getCambiRisk, cambiLimit, false), 'CAMBI');
+            applyBinding(estimateLowerCrossing(byCQ, getCambiRisk, cambiLimit, false, 6), 'CAMBI');
             notes.push('lowest tested CQ ' + lowestCQ + ' still failed CAMBI risk ' + lowestCambi.toFixed(2) + ' > ' + cambiLimit.toFixed(1));
         }
 
