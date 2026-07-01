@@ -2822,7 +2822,9 @@ var plugin = function (args) {
 
         if (bestParams.projectedOutputBpp !== undefined) {
 
-            args.jobLog('Projected output guard: ' + (bestParams.projectedOutputRatioPct || 0).toFixed(1) + '% source, '
+            args.jobLog('Sample-size projection (diagnostic/quality-risk only; live size monitor decides final size): '
+
+                + (bestParams.projectedOutputRatioPct || 0).toFixed(1) + '% source, '
 
                 + (bestParams.projectedOutputMbps || 0).toFixed(2) + ' Mbps, BPP ' + (bestParams.projectedOutputBpp || 0).toFixed(4));
 
@@ -2928,7 +2930,8 @@ var plugin = function (args) {
 
         var sourceDuration = 0;
 
-        var sourceFileSizeMB = args.inputFileObj.file_size || 0;
+        var sourceFileSizeRaw = Number(args.inputFileObj && args.inputFileObj.file_size || 0);
+        var sourceFileSizeMB = sourceFileSizeRaw > 1024 * 1024 ? (sourceFileSizeRaw / 1024 / 1024) : sourceFileSizeRaw;
 
         var bitsPerPixel = args.variables.vmafSourceBpp || 0;
 
@@ -3024,7 +3027,7 @@ var plugin = function (args) {
 
             vmaf_model_path: vmafModelPath,
 
-            actual_size_reduction_pct: 0, // Will be determined after transcode completes
+            actual_size_reduction_pct: null, // Unknown until a full-output size is measured
 
             met_vmaf_target: bestParams.avgVMAF >= minVMAF,
 
@@ -3034,7 +3037,13 @@ var plugin = function (args) {
 
               : null,
 
-          adaptive_frame_floor_used: adjustedMinFrameVMAF,met_size_target: false // Will be determined after transcode completes
+          adaptive_frame_floor_used: adjustedMinFrameVMAF,
+
+          met_size_target: null, // Unknown until a full-output size is measured
+
+          size_target_status: 'unknown',
+
+          projected_size_reduction_pct: bestParams.projectedOutputRatioPct !== undefined ? (100 - Number(bestParams.projectedOutputRatioPct)) : null
 
         };
 
