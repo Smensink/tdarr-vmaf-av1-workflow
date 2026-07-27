@@ -1,0 +1,100 @@
+name: tdarr-vmaf-av1
+
+services:
+  tdarr:
+    build:
+      context: ./runtime/vmaf-v1
+      dockerfile: Dockerfile.vmaf-v1-cpu
+      args:
+        TDARR_IMAGE: "${TDARR_IMAGE:-ghcr.io/haveagitgat/tdarr@sha256:e317124469a2f500add53733e2c501be5e23ca0a4a18e9606f4f80cb3d63370d}"
+    image: "${TDARR_WORKFLOW_IMAGE:-tdarr-vmaf-av1-workflow:local}"
+    container_name: "${TDARR_CONTAINER_NAME:-tdarr}"
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    ports:
+      - "127.0.0.1:${TDARR_WEB_PORT:-8265}:8265"
+      - "127.0.0.1:${TDARR_SERVER_PORT:-8266}:8266"
+    environment:
+      serverIP: "0.0.0.0"
+      serverURL: "http://127.0.0.1:8266"
+      serverPort: "8266"
+      webUIPort: "8265"
+      internalNode: "true"
+      inContainer: "true"
+      ffmpegVersion: ""
+      nodeName: "${TDARR_NODE_NAME:-vmaf-node}"
+      auth: "true"
+      seededApiKey: "${TDARR_API_KEY:?Set TDARR_API_KEY in .env}"
+      apiKey: "${TDARR_API_KEY:?Set TDARR_API_KEY in .env}"
+      openBrowser: "false"
+      maxLogSizeMB: "10"
+      TZ: "${TZ:-Etc/UTC}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+      NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-all}"
+      enableDockerAutoUpdater: "false"
+      LD_LIBRARY_PATH: "/usr/local/ffmpeg-custom/lib:/usr/local/lib:/usr/lib/x86_64-linux-gnu"
+      TDARR_GRAV1SYNTH: "/usr/local/bin/grav1synth"
+      TDARR_GRAIN_PIPELINE: "/opt/grain-pipeline/current/grain_pipeline_v5_direct.py"
+      TDARR_NVENCC: "/usr/local/bin/nvencc"
+      TDARR_NVENCC_COORDINATOR: "/usr/local/libexec/tdarr-nvencc-knn-ffmpeg.js"
+      TDARR_NVENCC_REQUIRED: "1"
+      VMAF_V1_WORK_ROOT: "/var/lib/tdarr-vmaf-score"
+      VMAF_POSTENCODE_CHECKPOINT_ROOT: "/temp/.vmaf-postencode-checkpoints-v1"
+      VMAF_POSTENCODE_REUSE_REQUIRED_ROOT: "/app/configs/vmaf-postencode-reuse-required-v1"
+      TDARR_FLOW_PARITY_BOOTSTRAP: "${TDARR_FLOW_PARITY_BOOTSTRAP:-0}"
+      TDARR_PLEX_URL: "${TDARR_PLEX_URL:-}"
+      TDARR_PLEX_TOKEN: "${TDARR_PLEX_TOKEN:-}"
+      TDARR_TMDB_API_KEY: "${TDARR_TMDB_API_KEY:-}"
+      TDARR_TVDB_API_KEY: "${TDARR_TVDB_API_KEY:-}"
+      TDARR_RADARR_API_KEY: "${TDARR_RADARR_API_KEY:-}"
+      TDARR_SONARR_API_KEY: "${TDARR_SONARR_API_KEY:-}"
+    gpus: all
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      # Cheap liveness only. Run build-scripts/verify-grain-toolchain.sh
+      # manually at startup qualification or while the queue is idle.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8266"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    volumes:
+      - "./server:/app/server"
+      - "tdarr-db-sql:/app/server/Tdarr/DB2/SQL"
+      - "./configs:/app/configs"
+      - "./logs:/app/logs"
+      - "./cache:/temp"
+      - "vmaf-v1-score:/var/lib/tdarr-vmaf-score"
+      - "./custom-ffmpeg:/usr/local/ffmpeg-custom"
+      - "./custom-libvmaf-lib:/custom-libvmaf-lib"
+      - "./custom-libvmaf-include:/usr/local/include/libvmaf"
+      - "./custom-libvmaf-pkgconfig:/custom-libvmaf-pkgconfig"
+      - "./custom-cuda:/usr/local/cuda"
+      - "./custom-cont-init.d:/custom-cont-init.d:ro"
+      - "./build-scripts:/usr/local/build-scripts:ro"
+      - "./container-overrides/03-setup-ffmpeg:/etc/cont-init.d/03-setup-ffmpeg:ro"
+      - "./custom-grav1synth:/opt/grav1synth-artifact:ro"
+      - "./custom-grain-pipeline:/opt/grain-pipeline-artifact:ro"
+      - "./custom-nvencc:/opt/nvencc-artifact:ro"
+      - "./grain-pilot-review:/grain-pilot-review"
+      - "./build-workspace:/tmp/ffmpeg-build"
+      - "./custom-vmaf-models:/usr/local/share/model"
+      # Add explicit media mounts after copying this file to docker-compose.yml.
+      # Keep them read-only unless replacement-in-place is deliberately required.
+      # - type: bind
+      #   source: "${TDARR_MEDIA_SOURCE_1}"
+      #   target: /media/library-1
+      #   read_only: true
+
+volumes:
+  tdarr-db-sql:
+    name: "${TDARR_SQL_VOLUME:-tdarr-db-sql}"
+  vmaf-v1-score:
+    name: "${TDARR_VMAF_SCORE_VOLUME:-tdarr-vmaf-v1-score}"

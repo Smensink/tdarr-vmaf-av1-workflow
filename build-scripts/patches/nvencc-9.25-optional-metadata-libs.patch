@@ -1,0 +1,42 @@
+diff --git a/meson.build b/meson.build
+index 5eaacc0..68c48c1 100644
+--- a/meson.build
++++ b/meson.build
+@@ -685,7 +685,7 @@ if cargo_prog.found()
+ endif
+ 
+ libdovi_dep = dependency('dovi', required: false)
+-if not libdovi_dep.found()
++if get_option('enable_libdovi') and not libdovi_dep.found()
+   if not cargo_prog.found()
+     error('cargo is required to build bundled libdovi when system dovi is not available')
+   endif
+@@ -727,7 +727,7 @@ if not libdovi_dep.found()
+ endif
+ 
+ libhdr10plus_dep = dependency('hdr10plus-rs', required: false)
+-if not libhdr10plus_dep.found()
++if get_option('enable_libhdr10plus') and not libhdr10plus_dep.found()
+   if not cargo_prog.found()
+     error('cargo is required to build bundled libhdr10plus-rs when system hdr10plus-rs is not available')
+   endif
+diff --git a/meson.options b/meson.options
+index 086f1e7..1516bb4 100644
+--- a/meson.options
++++ b/meson.options
+@@ -82,3 +82,15 @@ option('onnxruntime_dir',
+   value: '',
+   description: 'ONNX Runtime installation path for headers (expects include/onnxruntime_cxx_api.h)'
+ )
++
++option('enable_libdovi',
++  type: 'boolean',
++  value: true,
++  description: 'Enable Dolby Vision RPU parsing support'
++)
++
++option('enable_libhdr10plus',
++  type: 'boolean',
++  value: true,
++  description: 'Enable HDR10+ metadata parsing support'
++)

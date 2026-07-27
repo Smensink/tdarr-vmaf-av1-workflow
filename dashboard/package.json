@@ -1,0 +1,15 @@
+{
+  "name": "tdarr-vmaf-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone observability dashboard for Tdarr VMAF learning/results CSVs",
+  "main": "server.js",
+  "type": "commonjs",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "better-sqlite3": "^11.6.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

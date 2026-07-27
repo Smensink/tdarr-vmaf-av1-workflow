@@ -1,113 +1,151 @@
-# Troubleshooting
+# Troubleshooting and operations
 
-## Validate plugin syntax
+Never restart/recreate Tdarr, rebuild FFmpeg, mutate the graph, prune reports,
+or vacuum databases merely to investigate a problem while jobs are running.
+Start with read-only process, log, flow, and database checks.
 
-Run from the repository root:
+## Server/node contact timeouts
 
-```bash
-for f in plugins/vmaf/*/1.0.0/index.js; do node --check "$f" || exit 1; done
-```
-
-If this fails, fix syntax before copying plugins into Tdarr. Tdarr's runtime errors are much harder to read than Node's direct syntax output.
-
-## Validate a running Tdarr container
-
-The first troubleshooting step should be validating the FFmpeg/libvmaf runtime. If this fails, fix the image/build before debugging plugin policy.
-
-```bash
-bash tools/validate-install.sh tdarr
-```
-
-Expected capabilities:
-
-- `tdarr-ffmpeg` resolves to the custom build
-- `libvmaf` and/or `libvmaf_cuda` filters are registered, depending on your build
-- libvmaf exposes `feature=` support; CAMBI may or may not be explicitly listed in FFmpeg help
-- `av1_nvenc`, `hevc_nvenc`, and `h264_nvenc` are available
-- key VMAF plugin files exist in the Tdarr local-flow plugin tree
-
-If CAMBI is not explicitly listed by `ffmpeg -h filter=libvmaf`, verify it from actual VMAF JSON/job logs after a test run. Some builds expose CAMBI only through the generic `feature=name=cambi` mechanism.
-
-## `checkFileAge` blocks processing
-
-The included `checkFileAge` plugin intentionally fails the flow for files newer than its configured age threshold. This is useful for avoiding half-written downloads/imports. If this is too conservative for your setup, lower the **Minimum Age (Days)** input or remove the node from the flow.
-
-## UI shows new plugin code but jobs run old behavior
-
-Copy plugins to both server and node runtime paths, then restart the Tdarr container. Tdarr nodes can cache plugin code in memory, and server/node plugin roots can diverge.
-
-Use:
-
-```bash
-bash tools/install-local-plugins.sh tdarr
-```
-
-## FFmpeg is found but VMAF jobs fail
+Symptoms include server-contact failures, job-report POST timeouts,
+worker-limit poll timeouts, or an internal node configured against
+`http://0.0.0.0:8266`.
 
 Check:
 
 ```bash
-docker exec tdarr tdarr-ffmpeg -hide_banner -filters 2>/dev/null | grep -i vmaf
-docker exec tdarr tdarr-ffmpeg -hide_banner -encoders 2>/dev/null | grep -i nvenc
-docker exec tdarr tdarr-ffmpeg -hide_banner -decoders 2>/dev/null | grep -i cuvid
+docker stats --no-stream tdarr
+docker top tdarr
+docker logs --tail 500 tdarr
 ```
 
-Then inspect the Tdarr job report, not just the node log. Job reports usually contain the actual FFmpeg stderr.
+Likely causes in this deployment:
 
-## Output is too large or too small
+- two CPU-v1 scorers per job;
+- eight threads per scorer through `maxParallelVmaf`;
+- multiple simultaneous flow jobs;
+- two decoder processes per scorer;
+- a deep recurring GPU health check;
+- redundant library scanning.
 
-Review the plugin inputs for:
+Remediation after drain:
 
-- target minimum VMAF
-- 1%-low frame floor
-- BPP/Mbps/source-ratio guards
-- CAMBI limit
-- maximum/minimum CQ range
-- whether seed priors or local learning data are being used
+- add a host-wide CPU scoring semaphore;
+- reserve 2–4 logical CPUs for the control plane;
+- split `cpuV1ThreadsPerScore` from GPU concurrency;
+- use the cheap health check from the example compose;
+- configure the internal node to contact `127.0.0.1:8266`;
+- use one primary library discovery method plus staggered reconciliation.
 
-Start with a small test set before applying the flow to a large library.
+## Container would not start after recreation
 
-## Metadata lookup is not wanted
+The parity init hook is fail-closed. Compare:
 
-Leave Plex/TMDB/TVDB inputs blank in `fetchMediaMetadata`, or remove that plugin from your flow. The rest of the workflow has filename/stream-metadata fallbacks, though quality decisions may be less content-aware.
+- active DB flow;
+- mounted `configs/flow_YR5PZ1QaD_CANONICAL.json`;
+- server and internal-node plugin catalogs;
+- `custom-cont-init.d` payload;
+- the 19 runtime helpers.
 
-## GPU workers appear to bypass the pipeline lock
+The optional private size-shadow model is not part of startup parity; verify
+its checksum separately if it is installed.
 
-Do not just check that the lock nodes exist — stale direct edges can coexist with them. In the active flow, these entries must route through acquire nodes:
+The deployment audited on 2026-07-27 had a live 34/53 graph while the mounted
+host canonical still had 35/54. Reconcile during a drained window; do not
+disable parity to force startup.
 
-```text
-retry1:1          -> gpuLockAcquire1 -> test1
-checkCQBracket:2 -> gpuLockAcquire1 -> test1
-monitorRetry1:1  -> gpuLockAcquireTranscode1 -> transcode1
+## CPU VMAF-v1 geometry failure
+
+If CPU scoring reports unsupported coded/display dimensions or SAR/DAR:
+
+- capture source coded width/height, sample dimensions, SAR, DAR, pixel format,
+  transfer, primaries, and matrix;
+- do not coerce the geometry merely to pass the parser;
+- route the source to the qualified GPU metric path until an exact CPU contract
+  exists.
+
+Common unsupported cases include 720p, 1440p, SD, DCI/cropped, portrait, and
+missing/N/A aspect ratios.
+
+## GPU lock appears stuck
+
+Inspect the lock directory, token, owner metadata, heartbeat, and live process
+tree read-only. Do not delete it just because its age exceeded a threshold.
+
+The current helper can break a same-file live lock without proving the owner
+dead and treats any lock older than eight hours as stale. A valid long encode
+can exceed that assumption. Manual recovery should require:
+
+- exact lock root;
+- owner job and generation;
+- no live matching process;
+- stale heartbeat beyond a documented lease;
+- a retained forensic copy of lock metadata.
+
+Never allow a flow input to point the lock at an arbitrary directory.
+
+## `/temp/vmaf-v1-score.*` cache warnings
+
+CPU scorer scratch under `/temp` is seen by Tdarr's cache scanner. The tracked
+wrapper now honors `VMAF_V1_WORK_ROOT`; the example compose maps it to a
+dedicated named volume.
+
+Old orphan directories may remain after forced process termination. Inventory
+them after the queue drains and confirm no live process references them before
+cleanup.
+
+## Grain synthesis produced an invalid title
+
+Do not replace the source. Retain:
+
+- source-scoped analysis artifact;
+- base encode;
+- rewritten candidate;
+- plugin log and manifest;
+- ffprobe JSON;
+- tool versions/hashes.
+
+Run bounded full-title decode and stream/colour/duration comparison. The active
+direct synthesis path does not currently perform the required full-title
+decode after rewriting, so a successful plugin return is insufficient proof.
+
+## HDR source was retagged incorrectly
+
+Capture original transfer, primaries, matrix, bit depth, Dolby Vision profile,
+and static HDR metadata. Ambiguous BT.2020 with unknown transfer should preserve
+source signalling or stop for review; it should not be forcibly labeled PQ.
+
+## Learning or CSV disagreement
+
+Treat SQLite terminal outcome as authority. `learnCQRange` writes before the
+final transcode and its CSV success label is premature. CSV and EMA files have
+unlocked concurrent writes. Preserve them for diagnosis, but do not use them
+to overwrite SQLite.
+
+Validate privately:
+
+```bash
+sqlite3 /private/vmaf_training.db "PRAGMA quick_check;"
 ```
 
-There must be no direct `retry1 -> test1`, `checkCQBracket -> test1`, or `monitorRetry1 -> transcode1` edges. If the live Tdarr DB needs patching, back up the flow JSON and use Tdarr's `/api/v2/cruddb` endpoint on port 8266; sidecar direct SQLite writes may fail while Tdarr owns the DB.
+Never paste row-level output into a public issue.
 
-## Licensing / binary image warning
+## Job reports or SQL backups near limits
 
-If your FFmpeg configure output includes `--enable-nonfree`, do not redistribute the built binary/image unless you have independently confirmed redistribution is allowed.
+At audit time, job reports were roughly 98.5% of the configured 10 GiB limit,
+and the SQL volume held about 2.8 GB across 45 files, many one-off rollback
+databases.
 
-## Verifying Phase 4 ACTING is active in a job report
+Do not prune during active jobs. First:
 
-After the June 2026 promotion, the predictor runs in full acting mode. Confirm it in a completed job report by grepping for these markers:
+1. archive/compress reports to private storage;
+2. verify checksums and restore/readability;
+3. define age/count/incident-hold retention;
+4. identify active DB/WAL and rollback dependencies;
+5. delete only in a maintenance window.
 
-```
-[ACTING] Predictor-seeded                           ← selectBestParameters acting (not SHADOW)
-[PREDICT] learned metadata importance              ← η² weights computed from live DB
-Sequential sampling ON (randomised clip order)     ← calculateVMAF sequential early-stop
-Sequential stop … at N clips                      ← early-stop fired
-Source CAMBI baseline: …  (encode-delta: …)        ← holdout self-comparison active
-vmaf_min>vmaf_max rows excluded: N                 ← data integrity filter active
-```
+## Security
 
-If instead you see `[SHADOW]`, the container is still running pre-June-2026 plugin code — restart the container after checking the plugin source is in `/custom-cont-init.d/vmaf-plugin-patches/`.
-
-## High CPU on the host but GPU VMAF is working
-
-Investigated June 2026: job reports show `vmafGpuVmafFallbackUsed=false` in all recent jobs, and server logs show zero GPU→CPU VMAF fallback events. The high CPU is from FFmpeg AV1 NVENC encoding, not VMAF:
-
-- Quality-maximising NVENC settings (`-tune uhq -multipass fullres -spatial-aq 1 -temporal-aq 1 -rc-lookahead 48`) push significant CPU work even when the encode itself is on the GPU.
-- HDR→SDR tonemapping runs on CPU.
-- Software audio transcoding (EAC3→AAC) is CPU-bound.
-
-To reduce CPU: lower `-rc-lookahead` (e.g. 24 instead of 48), or simplify the HDR flow if you're transcoding to SDR output.
+The example binds ports to loopback and enables auth. If remote access is
+required, use a trusted reverse proxy/VPN and TLS. Integration plugins should
+only contact allowlisted hosts. Media names must be treated as untrusted until
+the shell-command construction findings in the audit are fixed.

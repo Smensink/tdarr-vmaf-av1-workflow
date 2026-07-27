@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1.7
+ARG TDARR_IMAGE=ghcr.io/haveagitgat/tdarr@sha256:e317124469a2f500add53733e2c501be5e23ca0a4a18e9606f4f80cb3d63370d
+
+FROM ubuntu:24.04 AS builder
+ARG DEBIAN_FRONTEND=noninteractive
+# v3.2.0 plus the pinned post-release speed_chroma build/runtime fixes.
+ARG VMAF_COMMIT=78e11b52c8fc1fcc6d15afd6c7479394fb3bc6af
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates git git-lfs meson ninja-build nasm pkg-config python3 xxd \
+    && rm -rf /var/lib/apt/lists/*
+RUN git lfs install --system \
+    && git clone https://github.com/Netflix/vmaf.git /src/vmaf \
+    && git -C /src/vmaf checkout --detach "${VMAF_COMMIT}" \
+    && git -C /src/vmaf lfs pull \
+    && test "$(git -C /src/vmaf rev-parse HEAD)" = "${VMAF_COMMIT}" \
+    && ! grep -RIl '^version https://git-lfs.github.com/spec/v1$' /src/vmaf/model /src/vmaf/resource/model
+RUN meson setup /src/vmaf/libvmaf/build /src/vmaf/libvmaf \
+      --buildtype=release \
+      --prefix=/opt/vmaf-v1 \
+      -Denable_tests=true \
+      -Denable_docs=false \
+      -Denable_tools=true \
+      -Denable_float=true \
+      -Denable_cuda=false \
+      -Dbuilt_in_models=true \
+    && meson compile -C /src/vmaf/libvmaf/build \
+    && meson test -C /src/vmaf/libvmaf/build --print-errorlogs \
+    && meson install -C /src/vmaf/libvmaf/build
+
+FROM ${TDARR_IMAGE} AS runtime
+COPY --from=builder /opt/vmaf-v1 /opt/vmaf-v1
+COPY vmaf-v1-wrapper.sh /usr/local/bin/vmaf-v1
+COPY vmaf-v1-score.sh /usr/local/bin/vmaf-v1-score
+RUN chmod 755 /usr/local/bin/vmaf-v1 /usr/local/bin/vmaf-v1-score
+LABEL org.opencontainers.image.title="Tdarr VMAF v1 CPU runtime"
+LABEL org.opencontainers.image.description="Isolated official libvmaf 3.2.0 plus pinned speed_chroma fixes and CPU/float scorer wrappers"
+LABEL org.opencontainers.image.source="https://github.com/Netflix/vmaf"
+LABEL org.opencontainers.image.revision="78e11b52c8fc1fcc6d15afd6c7479394fb3bc6af"
+LABEL tdarr.vmaf.contract="official-libvmaf-v3.2.0-plus-78e11b5-cpu-float"
+RUN set -eux; \
+    test -z "${LD_LIBRARY_PATH:-}" || ! printf '%s' "$LD_LIBRARY_PATH" | grep -q '/opt/vmaf-v1'; \
+    /usr/local/bin/vmaf-v1 --version

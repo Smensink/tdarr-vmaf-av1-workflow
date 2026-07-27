@@ -1,0 +1,25 @@
+'use strict';
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const root = __dirname;
+const dockerfile = fs.readFileSync(path.join(root, 'runtime/vmaf-v1/Dockerfile.vmaf-v1-cpu'), 'utf8');
+const runner = fs.readFileSync(path.join(root, 'runtime/vmaf-v1/vmaf-v1-score.sh'), 'utf8');
+const init = fs.readFileSync(path.join(root, 'custom-cont-init.d/96-apply-vmaf-plugin-patches.sh'), 'utf8');
+assert(dockerfile.includes('COPY vmaf-v1-score.sh /usr/local/bin/vmaf-v1-score'));
+assert(dockerfile.includes('chmod 755 /usr/local/bin/vmaf-v1 /usr/local/bin/vmaf-v1-score'));
+assert(runner.includes('mkfifo "$ref_fifo" "$dis_fifo"'));
+assert(runner.includes('-pix_fmt yuv420p10le -strict -1'));
+assert(runner.includes('-f yuv4mpegpipe "$ref_fifo"'));
+assert(runner.includes("feature_spec='cambi=full_ref=true'"));
+assert(runner.includes('model_spec="version=$model:name=$model"'));
+assert(runner.includes('--metadata-output'));
+assert(runner.includes('decoded frame-count mismatch'));
+assert(runner.includes('output_partial=$output.partial.$$'));
+assert(runner.includes('refusing to replace existing VMAF output'));
+assert(runner.includes('rm -f "$output"'));
+assert(runner.includes('"pixelFormat":"yuv420p10le"'));
+assert(!runner.includes('.yuv" >'));
+assert(init.includes("apply_shared_lib_file 'vmafV1Cpu.js'"),
+  'container init must deploy the CPU-v1 contract helper to both server and node catalogs');
+console.log('PASS isolated CPU-v1 runtime packages bounded FIFO native-10-bit scorer');

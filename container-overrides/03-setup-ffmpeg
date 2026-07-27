@@ -1,0 +1,6 @@
+#!/usr/bin/with-contenv bash
+# disabled by 99-replace-ffmpeg.sh (custom FFmpeg build)
+# Mounted read-only over Tdarr's vendor init hook so the vendor and custom init
+# runners cannot race to reinstall stock Jellyfin FFmpeg during container startup.
+echo "[03-setup-ffmpeg] disabled by Compose override; using custom FFmpeg build."
+exit 0

@@ -1,0 +1,17 @@
+name=nvencc
+version=9.25-r2
+git_url=https://github.com/rigaya/NVEnc
+git_tag=9.25
+git_commit=8c873e4d15aefb93dd50396e5c70fffb842f7d22
+patch=nvencc-9.25-optional-metadata-libs.patch
+patch_sha256=8fb6dd6c3770f1e239b56686e0e4e1b02f6f28513ad21c7f5d5e3920f62ea64e
+build_system=meson
+build_type=release
+enable_libdovi=false
+enable_libhdr10plus=false
+strip=false
+compiler=gcc 13.3.0
+nvenc_api=13.0
+cuda_headers=13.3
+binary_sha256=03d8a26631fef47881f30243e4442dcb26a66cabbb586ae9637c9e22b9776294
+coordinator_sha256=bcba1c9d16d3c6342eabbd8fc59397fbff04b30fb8301a338f29a0ba0a077921

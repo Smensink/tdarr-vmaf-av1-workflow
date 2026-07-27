@@ -1,17 +1,26 @@
 # Security and disclosure
 
-Do not commit private Tdarr state, raw media-derived rows, logs, databases, or API tokens. The `.gitignore` is intentionally aggressive, but it is not a substitute for review.
+Do not commit private Tdarr state, row-level media history, logs, reports,
+databases/WAL files, credentials, media paths, or generated binaries.
 
-Before publishing, opening a PR, or cutting a release, run:
+Before publication:
 
 ```bash
-python3 tools/audit-for-secrets.py .
+python tools/audit-for-secrets.py .
+git status --short
+git diff --cached --stat
 ```
 
-Also consider external scanners such as `gitleaks` or `trufflehog` if available.
+Review automated findings manually. Also inspect generated flow JSON and SQLite
+schemas directly; `.gitignore` and scanners are not a security boundary.
 
-## Reporting a problem
+The 2026-07-27 audit identified shell-command construction from media paths in
+three active plugins. Until those subprocesses use explicit argv with
+`shell:false`, treat filenames as untrusted and do not broaden deployment.
 
-If you find a secret, credential, or private media-derived artifact in this repository, rotate/revoke the secret first if applicable, then open a private security report or contact the maintainer directly. Do not paste live secrets into public issues.
+For a private disclosure, contact the maintainer without putting credentials,
+media names, paths, or raw database extracts in a public issue. If a secret was
+published, revoke/rotate it before history cleanup.
 
-For a repeatable pre-release process, see [docs/release-checklist.md](docs/release-checklist.md).
+See [the audit](docs/audit-2026-07-27.md) and
+[privacy policy](docs/privacy-and-data.md).

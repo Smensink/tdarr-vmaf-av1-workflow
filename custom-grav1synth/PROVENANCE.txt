@@ -1,0 +1,10 @@
+name=grav1synth
+version=0.2.0
+git_url=https://github.com/rust-av/grav1synth
+git_commit=1044228cd411672b565e5762a9b3597f4dd163b0
+patch=grav1synth-nvenc-sequence-header.patch
+patch_sha256=0beb125d34a0c8223a27728440a9dcbc05d72787570d5a0c634a48649a67e4a7
+nvenc_fixture_sha256=04e451508a968b62559e0b07f8829f931411749355dc27a882b18c56b35fb04a
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+sha256=5e6e462e7c6ddf1229e965d1bb4741b698f9cd9d40e4c0c0ec90d419d42c6e9e

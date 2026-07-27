@@ -1,0 +1,19 @@
+services:
+  vmaf-dashboard:
+    build:
+      context: .
+    container_name: tdarr-vmaf-dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8686:8686"
+    environment:
+      PORT: "8686"
+      CONFIGS_DIR: "/data"
+      RESULTS_CSV: "/data/vmaf_results.csv"
+      LEARNING_CSV: "/data/vmaf_cq_learning.csv"
+      DB_PATH: "/state/vmaf.sqlite"
+      TDARR_JOBREPORTS_DIR: "/tdarr-jobreports"
+    volumes:
+      - ../configs:/data:ro
+      - ../server/Tdarr/DB2/JobReports:/tdarr-jobreports:ro
+      - ./state:/state

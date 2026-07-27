@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Tdarr VMAF Dashboard</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div class="title">
+        <h1>Tdarr VMAF Observability</h1>
+        <div class="subtitle">Reads `vmaf_results.csv` + `vmaf_cq_learning.csv` and summarizes sample count + CQ behavior.</div>
+      </div>
+      <div class="actions">
+        <button id="refreshBtn">Refresh</button>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card">
+        <h2>Data</h2>
+        <div id="dataStatus" class="mono small"></div>
+      </section>
+
+      <section class="card">
+        <h2>Summary</h2>
+        <div id="summary" class="kv"></div>
+      </section>
+
+      <section class="card span2">
+        <h2>Sample Count (by)</h2>
+        <div class="row">
+          <label>Group by</label>
+          <select id="samplesBy">
+            <option value="resTier">Resolution</option>
+            <option value="codecCat">Codec</option>
+            <option value="isHdr">HDR</option>
+            <option value="mediaIsAnimation">Animation</option>
+            <option value="bitrateBucket">Bitrate bucket</option>
+            <option value="bppBucket">Bits-per-pixel bucket</option>
+          </select>
+        </div>
+        <div id="samplesChart" class="chart"></div>
+        <div id="samplesTable"></div>
+      </section>
+
+      <section class="card span2">
+        <h2>Selected CQ (by)</h2>
+        <div class="row">
+          <label>Group by</label>
+          <select id="cqBy">
+            <option value="resTier">Resolution</option>
+            <option value="codecCat">Codec</option>
+            <option value="isHdr">HDR</option>
+            <option value="mediaIsAnimation">Animation</option>
+            <option value="bitrateBucket">Bitrate bucket</option>
+            <option value="bppBucket">Bits-per-pixel bucket</option>
+          </select>
+        </div>
+        <div id="cqChart" class="chart"></div>
+        <div id="cqTable"></div>
+      </section>
+
+      <section class="card span2">
+        <h2>Learned CQ Range Width (by)</h2>
+        <div class="row">
+          <label>Group by</label>
+          <select id="learnBy">
+            <option value="resTier">Resolution</option>
+            <option value="codecCat">Codec</option>
+            <option value="bitrateBucket">Bitrate bucket</option>
+            <option value="mediaType">Media type</option>
+            <option value="mediaIsAnimation">Animation</option>
+          </select>
+        </div>
+        <div id="learnChart" class="chart"></div>
+        <div id="learnTable"></div>
+      </section>
+
+      <section class="card span2">
+        <h2>Test Encodes</h2>
+        <div class="subtitle">Total encode attempts per day (samples × CQ sweeps). Spikes highlight expensive jobs.</div>
+        <div id="retryChart" class="chart"></div>
+        <div id="retryStats" class="mono small"></div>
+      </section>
+
+      <section class="card span2">
+        <h2>Recent Runs</h2>
+        <div id="runsTable"></div>
+      </section>
+
+      <section class="card span2">
+        <h2>High-Std Investigation</h2>
+        <div class="row">
+          <label>Stddev =</label>
+          <input id="outStdMin" type="number" step="0.1" value="5.0" />
+          <button id="outRefreshBtn">Load outliers</button>
+        </div>
+        <div id="outliersTable"></div>
+        <div class="row">
+          <button id="outExcludeBtn" disabled>Exclude selected prior</button>
+          <div id="outStatus" class="mono small"></div>
+        </div>
+        <div id="outDetail" class="mono small"></div>
+      </section>
+
+      <section class="card span2">
+        <h2>Stddev Distribution (priors)</h2>
+        <div class="row">
+          <label>Bin width</label>
+          <input id="stdBinWidth" type="number" step="0.05" value="0.25" />
+          <label>Max</label>
+          <input id="stdMax" type="number" step="1" value="20" />
+          <button id="stdRefreshBtn">Load</button>
+        </div>
+        <div class="row">
+          <label>Exclude std ≥</label>
+          <input id="stdExcludeMin" type="number" step="0.1" value="10" />
+          <button id="stdExcludeBtn">Exclude priors</button>
+        </div>
+        <div id="stdChart" class="chart"></div>
+        <div id="stdStats" class="mono small"></div>
+      </section>
+
+      <section class="card span2">
+        <h2>Configurator</h2>
+        <div class="subtitle">Pick attributes and get Tdarr-style recommendations (adaptive samples + learned CQ range preload).</div>
+        <div class="row">
+          <label>Resolution</label>
+          <select id="cfgResTier"></select>
+          <label>Codec</label>
+          <select id="cfgCodecCat"></select>
+        </div>
+        <div class="row">
+          <label>HDR</label>
+          <select id="cfgHdr">
+            <option value="">Any</option>
+            <option value="0">SDR</option>
+            <option value="1">HDR</option>
+          </select>
+          <label>Animation</label>
+          <select id="cfgAnim">
+            <option value="">Any</option>
+            <option value="0">Live</option>
+            <option value="1">Animation</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>Bitrate bucket</label>
+          <select id="cfgBitrate"></select>
+          <label>Bitrate (Mbps)</label>
+          <input id="cfgBitrateMbps" type="number" step="0.1" placeholder="optional override" />
+          <label>BPP bucket</label>
+          <select id="cfgBpp"></select>
+        </div>
+        <div class="row">
+          <label>Media type</label>
+          <select id="cfgMediaType"></select>
+          <label>Source type</label>
+          <select id="cfgSourceType"></select>
+          <label>Genre contains</label>
+          <select id="cfgGenre"></select>
+        </div>
+        <div class="row">
+          <label>Duration (min)</label>
+          <input id="cfgDurationMin" type="number" step="1" value="30" />
+          <label>Year</label>
+          <input id="cfgYear" type="number" step="1" placeholder="optional" />
+          <label>Release group</label>
+          <input id="cfgReleaseGroup" type="text" placeholder="optional" />
+        </div>
+        <div class="row">
+          <label>Learning min samples</label>
+          <input id="cfgLearnMinSamples" type="number" step="1" value="5" />
+          <label>Bitrate tolerance (%)</label>
+          <input id="cfgLearnTol" type="number" step="1" value="20" />
+          <label>Only successes</label>
+          <select id="cfgLearnOnlySuccess">
+            <option value="true" selected>Yes</option>
+            <option value="false">No</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>Min segments</label>
+          <input id="cfgMinSeg" type="number" step="1" value="3" />
+          <label>Max segments</label>
+          <input id="cfgMaxSeg" type="number" step="1" value="10" />
+          <label>Title (optional)</label>
+          <input id="cfgTitle" type="text" placeholder="optional" />
+        </div>
+        <div class="row">
+          <button id="cfgRunBtn">Recommend</button>
+          <div id="cfgStatus" class="mono small"></div>
+        </div>
+        <div id="cfgResult" class="kv"></div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

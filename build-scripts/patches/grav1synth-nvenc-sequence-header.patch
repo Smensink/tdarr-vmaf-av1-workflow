@@ -1,0 +1,156 @@
+diff --git a/src/parser/grain.rs b/src/parser/grain.rs
+index e70c88b..925f898 100644
+--- a/src/parser/grain.rs
++++ b/src/parser/grain.rs
+@@ -459,7 +459,8 @@ mod tests {
+         assert_eq!(params.ar_coeffs_y.as_slice(), &[]);
+         assert_eq!(params.ar_coeffs_cb.as_slice(), &[0]);
+         assert_eq!(params.ar_coeffs_cr.as_slice(), &[0]);
+-        assert_eq!(params.scaling_shift, 8);
++        // The fixture encodes grain_scaling_minus_8 as 0b10.
++        assert_eq!(params.scaling_shift, 10);
+         assert_eq!(params.ar_coeff_shift, 7);
+         assert_eq!(params.grain_scale_shift, 2);
+         assert_eq!(params.cb_mult, 0);
+diff --git a/src/parser/obu.rs b/src/parser/obu.rs
+index edaeaf7..99a2878 100644
+--- a/src/parser/obu.rs
++++ b/src/parser/obu.rs
+@@ -128,18 +128,12 @@ impl<const WRITE: bool> BitstreamParser<WRITE> {
+                     pre_len - input.len()
+                 );
+                 if obu_header.has_size_field {
+-                    if WRITE {
+-                        let bytes_written = self.packet_out.len() - packet_start_len;
+-                        let bytes_taken = pre_input.len() - input.len();
+-                        let obu_size_change = bytes_written as isize - bytes_taken as isize;
+-                        if obu_size_change != 0 {
+-                            self.adjust_obu_size(
+-                                obu_size_pos,
+-                                leb_size,
+-                                (obu_size as isize + obu_size_change) as usize,
+-                            );
+-                        }
+-                    }
++                    // parse_sequence_header copies the complete original payload and
++                    // changes exactly one bit, so its encoded payload length is
++                    // invariant.  The parser intentionally stops before trailing_bits;
++                    // treating those unparsed bytes as newly-written bytes falsely
++                    // grew NVENC's 15-byte Sequence Header OBU to 16 bytes and shifted
++                    // every following OBU by one.
+                     let adjustment = obu_size - (pre_len - input.len());
+                     input = &input[adjustment..];
+                 }
+@@ -1165,6 +1159,80 @@ mod tests {
+         assert!(!parser.packet_out.is_empty());
+     }
+ 
++    #[test]
++    fn parse_obu_sequence_header_write_preserves_nvenc_size_and_trailing_bits() {
++        // Sequence Header payload emitted by av1_nvenc for the production 10-bit
++        // fixture.  film_grain_params_present is the low bit of byte 13; byte 14
++        // is the separate AV1 trailing-bits byte.
++        let seq_payload = [
++            0x00, 0x00, 0x00, 0x62, 0xeb, 0xbf, 0xf1, 0xf8, 0x04, 0x33, 0xa1, 0x22, 0x01, 0x20,
++            0x80,
++        ];
++        let obu = build_obu_bytes(ObuType::SequenceHeader, None, true, &seq_payload);
++        let following_obu = build_obu_bytes(ObuType::Padding, None, true, &[0x55]);
++        let mut packet = obu.clone();
++        packet.extend_from_slice(&following_obu);
++        let mut parser = make_parser::<true>(0, false, None, Vec::new());
++        parser.incoming_grain_header = Some(Vec::new());
++
++        let (remaining, _) = parser
++            .parse_obu(&packet, 0)
++            .expect("should rewrite NVENC header");
++
++        assert_eq!(remaining, following_obu);
++        assert_eq!(parser.packet_out.len(), obu.len());
++        assert_eq!(parser.packet_out[1], seq_payload.len() as u8);
++        assert_eq!(parser.packet_out[2 + 13], 0x21);
++        assert_eq!(parser.packet_out[2 + 14], 0x80);
++
++        let (remaining, _) = parser
++            .parse_obu(remaining, 0)
++            .expect("following OBU boundary should remain intact");
++        assert!(remaining.is_empty());
++        assert_eq!(&parser.packet_out[obu.len()..], following_obu);
++
++        let mut read_parser = make_parser::<false>(0, false, None, Vec::new());
++        let (read_remaining, parsed) = read_parser
++            .parse_obu(&parser.packet_out, 0)
++            .expect("rewritten NVENC header should parse");
++        assert_eq!(read_remaining, following_obu);
++        let Some(Obu::SequenceHeader(header)) = parsed else {
++            panic!("expected rewritten sequence header");
++        };
++        assert!(header.film_grain_params_present);
++    }
++
++    #[test]
++    fn parse_obu_sequence_header_write_removes_grain_without_changing_nvenc_size() {
++        let mut seq_payload = [
++            0x00, 0x00, 0x00, 0x62, 0xeb, 0xbf, 0xf1, 0xf8, 0x04, 0x33, 0xa1, 0x22, 0x01, 0x20,
++            0x80,
++        ];
++        seq_payload[13] |= 1;
++        let obu = build_obu_bytes(ObuType::SequenceHeader, None, true, &seq_payload);
++        let mut parser = make_parser::<true>(0, false, None, Vec::new());
++
++        let (remaining, _) = parser
++            .parse_obu(&obu, 0)
++            .expect("should clear the NVENC grain-present flag");
++
++        assert!(remaining.is_empty());
++        assert_eq!(parser.packet_out.len(), obu.len());
++        assert_eq!(parser.packet_out[1], seq_payload.len() as u8);
++        assert_eq!(parser.packet_out[2 + 13], 0x20);
++        assert_eq!(parser.packet_out[2 + 14], 0x80);
++
++        let mut read_parser = make_parser::<false>(0, false, None, Vec::new());
++        let (read_remaining, parsed) = read_parser
++            .parse_obu(&parser.packet_out, 0)
++            .expect("rewritten NVENC header should parse");
++        assert!(read_remaining.is_empty());
++        let Some(Obu::SequenceHeader(header)) = parsed else {
++            panic!("expected rewritten sequence header");
++        };
++        assert!(!header.film_grain_params_present);
++    }
++
+     // ===== Group 8: parse_obu — TileGroup panic + error conditions =====
+ 
+     #[test]
+diff --git a/src/parser/sequence.rs b/src/parser/sequence.rs
+index b285f6e..9980778 100644
+--- a/src/parser/sequence.rs
++++ b/src/parser/sequence.rs
+@@ -399,7 +399,15 @@ impl<const WRITE: bool> BitstreamParser<WRITE> {
+             let (input, enable_cdef) = trace_bool(input, ctx, "enable_cdef")?;
+             let (input, enable_restoration) = trace_bool(input, ctx, "enable_restoration")?;
+             let (input, color_config) = color_config(input, ctx, seq_profile)?;
+-            let fgp_bit_offset = input.1;
++            // `input.1` is only the bit offset within the current byte.  Sequence
++            // headers may also carry one or more trailing bytes after the syntax
++            // fields, so `obu_out.last_mut()` is not necessarily the byte that
++            // contains film_grain_params_present (NVENC ends its sequence header
++            // with a separate 0x80 trailing-bits byte).  Preserve the byte offset
++            // as well as the bit offset before consuming the flag.
++            let fgp_payload_bit_offset = ctx.pos(input) - obu_bit_offset;
++            let fgp_byte_offset = fgp_payload_bit_offset / 8;
++            let fgp_bit_offset = fgp_payload_bit_offset % 8;
+             let (input, film_grain_params_present) =
+                 trace_bool(input, ctx, "film_grain_params_present")?;
+ 
+@@ -408,9 +416,7 @@ impl<const WRITE: bool> BitstreamParser<WRITE> {
+                 // based on whether we are adding or removing film grain.
+                 // We use the bit offset captured BEFORE parsing the flag so
+                 // it points at the flag itself rather than one past it.
+-                obu_out
+-                    .last_mut()
+-                    .unwrap()
++                obu_out[fgp_byte_offset]
+                     .set_bit(7 - fgp_bit_offset, self.incoming_grain_header.is_some());
+                 self.packet_out.extend_from_slice(&obu_out);
+                 debug!(

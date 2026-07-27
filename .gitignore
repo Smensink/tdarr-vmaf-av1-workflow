@@ -1,7 +1,6 @@
 # Runtime / private Tdarr state
 server/
-configs/*.csv
-configs/*.json
+configs/**
 logs/
 cache/
 backups/
@@ -23,16 +22,36 @@ custom-vmaf-models/
 *.db-*
 *.sqlite
 *.sqlite3
+*.sqlite-*
+*.sqlite3-*
 *.log
 *.bak*
+dashboard/state/
+grain-pilot-review/
 
 # Local raw/private data drop zone
 data/private/
+plugins/vmaf/_lib/size_failure_shadow_hgb.json
+custom-cont-init.d/vmaf-plugin-patches/_lib/size_failure_shadow_hgb.json
 
 # Tooling
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
 node_modules/
 .env
 .env.*
+!.env.example
 _live_compare/
+
+# Deliberately published, redacted/aggregate snapshots
+!configs/
+!configs/flow_YR5PZ1QaD_CANONICAL.json
+!data/public/
+!data/public/vmaf-learning-public.sqlite3
+data/public/.*.tmp
+
+# Runtime binaries are documented by checksums/provenance but never committed
+custom-grav1synth/bin/
+custom-nvencc/bin/

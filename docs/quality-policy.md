@@ -1,91 +1,126 @@
 # Quality policy
 
-This workflow chooses AV1 CQ values by measuring candidate encodes, not by trusting a fixed preset.
+This is the policy represented by the 2026-07-27 active-flow snapshot. It
+describes implemented decisions; it does not claim that every threshold or
+adaptive policy has been prospectively validated.
 
-The policy is inspired by Netflix's video-quality work:
+## Active inputs
 
-- [VMAF](https://github.com/Netflix/vmaf) estimates perceptual quality by combining several objective features into a model trained against subjective human opinion scores.
-- Netflix's [Toward a Practical Perceptual Video Quality Metric](https://netflixtechblog.com/toward-a-practical-perceptual-video-quality-metric-653f208b9652) explains why perceptual metrics are more useful than raw PSNR/SSIM-style scores for streaming decisions.
-- [CAMBI](https://netflixtechblog.com/cambi-a-new-video-quality-metric-for-hdr-1ba3aefc0f44) focuses on banding, especially visible stair-step artifacts in smooth gradients.
+| Stage | Setting | Active value |
+|---|---|---:|
+| Eligibility | Minimum file age | 7 days |
+| Sampling | Initial segments | 4 |
+| Sampling | Maximum segments | 16 |
+| Search | Target minimum VMAF | 95 |
+| Search | Target size reduction | 30% |
+| Search | CQ range width / step | 6 / 2 |
+| Search | Preset | NVENC `p7` |
+| Search | Exploration rate | 0.02 |
+| Scoring | Parallel GPU VMAF | 4 |
+| Scoring | CPU-v1 scorers per job | 2 |
+| Scoring | Threads per CPU-v1 scorer | 8, via misnamed `maxParallelVmaf` |
+| Selection | Minimum VMAF | 95 |
+| Selection | Minimum frame VMAF | 88 |
+| Selection | Minimum requested reduction | 20% |
+| Live size check | Maximum output/source ratio | 75% |
+| Grain synthesis | Maximum output/source ratio | 101% |
 
-The workflow uses those ideas in a Tdarr setting: encode a small set of samples, measure them, reject risky candidates, then transcode the full file only after a candidate has earned it.
+The 75% live size gate occurs after search/export and waits 120 seconds before
+checking. Its second graph edge is currently dead because the Community plugin
+exposes only one output.
 
-## Why mean VMAF is not enough
+## Measurements and constraints
 
-A single average score can hide failure modes:
+The selector considers more than mean VMAF:
 
-- a few dark or complex frames collapse while the average stays high
-- samples miss the hardest scene
-- output bitrate becomes implausibly low for the resolution
-- gradients band even though VMAF remains acceptable
-- HDR/live-action content behaves differently from animation or easy SDR content
+- average/harmonic quality;
+- low-frame/tail quality;
+- CAMBI and source-relative banding behavior;
+- bitrate/BPP and projected output ratio;
+- holdout measurements;
+- prior failed CQs and same-file history;
+- source/reference contract compatibility;
+- temporal filter and denoise identities.
 
-So the workflow treats mean VMAF as one signal, not the whole decision.
+This layered feasibility design is sensible: one aggregate score should not
+override a severe tail, banding, or size failure. The implementation still
+needs controlled outcome labels before any learned or projected-size policy is
+described as validated.
 
-## Candidate scoring
+## Search and learning
 
-For each tested CQ candidate, the workflow records a quality/size profile:
+The predictor pools compatible historical curves and uses metadata similarity
+to propose a starting range. Same-file history can make a re-encode converge
+faster. Exploration and shadow models collect evidence without necessarily
+controlling the result.
 
-- VMAF mean and harmonic mean
-- low-frame/tail quality signals, including 1%-low frame VMAF where available
-- sample output size
-- projected full-file output size
-- projected bitrate and bits-per-pixel
-- CAMBI/banding score where the FFmpeg/libvmaf build supports it
-- source metadata such as resolution tier, HDR/SDR, codec, and content class
+The runtime database is the appropriate source for learning. The plural
+`learnCQRanges` plugin is retired and incompatible with the current selector.
+The active singular `learnCQRange` plugin currently writes a CSV field named
+`transcode_succeeded` before the title transcode has occurred. Treat that field
+as a selection-eligible observation until the schema is corrected; use
+terminal status written by the monitor for outcome learning.
 
-## Acceptance guards
+CSV and EMA sidecars are not concurrency-safe. SQLite transactions should own
+the learning state, with CSV generated later as reporting output.
 
-A candidate must clear several layers before it can be selected.
+## CPU VMAF-v1 authority
 
-### 1. Perceptual quality target
+The active graph sets:
 
-The candidate must meet the configured VMAF target. VMAF is used because it better approximates perceived quality than simple pixel-error metrics.
+- qualification enabled: false;
+- production enabled: true;
+- provisional HDR production allowed: true.
 
-### 2. Tail-frame quality
+Those booleans currently promote the CPU scorer without requiring an immutable
+calibration artifact or scorer digest at runtime. The helper itself labels SDR
+runtime qualification incomplete and HDR provisional. Before retaining acting
+authority:
 
-The candidate must not have an unacceptable 1%-low frame score. This catches cases where average quality is fine but hard frames are visibly worse.
+1. preflight exact coded/display geometry and SAR/DAR;
+2. route unsupported content to the established GPU metric path;
+3. bind wrapper, libvmaf, model, and parser hashes to a calibration result;
+4. compare CPU/GPU decisions on a controlled labeled cohort;
+5. keep HDR canary-only until its transform/colour contract is validated.
 
-### 3. Output-size plausibility
+## Grain policy
 
-The projected output must not be suspiciously tiny for its resolution/source class. The workflow checks:
+Grain analysis and synthesis are active for SDR and PQ sources under `/media`.
+The flow preserves the base encode if analysis is skipped or synthesis is not
+applicable. A synthesized title may be up to 101% of the pre-grain source ratio
+according to the active plugin input.
 
-- output/source-size ratio
-- bits per pixel
-- output Mbps
+Production grain acceptance must include:
 
-This prevents a candidate from passing on VMAF while collapsing the bitrate too aggressively.
+- authenticated source-scoped analysis artifact;
+- exact denoise/temporal-filter/metric contract;
+- source and output duration/stream validation;
+- size policy;
+- bounded full-title decode validation after bitstream rewriting.
 
-### 4. CAMBI/banding risk
+The last item is missing from the active direct synthesis path.
 
-Where available, CAMBI is used as a banding guard. Lower CAMBI is better. The workflow can reject or de-prioritize candidates with elevated banding risk, especially for HDR/live-action material.
+## HDR policy
 
-### 5. Holdout validation
+Dolby Vision handling is profile-aware. HDR classification must not infer PQ
+solely from 10/12-bit BT.2020 primaries with an unknown transfer function.
+Ambiguous sources should preserve their original signalling or fail closed for
+manual review. Retagging to BT.2020/PQ/BT2020NC is irreversible metadata
+mutation and needs affirmative evidence.
 
-A sample is reserved outside the main sweep. After the best candidate is chosen, the workflow validates it against that holdout sample. If the holdout fails quality or banding checks, the workflow moves to a safer CQ or retries.
+## Validation status
 
-## Bracket and retry behavior
+Verified in this repository:
 
-The workflow tries to test a useful range of CQ values:
+- static JavaScript syntax and undeclared-identifier checks;
+- graph shape, plugin inventory, and deployment-source parity;
+- database integrity and aggregate-export structure;
+- explicit contracts encoded in the included tests.
 
-- if all candidates are too high quality, it can test higher CQ values for more compression
-- if all candidates are too low quality, it can test lower CQ values for more bits
-- if selection guards reject every candidate, retry logic can expand or shift the range
+Not established by those checks:
 
-This matters because CQ is content-dependent. The same CQ can be transparent for one source and unacceptable for another.
-
-## Learning priors
-
-After completed runs, `learnCQRange` updates learning data. Future jobs use that history to choose better starting brackets for similar files.
-
-The shipped seed priors are only a warm start. Local results should become more important over time because they reflect your own sources, GPU, FFmpeg build, and quality preferences.
-
-## Conservative by design
-
-For difficult live-action, high-resolution, HDR, or grainy content, the workflow may choose a lower CQ than a simple fixed-preset workflow would. That means larger outputs, but fewer visibly bad encodes.
-
-For animation or easier SDR content, the learning model and quality guards can allow more aggressive compression when measured history supports it.
-
-## Why the provided FFmpeg/libvmaf runtime is recommended
-
-The policy depends on measurements. If FFmpeg lacks the expected VMAF/libvmaf/CAMBI/NVENC features, the workflow cannot make the same decisions. Use the provided FFmpeg/libvmaf image/build path unless you are deliberately porting the workflow to another validated runtime.
+- perceptual superiority on an independent labeled cohort;
+- safety of the 75% projected/output-size decision for all content;
+- CPU-v1 HDR parity;
+- global throughput under multiple concurrent jobs;
+- post-grain full-title decode health.

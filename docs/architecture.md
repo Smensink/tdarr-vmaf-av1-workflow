@@ -1,122 +1,184 @@
-# Architecture
+# Architecture and active flow
 
-This project is a Tdarr Local Flow Plugin chain plus a matching FFmpeg/libvmaf runtime. The main idea is simple: **measure a few candidate encodes before committing to the full-file transcode**.
+This document describes the redacted live snapshot exported on 2026-07-27:
+flow `YR5PZ1QaD`, 34 nodes, 53 edges. It distinguishes current behavior from
+recommended changes.
 
-A usual Tdarr install often applies a static preset. This workflow instead builds a small per-file experiment, scores the outputs, and chooses the final transcode parameters from the evidence.
-
-## System components
-
-```text
-┌──────────────────────┐
-│ Tdarr flow JSON       │  Defines plugin order and edges in the Tdarr UI
-└──────────┬───────────┘
-           │
-┌──────────▼───────────┐
-│ Local Flow Plugins    │  JavaScript plugins under plugins/vmaf/
-└──────────┬───────────┘
-           │
-┌──────────▼───────────┐
-│ FFmpeg/libvmaf image  │  Expected encoders, decoders, VMAF filters, wrappers
-└──────────┬───────────┘
-           │
-┌──────────▼───────────┐
-│ Tdarr config state    │  SQLite + CSV learning data and result history
-└──────────────────────┘
-```
-
-The plugin code communicates through `args.variables`. Longer-lived learning state is stored in Tdarr's config directory, primarily in SQLite (`vmaf_training.db`), with legacy CSV/JSON sidecars retained for compatibility.
-
-## High-level flow
+## Control flow
 
 ```text
-preflight checks
-  → optional metadata lookup
-  → HDR / stream metadata detection
-  → sample extraction
-  → candidate CQ range selection
-  → acquire shared GPU pipeline lock
-  → sample encodes with AV1 NVENC
-  → VMAF/CAMBI scoring
-  → bracket expansion if needed
-  → best-candidate selection
-  → holdout validation
-  → final full-file transcode
-  → release shared GPU pipeline lock before post-processing
-  → result export
-  → CQ-learning update
-  → cleanup / retry bookkeeping
+input
+  -> seven-day age gate
+  -> NVIDIA AV1 capability probe
+  -> HDR/Dolby Vision classification
+  -> grain analysis
+  -> metadata enrichment
+  -> sample extraction
+  -> acquire GPU lock
+  -> sample encodes
+  -> VMAF/CAMBI scoring
+  -> bracket decision ----retry----+
+  -> candidate selection             |
+  -> CQ range/retry decision --------+
+  -> learning + result export
+  -> projected-size delay/check
+  -> acquire GPU lock
+  -> final transcode
+  -> release GPU lock
+  -> terminal monitor ----retry------+
+  -> grain synthesis or FFmpeg fallback
+  -> stream reorder
+  -> replace source
+  -> notify Radarr then Sonarr
+  -> unmonitor Radarr then Sonarr
+  -> cleanup
 ```
 
-## Decision loop
+Error and keep-original branches release the GPU lock where applicable and
+route through cleanup. `onFlowError` and its release node are detached from
+ordinary edge reachability because Tdarr invokes the handler specially.
 
-The decision loop has three phases.
+### Known graph defects
 
-### 1. Predict a useful CQ range
+- `detectGPUEncoder` output 2 is documented as no-GPU/failure, but both outputs
+  currently continue into HDR analysis.
+- `compareFileSizeRatioLive` has only output 1, while the graph retains an edge
+  from output handle 2.
+- Several important policy defaults are inherited rather than explicitly bound.
+- The graph sets paired-CQ acting true and force-full true; force-full disables
+  acting, so the configuration is internally misleading.
 
-`extractVideoSamples` and `testEncodingParameters` use existing learning data and source metadata to avoid testing every possible CQ. The initial range is a guess, not a commitment.
+The tracked graph remains a faithful redacted snapshot. These corrections
+should be applied as a versioned migration and deployed only after a drain.
 
-### 2. Measure candidate encodes
+## GPU ownership
 
-The workflow encodes short samples at candidate CQ values, then compares each encoded sample to the original sample with VMAF and related metrics. The result is a small quality/size curve for that specific source file.
+The current global lock is a directory under `/temp`. Candidate sample encodes
+and final full-title transcodes acquire it through explicit graph nodes. The
+lock contains a token and heartbeat, and the normal release plugin requires
+token ownership.
 
-### 3. Select or retry
+Film-grain analysis currently occurs before the first graph lock. Its NVEncC
+KNN stage can therefore overlap another job's GPU work. A prior desired
+canonical graph put the entire analysis plugin under the lock, but that would
+also serialize several minutes of mostly CPU fitting. The design decision is
+not resolved by measurement.
 
-`selectBestParameters` picks the most efficient acceptable candidate. If the tested range does not bracket the target, or if quality guards reject every candidate, retry plugins expand or shift the range and test again.
+Recommended redesign:
 
-## Runtime paths
+1. keep the live graph unchanged while jobs run;
+2. measure KNN/encode overlap on a drained canary;
+3. move lock acquisition into the narrow GPU-using section of grain analysis,
+   or split that section into a dedicated node;
+4. change the graph, deployment canonical, parity tests, and operations
+   documentation atomically.
 
-Source in this repo is grouped by Local Flow Plugin category:
+`calculateVMAF` can release the GPU lock while CPU-v1 scoring runs, but its
+internal handoff currently ignores release failure, then synchronously
+reacquires the lock before CPU-only aggregation and selection. Later graph
+nodes already acquire the lock before subsequent GPU work. The internal
+reacquire should be removed after its ownership contract is repaired.
 
-```text
-plugins/vmaf/<plugin>/1.0.0/index.js
-plugins/filter/checkFileAge/1.0.0/index.js
-```
+## Sample search and scoring
 
-Typical Tdarr runtime paths:
+`extractVideoSamples` chooses representative segments and can expand to at most
+16 segments. `testEncodingParameters` encodes CQ candidates using AV1 NVENC.
+`calculateVMAF` measures candidates and `checkCQBracket` decides whether to
+continue searching.
 
-```text
-/app/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins/vmaf/<plugin>/1.0.0/index.js
-/app/Tdarr_Node/assets/app/plugins/FlowPlugins/LocalFlowPlugins/vmaf/<plugin>/1.0.0/index.js
-```
+Two metric paths are present:
 
-The plugin code communicates through `args.variables`. Longer-lived learning state is stored in Tdarr's config directory as an SQLite database (`vmaf_training.db`) for new data, with legacy CSV files (`vmaf_results.csv`, `vmaf_cq_learning.csv`) retained for backward compatibility.
+- the custom FFmpeg/libvmaf GPU contract;
+- an isolated official libvmaf 3.2.0 CPU/float scorer.
 
-## Learning state
+The active graph enables CPU-v1 production authority and provisional HDR.
+This is a deployment fact, not a validation claim. The CPU helper accepts only
+narrow full-width/full-height 1080/4K geometry bands, while the upstream
+contract resolver accepts a much broader set. Unsupported 720p, 1440p, SD,
+portrait, DCI/cropped, or missing-aspect-ratio sources can therefore fail after
+CPU authority is selected.
 
-The learning system uses **SQLite as the primary store** for new transcode data. The library (`plugins/vmaf/_lib/vmafdb.js`) manages two tables:
+Concurrency is also local rather than global:
 
-- **jobs** — one row per transcode: source facts (resolution, codec, bitrate, source CAMBI, bit depth), the CQ decision made, and the measured outcome (actual VMAF, CAMBI, output size).
-- **sweep_points** — one row per (job, CQ) pair: the measured CQ→VMAF/CAMBI/size curve for that file. These curves are content-independent and are pooled across dissimilar sources to predict a good CQ centre before a sweep runs.
+- `maxParallelCpuV1=2` permits two CPU scorers per flow job;
+- `maxParallelVmaf=8` is also used as threads per CPU-v1 scorer;
+- multiple active flow jobs multiply both values.
 
-### Phase 4 — ACTING (June 2026)
+A host-wide semaphore and a dedicated `cpuV1ThreadsPerScore` input should
+reserve CPU for the Tdarr server, node, Docker, and decoders.
 
-The A/B-shadow predictor has been promoted to full acting mode. The current active system includes:
+## Candidate selection and terminal encode
 
-- **Learned similarity weights (η² correlation ratios)** — `vmafpredict.learnFeatureWeights` computes each metadata covariate's η² on the optimal-CQ distribution. Live empirical findings: `release_group` and `genre` (η²≈0.23 each) are the top predictors; `network` ≈0.19; `type`/`year`/`language`/`codec` ≈0. These are recomputed from the live DB on every prediction call, so they self-update as more data accrues.
+`selectBestParameters` applies quality, frame-tail, banding, projected-size,
+and holdout rules. `learnCQRange` and `exportVMAFResults` write search outcomes
+before the final title encode. The terminal monitor is the appropriate source
+of truth for transcode success/failure; the older CSV success label written
+before transcode is semantically wrong.
 
-- **Sequential sampling with early stop** — `calculateVMAF` now measures clips in randomised order (shared permutation across CQs so curves remain comparable) and stops a CQ once its mean CI ≤ 0.5 VMAF and the worst clip clears `floor+2` margin. Per-file sigma is plausibility-bounded (0.05–6) and fed back for future clips. Disabled via `args.variables.vmafSequentialSampling=false`.
+`vmafOptimizedTranscode` creates an authenticated post-encode checkpoint. This
+allows later stages to reuse a verified exit-zero artifact after a process or
+flow interruption. It also enforces a hard wall-clock timeout of twice the
+source duration, clamped to 30 minutes–4 hours.
 
-- **Holdout CAMBI self-comparison** — the holdout validation now compares the holdout segment's own source CAMBI to the encode-introduced CAMBI delta, rather than gating against a job-global floor. Fixes VMAF-100/CAMBI-high false-fails where source banding was already elevated.
+`monitorTranscodeRetry` validates the terminal output and decides whether to
+retry search/transcode, keep the original, or proceed. Retries are bounded.
 
-- **Data integrity filter** — `getSimilarSweepCurves` (v4 schema) excludes physically-impossible rows (`vmaf_min>vmaf_max` or `vmaf_mean` outside `[min,max]`) by default. ~92% of historical CSV-backfill rows had these misalignments; `recover_sweep_aggregates.js` recomputed correct aggregates from per-sample columns, reducing violations from 17,956 to 107 (auto-excluded).
+## Film grain
 
-- **Per-file sigma bounding** — `selectSampleCount` now plausibility-bounds per-clip sigma to [0.05, 6] with a floor of 3 clips. Previously inert despite being wired in; now actively adapts clip count to content variance.
+`analyzeFilmGrain` runs the pinned direct pipeline and produces a versioned,
+source-scoped artifact. The pipeline combines the required NVEncC KNN analysis
+with grav1synth fitting.
 
-- **Show-title and source-banding similarity** — schema v6 adds `media_title`; the predictor treats exact same-show/movie matches as a strong prior and compares source banding by `max(source_cambi, source_cambi_p95)`.
+`synthesizeFilmGrain` applies the artifact after a successful base encode.
+The direct production path validates structure and metadata, but the audit
+found that it does not perform bounded full-title decode validation after the
+bitstream rewrite. That validation must be restored before replacement.
 
-- **GPU pipeline lock** — flows can safely run two GPU workers for pipeline overlap while serialising GPU-heavy sections (`testEncodingParameters`, `calculateVMAF`, `vmafOptimizedTranscode`) through `acquireGpuPipelineLock` / `releaseGpuPipelineLock`.
+Both grain plugins should compare canonical `realpath` values with a canonical
+media root. Their current regex checks occur on uncanonicalized paths while
+`stat` follows symlinks.
 
-### Additional _lib utilities
+## Persistence
 
-- `backfill_metadata.js` — enriches historical jobs with metadata covariates (genre, release_group, network, codec) for the η² feature learning.
-- `recover_sweep_aggregates.js` — recomputes corrupted aggregate columns (`vmaf_mean`, `vmaf_min`, `vmaf_max`) from per-sample data already stored in `sweep_points`.
+### Tdarr application database
 
-### Legacy state
+Tdarr's live SQL directory is mounted from a named Docker volume over
+`/app/server/Tdarr/DB2/SQL`. A same-named host directory is therefore a stale
+shadow, not a reliable backup source. Back up the active volume with SQLite's
+online backup API during a quiescent/consistent operation.
 
-The legacy CSV files are not cross-linked with new SQLite jobs (they shared no common key). New jobs are unified by `vmafJobId`, a shared variable seeded by `extractVideoSamples` and propagated through the full flow.
+### Learning database
 
-## Why the FFmpeg/libvmaf runtime is part of the architecture
+`/app/configs/vmaf_training.db` is the row-level learning authority. Its
+`jobs` and `sweep_points` tables contain media-identifying fields and are
+private. SQLite is authoritative; CSV outputs are best-effort sidecars and
+have unlocked append races.
 
-The plugins are tightly coupled to FFmpeg capabilities. They expect AV1 NVENC encoders, VMAF filters, FFprobe behavior, and wrapper names used by Tdarr. That is why the recommended path is the provided FFmpeg/libvmaf image/build, not a stock Tdarr image with arbitrary FFmpeg.
+The public database under `data/public/` is built from scratch. It contains
+only aggregate buckets with a minimum cohort size and never copies raw pages,
+row identifiers, paths, titles, release groups, or exact timestamps.
 
-See [Installation](installation.md) and [Plugin reference](plugin-reference.md).
+### Deployment source
+
+The init hook copies pinned plugin files to both the persistent server catalog
+and the ephemeral internal-node catalog. It also exposes shared helpers from
+`/custom-cont-init.d/vmaf-plugin-patches/_lib`, because existing plugins use
+that absolute fallback.
+
+The init-pinned subset of the review tree (`plugins/`) and deployment mirror
+must stay identical. Inactive reference plugins are not necessarily mirrored
+or startup-pinned. `manifest.json`, the checkout source-parity verifier, and
+the in-container deployment verifier exist to detect drift in the pinned
+runtime set.
+
+## Trust boundaries
+
+- Media filenames and paths are untrusted input.
+- Flow inputs may be edited through Tdarr and must not select arbitrary
+  deletion/lock roots.
+- Plex/TMDB/TVDB/Radarr/Sonarr credentials belong in environment variables,
+  never the tracked flow.
+- Arr unmonitor operations are external state changes and need stronger
+  identity verification.
+- Custom init, FFmpeg, CUDA, grav1synth, grain-pipeline, and NVEncC artifacts
+  are privileged deployment inputs and must be checksum-pinned.

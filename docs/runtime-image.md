@@ -1,54 +1,98 @@
-# FFmpeg/libvmaf runtime
+# Runtime image and artifact contract
 
-The workflow should be run with the provided FFmpeg/libvmaf runtime image or build recipe.
+The deployment is a pinned Tdarr base plus separately mounted FFmpeg, CUDA,
+libvmaf, grav1synth, grain-pipeline, NVEncC, and model artifacts.
 
-## Why this matters
+## CPU VMAF-v1 layer
 
-The plugins are not generic FFmpeg wrappers. They expect specific features to exist:
+`runtime/vmaf-v1/Dockerfile.vmaf-v1-cpu`:
 
-| Capability | Why it is needed |
-|---|---|
-| `av1_nvenc` | final AV1 transcode and sample encodes |
-| `h264_nvenc` / `hevc_nvenc` | intermediate compatibility and test paths |
-| NVIDIA decode/CUVID/NVDEC support | efficient decode paths for samples and scoring |
-| `libvmaf` | perceptual quality scoring |
-| `libvmaf_cuda` where available | GPU-accelerated VMAF paths |
-| libvmaf model support | VMAF model selection without missing model-file errors |
-| libvmaf `feature=` support | CAMBI-style banding feature integration |
-| `tdarr-ffmpeg` / `tdarr-ffprobe` wrappers | Tdarr plugin compatibility |
+- pins the Tdarr base by digest;
+- builds official libvmaf 3.2.0 plus the pinned post-release revision;
+- enables CPU/float tools and built-in models;
+- installs into isolated `/opt/vmaf-v1`;
+- adds `vmaf-v1` and `vmaf-v1-score` wrappers;
+- does not put `/opt/vmaf-v1` on global `LD_LIBRARY_PATH`.
 
-A normal Tdarr image may not have this combination. If one feature is missing, the failure often appears much later as a confusing FFmpeg or Tdarr job-report error.
-
-## Recommended path
-
-Use one of these, in order:
-
-1. A project-provided prebuilt runtime image for your platform, if available.
-2. A locally built image/runtime using the scripts in `docker/`.
-3. A custom FFmpeg/libvmaf runtime you have validated yourself with `tools/validate-install.sh`.
-
-Avoid running the flow against an arbitrary system FFmpeg just because Tdarr can see it.
-
-## Validation
-
-Inside the running Tdarr container, the important checks are:
+Build through the root compose example or directly:
 
 ```bash
-tdarr-ffmpeg -hide_banner -filters 2>/dev/null | grep -iE 'libvmaf|vmaf'
-tdarr-ffmpeg -hide_banner -encoders 2>/dev/null | grep -iE 'av1_nvenc|hevc_nvenc|h264_nvenc'
-tdarr-ffmpeg -hide_banner -h filter=libvmaf 2>&1 | grep -i feature
+docker build \
+  -f runtime/vmaf-v1/Dockerfile.vmaf-v1-cpu \
+  -t tdarr-vmaf-av1-workflow:local \
+  runtime/vmaf-v1
 ```
 
-Or run the bundled validator from the repository root:
+The scorer wrapper uses `VMAF_V1_WORK_ROOT`, which the example maps to a
+dedicated named volume. This prevents Tdarr's `/temp` cache scanner from
+enumerating scorer scratch every minute.
 
-```bash
-bash tools/validate-install.sh tdarr
+The build is reproducible source, but production metric authority still
+requires a versioned calibration artifact and runtime hash attestation. The
+current helper has incomplete geometry coverage and provisional HDR support;
+see [Quality policy](quality-policy.md).
+
+## Custom FFmpeg/libvmaf
+
+`custom-ffmpeg/` is the mounted prefix used by the Tdarr shims.
+`custom-cont-init.d/99-replace-ffmpeg.sh` verifies and installs those shims.
+The build scripts under `build-scripts/` target the CUDA/libvmaf capability
+required by this flow.
+
+Required validation after a rebuild includes:
+
+- `tdarr-ffmpeg -version` and hash;
+- `libvmaf_cuda` filter presence;
+- CUDA PTX path;
+- 10-bit input path;
+- the VMAF-v1 capability contract;
+- both 8-bit and 10-bit grain/NVEncC smoke tests.
+
+These are qualification checks, not suitable as a recurring 30-second or
+two-minute health check.
+
+## Grain toolchain
+
+The runtime expects stable paths:
+
+```text
+/usr/local/bin/grav1synth
+/opt/grain-pipeline/current/grain_pipeline_v5_direct.py
+/usr/local/bin/nvencc
+/usr/local/libexec/tdarr-nvencc-knn-ffmpeg.js
 ```
 
-## About CAMBI
+The init hooks install those paths from read-only artifact mounts after
+checksum/provenance checks. The repository omits large/generated binaries.
 
-Some FFmpeg/libvmaf builds do not list CAMBI explicitly in `ffmpeg -h filter=libvmaf`, even though `feature=name=cambi` can still be routed through libvmaf's generic feature interface. The reliable proof is a real VMAF JSON/job report that includes CAMBI values.
+Direct film-grain synthesis rewrites AV1 bitstreams. Structural inspection is
+not enough: release qualification must include a bounded full-title decode of
+the rewritten output before replacement.
 
-## Binary redistribution
+## Startup hooks
 
-NVIDIA/FFmpeg builds can involve GPL and nonfree configure flags. A local image can be useful operationally while still being unsuitable for public binary redistribution. Check the actual FFmpeg configure line before publishing an image.
+The canonical root is `custom-cont-init.d/`; the former stale `docker/` init
+tree has been removed. Hooks:
+
+- prepare the build environment and libvmaf;
+- install models and the custom FFmpeg shims;
+- copy pinned Local plugins/helpers to server and internal-node catalogs;
+- initialize protected checkpoint storage;
+- verify plugin/helper/flow parity;
+- install and qualify the grain toolchain.
+
+The parity hook is deliberately fail-closed. A canonical/live mismatch can
+halt startup, so graph changes and restarts must be maintenance-window actions.
+
+## Updates
+
+Disable automatic Tdarr server, node, plugin, and container replacement for
+the pinned runtime. Upgrade as one versioned unit:
+
+1. base image digest;
+2. VMAF revision and wrapper;
+3. FFmpeg/libvmaf/CUDA artifacts;
+4. plugin/helper payload;
+5. flow canonical;
+6. tests and manifest;
+7. canary evidence and rollback snapshot.

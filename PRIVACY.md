@@ -1,11 +1,20 @@
-# Privacy policy for exported learning data
+# Privacy policy for repository exports
 
-This project should only publish aggregate, de-identified learning priors.
+This public repository may contain only credential-redacted flow definitions
+and aggregate, de-identified learning priors.
 
-Allowed public fields include broad resolution tier, codec bucket, source-type bucket, animation/live-action class, sample counts, and rounded distribution statistics for CQ/VMAF/SSIM/CAMBI/BPP/output ratio.
+Allowed learning dimensions are broad resolution, codec, source-type, and
+animation/live-action buckets. Allowed values are cohort counts and rounded
+CQ, VMAF, SSIM, CAMBI, BPP, target-VMAF, and output-ratio distribution
+statistics. Every published cohort must contain at least 25 observations.
 
-Disallowed public fields include raw rows, file paths, filenames, titles, release groups, exact timestamps, Plex/TMDB/TVDB identifiers, API tokens, job reports, media-library mounts, and Tdarr databases.
+Disallowed data includes raw rows or database pages, paths, filenames, titles,
+release groups, exact event timestamps, media/provider identifiers, API
+credentials, job reports, logs, mounts, private backups, and Tdarr application
+databases/WAL files.
 
-The sanitizer is allowlist-based: columns not explicitly used by the aggregation code are ignored.
+Exports must be created from a consistent SQLite online backup into a new
+database with an explicit schema. Filesystem-copying an active database and
+then deleting columns is not an acceptable sanitizer.
 
-For the practical workflow and rationale, see [docs/privacy-and-data.md](docs/privacy-and-data.md).
+See [Privacy and data handling](docs/privacy-and-data.md).

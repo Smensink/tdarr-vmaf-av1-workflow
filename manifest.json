@@ -1,144 +1,401 @@
 {
-  "exported_at_utc": "2026-06-22T22:38:33Z",
-  "source": "local clean-room export from allowlisted Tdarr VMAF workflow files",
-  "excluded": [
-    "raw configs",
-    "server DB",
-    "job reports",
-    "logs",
-    "cache/workdirs",
-    "raw learning CSV rows",
-    "media paths",
-    "backup trees",
-    "stale duplicate learnCQRanges plugin"
-  ],
+  "schema": "tdarr-vmaf-av1-manifest/v3",
+  "generatedAtUtc": "2026-07-27T04:16:44Z",
+  "source": {
+    "type": "redacted live-flow export plus parity-verified host plugin payloads",
+    "flowId": "YR5PZ1QaD",
+    "flowName": "VMAF Parameter Optimization + stream reorder",
+    "flowNodes": 34,
+    "flowEdges": 53
+  },
+  "privacy": {
+    "rawTdarrDatabaseIncluded": false,
+    "rawLearningDatabaseIncluded": false,
+    "publicLearningSnapshot": "data/public/vmaf-learning-public.sqlite3",
+    "policy": "Aggregate-only database and redacted flow configuration."
+  },
   "plugins": [
     {
-      "name": "calculateVMAF",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/calculateVMAF/1.0.0/index.js"
-    },
-    {
-      "name": "checkCQBracket",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/checkCQBracket/1.0.0/index.js"
-    },
-    {
-      "name": "checkCQRangeRetry",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/checkCQRangeRetry/1.0.0/index.js"
-    },
-    {
-      "name": "checkHdrContent",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/checkHdrContent/1.0.0/index.js"
-    },
-    {
-      "name": "exportVMAFResults",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/exportVMAFResults/1.0.0/index.js"
-    },
-    {
-      "name": "extractVideoSamples",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/extractVideoSamples/1.0.0/index.js"
-    },
-    {
-      "name": "learnCQRange",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/learnCQRange/1.0.0/index.js"
-    },
-    {
-      "name": "selectBestParameters",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/selectBestParameters/1.0.0/index.js"
-    },
-    {
-      "name": "testEncodingParameters",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/testEncodingParameters/1.0.0/index.js"
-    },
-    {
-      "name": "vmafOptimizedTranscode",
-      "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/vmafOptimizedTranscode/1.0.0/index.js"
-    },
-    {
-      "name": "checkFileLimits",
-      "version": "1.0.0",
-      "source": "tdarr-local-plugin-runtime-copy",
-      "path": "plugins/vmaf/checkFileLimits/1.0.0/index.js"
-    },
-    {
-      "name": "checkVideoCodec",
-      "version": "1.0.0",
-      "source": "tdarr-local-plugin-runtime-copy",
-      "path": "plugins/vmaf/checkVideoCodec/1.0.0/index.js"
-    },
-    {
-      "name": "cleanupTempFiles",
-      "version": "1.0.0",
-      "source": "tdarr-local-plugin-runtime-copy",
-      "path": "plugins/vmaf/cleanupTempFiles/1.0.0/index.js"
-    },
-    {
-      "name": "detectGPUEncoder",
-      "version": "1.0.0",
-      "source": "tdarr-local-plugin-runtime-copy",
-      "path": "plugins/vmaf/detectGPUEncoder/1.0.0/index.js"
-    },
-    {
-      "name": "detectSceneComplexity",
-      "version": "1.0.0",
-      "source": "tdarr-local-plugin-runtime-copy",
-      "path": "plugins/vmaf/detectSceneComplexity/1.0.0/index.js"
-    },
-    {
-      "name": "fetchMediaMetadata",
-      "version": "1.0.0",
-      "source": "tdarr-local-plugin-runtime-copy",
-      "path": "plugins/vmaf/fetchMediaMetadata/1.0.0/index.js"
-    },
-    {
-      "name": "monitorTranscodeRetry",
-      "version": "1.0.0",
-      "source": "tdarr-local-plugin-runtime-copy",
-      "path": "plugins/vmaf/monitorTranscodeRetry/1.0.0/index.js"
-    },
-    {
       "name": "checkFileAge",
+      "category": "filter",
       "version": "1.0.0",
-      "source": "tdarr-local-plugin-runtime-copy",
-      "path": "plugins/filter/checkFileAge/1.0.0/index.js"
+      "path": "plugins/filter/checkFileAge/1.0.0/index.js",
+      "sha256": "e0e4177ce7a5422ffcb6eb005cd0e3e7891a1fbde624c8ae8b9f2eb99d21b7d1",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "unmonitorRadarrOrSonarr",
+      "category": "tools",
+      "version": "1.0.0",
+      "path": "plugins/tools/unmonitorRadarrOrSonarr/1.0.0/index.js",
+      "sha256": "656a609b6c74cc14445599d0602a01da64a2dd27c7a9b30239a13a315a02ed13",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
     },
     {
       "name": "acquireGpuPipelineLock",
+      "category": "vmaf",
       "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/acquireGpuPipelineLock/1.0.0/index.js"
+      "path": "plugins/vmaf/acquireGpuPipelineLock/1.0.0/index.js",
+      "sha256": "85d60b928c16825a7bd748625e0071da66d5aa93f01f7dedda2784970ef8f20d",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "analyzeFilmGrain",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/analyzeFilmGrain/1.0.0/index.js",
+      "sha256": "2c4406c4a3ae8f50006eef48237b4e533ed4a3c01babe836f90ba1cabfbfcc29",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "calculateVMAF",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/calculateVMAF/1.0.0/index.js",
+      "sha256": "8f41bb18d67ce59b3a9a56df5dddaca4d5902839016c6e6fa748a0359180ae6a",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "checkCQBracket",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/checkCQBracket/1.0.0/index.js",
+      "sha256": "83aa37a9a4bbfeb17847b025e044e855c13d1ba73154b5e232651bc52a956816",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "checkCQRangeRetry",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/checkCQRangeRetry/1.0.0/index.js",
+      "sha256": "b8c6907327beab8d3f5950446c5cc4c36486bbe35ba9316784dcd31cb106610e",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "checkFileLimits",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/checkFileLimits/1.0.0/index.js",
+      "sha256": "8e4128f5d4ad5a0a69d1f01de87d70eee1b65e707a9fea65ffbcbc1faf5e29a4",
+      "activeInLiveFlow": false,
+      "pinnedAtContainerStart": false
+    },
+    {
+      "name": "checkHdrContent",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/checkHdrContent/1.0.0/index.js",
+      "sha256": "96db7ce56bc9c4eb9098c47ff8da4a34f012868904155bf07871754b411600b3",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "checkVideoCodec",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/checkVideoCodec/1.0.0/index.js",
+      "sha256": "71e21c9e7fe3f9474c77e13b88374e8caeea26a31aca46fd799ce9b65fdcd70b",
+      "activeInLiveFlow": false,
+      "pinnedAtContainerStart": false
+    },
+    {
+      "name": "cleanupTempFiles",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/cleanupTempFiles/1.0.0/index.js",
+      "sha256": "97147796cd0bd2550beb90a5af0213f8a7fffb3f5b3f5187c15e9dea31caa29f",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "detectGPUEncoder",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/detectGPUEncoder/1.0.0/index.js",
+      "sha256": "20a85e30f1d7118d15e4d468139b2c78a215568847431c5943cbdec612c2381a",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "detectSceneComplexity",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/detectSceneComplexity/1.0.0/index.js",
+      "sha256": "6b51681229a04d00763939336555d18d876259579a62457435d1e56c317c3f61",
+      "activeInLiveFlow": false,
+      "pinnedAtContainerStart": false
+    },
+    {
+      "name": "exportVMAFResults",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/exportVMAFResults/1.0.0/index.js",
+      "sha256": "5dd6f980320e425520252b0d19a742674137f5a4212cb4e7bc745de5de326c55",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "extractVideoSamples",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/extractVideoSamples/1.0.0/index.js",
+      "sha256": "8247d081183b40ad9b9c7e78d5a040f6f32a2c44931a33b5f4b7fd6c354ded87",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "fetchMediaMetadata",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/fetchMediaMetadata/1.0.0/index.js",
+      "sha256": "cdfcd85ff923ce8d667a6c11c1abe7da259e255883903d5d270bd8e50ce5af47",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "learnCQRange",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/learnCQRange/1.0.0/index.js",
+      "sha256": "05542b95b7e6e0d18ec3b243460365d928a7b5efaa93e067282fc233209969f1",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "learnCQRanges",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/learnCQRanges/1.0.0/index.js",
+      "sha256": "102a3d8a1be4f8e3a95d22085ff56ec01b7b017a33e57d12e3dc3d4d529e7b34",
+      "activeInLiveFlow": false,
+      "pinnedAtContainerStart": false
+    },
+    {
+      "name": "monitorTranscodeRetry",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/monitorTranscodeRetry/1.0.0/index.js",
+      "sha256": "71199c698eb929cdee60872396151e29e27340c50d7a0f9a578502538c97a7ca",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
     },
     {
       "name": "releaseGpuPipelineLock",
+      "category": "vmaf",
       "version": "1.0.0",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/releaseGpuPipelineLock/1.0.0/index.js"
+      "path": "plugins/vmaf/releaseGpuPipelineLock/1.0.0/index.js",
+      "sha256": "fa057d6e6fe87cb8bc8e50f3fc4c574ef3bd90cfd4bd8c4a55d72c0922752614",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "selectBestParameters",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/selectBestParameters/1.0.0/index.js",
+      "sha256": "6468a1ad89574ddcd441fad879bd17de27338145cde8d21895e4da1858f54976",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "synthesizeFilmGrain",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/synthesizeFilmGrain/1.0.0/index.js",
+      "sha256": "df1b5823f84d159acd5debb1ce11edb3fc2057d9a69b76823d1acc6eae3bfcd8",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "testEncodingParameters",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/testEncodingParameters/1.0.0/index.js",
+      "sha256": "1b3bba77b6b426671a2b0c68c06e74faa862fdfec94951b30ca03c868e25077e",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "vmafOptimizedTranscode",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/vmafOptimizedTranscode/1.0.0/index.js",
+      "sha256": "405b1c81f5a75adf50af0bfe8103b020adb8c2f7fce94948bf0eafa22102428b",
+      "activeInLiveFlow": true,
+      "pinnedAtContainerStart": true
     }
   ],
-  "support_files": [
+  "runtimeHelpers": [
     {
-      "name": "_lib/gpuPipelineLock.js",
-      "source": "patched-host-source",
-      "path": "plugins/vmaf/_lib/gpuPipelineLock.js"
+      "name": "canonicalDenoise.js",
+      "path": "plugins/vmaf/_lib/canonicalDenoise.js",
+      "sha256": "14bacb4e30ec945f7a2dbc85e0eb3da4014139f8d9ab46342f18a7a5a945ae17"
+    },
+    {
+      "name": "currentContractMeasurementHistory.js",
+      "path": "plugins/vmaf/_lib/currentContractMeasurementHistory.js",
+      "sha256": "91e1913a26bccc70faa11d38b425fe3403b8f1c8faec2a9924e173979ce2ff8e"
+    },
+    {
+      "name": "emptyBandShadow.js",
+      "path": "plugins/vmaf/_lib/emptyBandShadow.js",
+      "sha256": "d25cece7536f2fdbdb22c9d757666c20a9413c6c87221d5feccc0fa6f4157df8"
+    },
+    {
+      "name": "feasibility.js",
+      "path": "plugins/vmaf/_lib/feasibility.js",
+      "sha256": "a9ebabf6b53c67d99150f92de6c6fef9458930e59905a86cbcde8cd9befa1400"
+    },
+    {
+      "name": "gpuPipelineLock.js",
+      "path": "plugins/vmaf/_lib/gpuPipelineLock.js",
+      "sha256": "d022c030bb0f168f8b001a3ac8a606937a71aa12f94d6bbe55c47360633d36dd"
+    },
+    {
+      "name": "grainAnalysisArtifact.js",
+      "path": "plugins/vmaf/_lib/grainAnalysisArtifact.js",
+      "sha256": "ed9895a83e1f55d0175e1b2b6bcb560229f34c1df70de036e2eb3f5d03bb3f0b"
+    },
+    {
+      "name": "grainVmafContract.js",
+      "path": "plugins/vmaf/_lib/grainVmafContract.js",
+      "sha256": "adb83df320c4ed12dc0a68dbf88242d823549990ac35c2439f89bd6f64ca7a7c"
+    },
+    {
+      "name": "nvenccKnn.js",
+      "path": "plugins/vmaf/_lib/nvenccKnn.js",
+      "sha256": "509b4b3f8db150270515281bbfed5dac6ec47772314b92f172b3063d46b55e45"
+    },
+    {
+      "name": "nvencTemporalFilter.js",
+      "path": "plugins/vmaf/_lib/nvencTemporalFilter.js",
+      "sha256": "9fa816be4bbc7734b7db543f27681d54e17e1636e47e2bdaa5c9470aa514d247"
+    },
+    {
+      "name": "pairedCqShadow.js",
+      "path": "plugins/vmaf/_lib/pairedCqShadow.js",
+      "sha256": "10e81fcec79164964348ac95b8c4c5af17e11aeaeb169c0a440af02ddf7a3bc8"
+    },
+    {
+      "name": "postEncodeCheckpoint.js",
+      "path": "plugins/vmaf/_lib/postEncodeCheckpoint.js",
+      "sha256": "a3cecd3970fdb293180baeac353e14252a54d493d09683266e068de06383d7e0"
+    },
+    {
+      "name": "preFgsCambi.js",
+      "path": "plugins/vmaf/_lib/preFgsCambi.js",
+      "sha256": "1d22d07e51884ad8ec0d660aaf439f3e86fccaf6209a12f4b06fe39223b42de4"
+    },
+    {
+      "name": "referenceContractBridge.js",
+      "path": "plugins/vmaf/_lib/referenceContractBridge.js",
+      "sha256": "4ca179a5f59aa545feb41d6621b0b53b2b9fe6ef38904c99a1ba606b2a1608cf"
+    },
+    {
+      "name": "rejectionReasons.js",
+      "path": "plugins/vmaf/_lib/rejectionReasons.js",
+      "sha256": "4f0f354773ab77ea464fd26d9c7c837b772afcefce5a5143f7655c2d2bca10f8"
+    },
+    {
+      "name": "sizeFailureShadow.js",
+      "path": "plugins/vmaf/_lib/sizeFailureShadow.js",
+      "sha256": "22f47b673401b1ff8a6b500622589c3ff50720ebae539bb1730da3abf48a146b"
+    },
+    {
+      "name": "vmafdb.js",
+      "path": "plugins/vmaf/_lib/vmafdb.js",
+      "sha256": "e975e58c7b2238ed40f99224877f9870e00903a52864d911fb2f00e307ed24ce"
+    },
+    {
+      "name": "vmafMetricContract.js",
+      "path": "plugins/vmaf/_lib/vmafMetricContract.js",
+      "sha256": "6dcd3cc0505e564309ae3166f7868f4fb359c7db98dac75dac8648e1d296a632"
+    },
+    {
+      "name": "vmafpredict.js",
+      "path": "plugins/vmaf/_lib/vmafpredict.js",
+      "sha256": "65eacef501f645342e4beb49f3ff80dd6b0d1cb8f32921178d490df04b0b5568"
+    },
+    {
+      "name": "vmafV1Cpu.js",
+      "path": "plugins/vmaf/_lib/vmafV1Cpu.js",
+      "sha256": "cff853f84b1debcb70a1c14a40c276aa25a30315d8c1d38788187b46da99fc11"
     }
-  ]
+  ],
+  "supportAssets": {
+    "models": [],
+    "tests": [
+      {
+        "name": "test_vmafMetricContract.js",
+        "path": "plugins/vmaf/_lib/test_vmafMetricContract.js",
+        "sha256": "fdb9c497cb504c93e3b8fe0aa5bcf75ecbe0b4712a06b41484f6fc1da0da5768"
+      },
+      {
+        "name": "test_vmafpredict.js",
+        "path": "plugins/vmaf/_lib/test_vmafpredict.js",
+        "sha256": "0edd6c62f0d6e82dcc5f1f39b6cfdd404660f9c4e3ab809cdfcfe349e0a7cdef"
+      },
+      {
+        "name": "vmafV1Cpu.test.js",
+        "path": "plugins/vmaf/_lib/vmafV1Cpu.test.js",
+        "sha256": "4dcc7a2f64689596abec478ba056c4852838d27d642a31dc571fc54c3185e042"
+      }
+    ],
+    "maintenance": [
+      {
+        "name": "ab_convergence.js",
+        "path": "plugins/vmaf/_lib/ab_convergence.js",
+        "sha256": "7df1046191aaae7221b220af82bc9ab62598cfc26d4009bef600efcfcdfb11cb"
+      },
+      {
+        "name": "ab_sweepdomain.js",
+        "path": "plugins/vmaf/_lib/ab_sweepdomain.js",
+        "sha256": "beff3c76827b9905f35e80152cd100e0f3be0819589d2cc5205e28b437d82ae5"
+      },
+      {
+        "name": "ab_vmafpredict.js",
+        "path": "plugins/vmaf/_lib/ab_vmafpredict.js",
+        "sha256": "c01068ae6753cee7b702c028aae843dbcc20b575b5502e8aa679100dd17a38c6"
+      },
+      {
+        "name": "backfill_media_title.js",
+        "path": "plugins/vmaf/_lib/backfill_media_title.js",
+        "sha256": "c51595c0a81c391617e854f47254ccab41bc58a6318f2cc9c9d52bf520fdc343"
+      },
+      {
+        "name": "backfill_metadata.js",
+        "path": "plugins/vmaf/_lib/backfill_metadata.js",
+        "sha256": "005545527786367763bdbf7b51bbcc942fbc875c89574ffd357bd796d084d716"
+      },
+      {
+        "name": "backfill_size_outcomes_from_job_reports.py",
+        "path": "plugins/vmaf/_lib/backfill_size_outcomes_from_job_reports.py",
+        "sha256": "04c414033f3df43840c9b7c76b1ff114a59f8f1364025395c15f9fc75637148d"
+      },
+      {
+        "name": "backfill_vmaf_training_db.js",
+        "path": "plugins/vmaf/_lib/backfill_vmaf_training_db.js",
+        "sha256": "653a13066f8689bf0a6dd3a089cb4457258541347b8496461fdc70a006cea531"
+      },
+      {
+        "name": "recover_sweep_aggregates.js",
+        "path": "plugins/vmaf/_lib/recover_sweep_aggregates.js",
+        "sha256": "703327507d5009294b8d384687e7a627ca56b27657a5f944c6f9c342521e42d2"
+      }
+    ],
+    "modules": [
+      {
+        "name": "vmafV1Policy.js",
+        "path": "plugins/vmaf/_lib/vmafV1Policy.js",
+        "sha256": "6fd7fb89e6fcdfdddade35b094518de3ca7e98026241421319af0550caf7fdea"
+      }
+    ]
+  }
 }
