@@ -95,6 +95,34 @@ var details = function () { return ({
 }); };
 exports.details = details;
 
+var CRITICAL_DEFAULTS = Object.freeze({
+    targetVMAF: 95,
+    expansionCQCount: 2,
+    highMarginVMAFHeadroom: 1.5,
+    highMarginVMAFHeadroom4K: 2,
+    highMarginExpansionCQCount4K: 4,
+    threeStageVmaf: false,
+    intermediateVmafSubsample: 2,
+});
+
+function resolveCriticalDefaults(inputs) {
+    inputs = inputs || {};
+    function boundedNumber(name, min, max, integer) {
+        var value = Number(inputs[name]);
+        if (!isFinite(value) || value < min || value > max) value = CRITICAL_DEFAULTS[name];
+        return integer ? Math.round(value) : value;
+    }
+    return {
+        targetVMAF: boundedNumber('targetVMAF', 0, 100, false),
+        expansionCQCount: boundedNumber('expansionCQCount', 1, 16, true),
+        highMarginVMAFHeadroom: boundedNumber('highMarginVMAFHeadroom', 0, 20, false),
+        highMarginVMAFHeadroom4K: boundedNumber('highMarginVMAFHeadroom4K', 0, 20, false),
+        highMarginExpansionCQCount4K: boundedNumber('highMarginExpansionCQCount4K', 1, 16, true),
+        threeStageVmaf: inputs.threeStageVmaf === true || inputs.threeStageVmaf === 'true',
+        intermediateVmafSubsample: boundedNumber('intermediateVmafSubsample', 2, 4, true),
+    };
+}
+
 // ── Winner full-rate confirmation (2026-07-21, adaptive subsampling) ──
 // With coarse rounds at n=4 (flow input vmafSubsample=4), the selected winner could be a CQ
 // whose only measurement was frame-subsampled — carrying the known optimistic subsampling
@@ -151,13 +179,12 @@ var plugin = function (args) {
     var feasibility = require('../../_lib/feasibility.js');
     args.inputs = lib.loadDefaultValues(args.inputs, details);
 
-    var targetVMAF = Number(args.inputs.targetVMAF) || 95;
-    var expansionCQCount = Number(args.inputs.expansionCQCount) || 2;
-    var highMarginVMAFHeadroom = Number(args.inputs.highMarginVMAFHeadroom);
-    if (isNaN(highMarginVMAFHeadroom) || highMarginVMAFHeadroom < 0) highMarginVMAFHeadroom = 1.5;
-    var highMarginVMAFHeadroom4K = Number(args.inputs.highMarginVMAFHeadroom4K);
-    if (isNaN(highMarginVMAFHeadroom4K) || highMarginVMAFHeadroom4K < 0) highMarginVMAFHeadroom4K = 2;
-    var highMarginExpansionCQCount4K = Number(args.inputs.highMarginExpansionCQCount4K) || 4;
+    var policyInputs = resolveCriticalDefaults(args.inputs);
+    var targetVMAF = policyInputs.targetVMAF;
+    var expansionCQCount = policyInputs.expansionCQCount;
+    var highMarginVMAFHeadroom = policyInputs.highMarginVMAFHeadroom;
+    var highMarginVMAFHeadroom4K = policyInputs.highMarginVMAFHeadroom4K;
+    var highMarginExpansionCQCount4K = policyInputs.highMarginExpansionCQCount4K;
 
     args.jobLog('=== CQ Bracket Check ===');
 
@@ -504,6 +531,8 @@ var plugin = function (args) {
 };
 exports.plugin = plugin;
 exports._test = {
+    CRITICAL_DEFAULTS: CRITICAL_DEFAULTS,
+    resolveCriticalDefaults: resolveCriticalDefaults,
     chooseRefinementSubsample: chooseRefinementSubsample,
     chooseWinnerFullRateConfirmation: chooseWinnerFullRateConfirmation,
 };

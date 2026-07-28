@@ -7,9 +7,83 @@ var crypto = require("crypto");
 var path = require("path");
 
 var MAX_RECOVERY_JSON_BYTES = 64 * 1024;
+var TOO_YOUNG_RECORD_ROOT = '/app/configs/too_young_files.d';
 
 function sha256Text(value) {
     return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
+
+function calculateFileAge(fileDate, now) {
+    var timestamp = Number(fileDate);
+    var currentTime = now === undefined ? Date.now() : Number(now);
+    if (!Number.isFinite(timestamp) || timestamp <= 0 ||
+        !Number.isFinite(currentTime) || currentTime <= 0) {
+        throw new Error('file age calculation requires valid positive timestamps');
+    }
+    var future = timestamp > currentTime;
+    var ageMs = future ? 0 : currentTime - timestamp;
+    return {
+        timestamp: timestamp,
+        ageMs: ageMs,
+        ageDays: ageMs / (24 * 60 * 60 * 1000),
+        future: future,
+    };
+}
+
+function persistTooYoungFirstSeen(record, recordRoot) {
+    var sourcePath = path.resolve(String(record && record.file || ''));
+    if (!sourcePath || sourcePath === path.parse(sourcePath).root) {
+        throw new Error('too-young record source path is empty or unsafe');
+    }
+    var root = path.resolve(String(recordRoot || TOO_YOUNG_RECORD_ROOT));
+    fs.mkdirSync(root, { recursive: true });
+    var rootStat = fs.lstatSync(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() ||
+        path.resolve(fs.realpathSync(root)) !== root) {
+        throw new Error('too-young record root is not a canonical real directory');
+    }
+    var sourceKey = sha256Text(sourcePath);
+    var recordPath = path.join(root, sourceKey + '.json');
+    if (!pathWithin(root, recordPath)) {
+        throw new Error('too-young record path escaped its protected root');
+    }
+    var firstSeenRecord = Object.assign({}, record, {
+        schema: 1,
+        sourceKey: sourceKey,
+        file: sourcePath,
+        firstObservedAt: new Date().toISOString(),
+    });
+    var payload = JSON.stringify(firstSeenRecord, null, 2) + '\n';
+    if (Buffer.byteLength(payload, 'utf8') > MAX_RECOVERY_JSON_BYTES) {
+        throw new Error('too-young first-seen record is too large');
+    }
+
+    // Publish a complete inode with an atomic no-replace hard link. Concurrent
+    // workers for the same source race only on the link: exactly one wins and
+    // the immutable first-seen timestamp cannot be overwritten.
+    var temporaryPath = path.join(root, '.' + sourceKey + '.' + process.pid + '.' +
+        crypto.randomBytes(8).toString('hex') + '.tmp');
+    try {
+        fs.writeFileSync(temporaryPath, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+        try {
+            fs.linkSync(temporaryPath, recordPath);
+            return { created: true, path: recordPath, record: firstSeenRecord };
+        } catch (linkError) {
+            if (!linkError || linkError.code !== 'EEXIST') throw linkError;
+        }
+    } finally {
+        try { fs.unlinkSync(temporaryPath); } catch (cleanupError) {
+            if (!cleanupError || cleanupError.code !== 'ENOENT') throw cleanupError;
+        }
+    }
+
+    var existing = readBoundedJson(recordPath, 'too-young first-seen record');
+    if (existing.schema !== 1 || existing.sourceKey !== sourceKey ||
+        path.resolve(String(existing.file || '')) !== sourcePath ||
+        !Number.isFinite(Date.parse(String(existing.firstObservedAt || '')))) {
+        throw new Error('existing too-young first-seen record identity is invalid');
+    }
+    return { created: false, path: recordPath, record: existing };
 }
 
 function pathWithin(rootPath, childPath) {
@@ -369,14 +443,15 @@ var plugin = function (args) {
 
         // Calculate file age
         var now = Date.now();
-        var fileAgeMs = now - fileDate;
-        var ageDays = fileAgeMs / (24 * 60 * 60 * 1000);
+        var age = calculateFileAge(fileDate, now);
+        fileDate = age.timestamp;
+        var fileAgeMs = age.ageMs;
+        var ageDays = age.ageDays;
 
-        // Validate calculated age (should be positive and reasonable)
-        if (fileAgeMs < 0) {
-            args.jobLog("WARNING: File date is in the future (age calculation negative). Using file date as-is.");
-            fileAgeMs = Math.abs(fileAgeMs); // Treat as positive for comparison
-            ageDays = Math.abs(ageDays);
+        // A future timestamp is never evidence that a file is old. Treat it as
+        // age zero so clock skew or malicious metadata cannot pass this gate.
+        if (age.future) {
+            args.jobLog("WARNING: File date is in the future. Treating the file as age zero; it cannot pass the age gate.");
         }
 
         // Log detailed information
@@ -425,37 +500,14 @@ var plugin = function (args) {
             };
             args.variables.tooYoungFiles.push(record);
 
-            // Optional persistent record in /app/configs/too_young_files.json (best-effort)
-            var recordPath = '/app/configs/too_young_files.json';
+            // Persist immutable per-source first-seen evidence. Per-key atomic
+            // publication avoids the lost updates of a shared JSON array.
             try {
-                var existing = [];
-                if (fs.existsSync(recordPath)) {
-                    var raw = fs.readFileSync(recordPath, 'utf8');
-                    if (raw.trim()) {
-                        try {
-                            existing = JSON.parse(raw);
-                        } catch (parseErr) {
-                            var backupPath = recordPath + '.corrupt-' + Date.now();
-                            try {
-                                fs.renameSync(recordPath, backupPath);
-                                args.jobLog('WARNING: too-young list was corrupt; moved aside to ' + backupPath + ': ' + parseErr.message);
-                            } catch (renameErr) {
-                                args.jobLog('WARNING: too-young list corrupt and backup failed: ' + renameErr.message);
-                            }
-                            existing = [];
-                        }
-                    }
-                    if (!Array.isArray(existing)) existing = [];
-                }
-                // avoid duplicates
-                var dedup = existing.filter(function(entry) { return entry && entry.file !== record.file; });
-                dedup.push(record);
-                var tmpPath = recordPath + '.tmp-' + process.pid;
-                fs.writeFileSync(tmpPath, JSON.stringify(dedup, null, 2));
-                fs.renameSync(tmpPath, recordPath);
-                args.jobLog("Recorded too-young file for later requeue: ".concat(record.file));
+                var persisted = persistTooYoungFirstSeen(record);
+                args.jobLog((persisted.created ? 'Recorded' : 'Retained') +
+                    " atomic too-young first-seen evidence for later requeue: ".concat(record.file));
             } catch (writeErr) {
-                args.jobLog("WARNING: Could not persist too-young list: ".concat(writeErr.message));
+                args.jobLog("WARNING: Could not persist too-young first-seen evidence: ".concat(writeErr.message));
             }
 
             throw new Error(errorMessage);
@@ -481,3 +533,7 @@ var plugin = function (args) {
     }
 };
 exports.plugin = plugin;
+exports._test = {
+    calculateFileAge: calculateFileAge,
+    persistTooYoungFirstSeen: persistTooYoungFirstSeen,
+};

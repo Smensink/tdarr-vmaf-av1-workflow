@@ -19,10 +19,10 @@ PRIVATE_ARTIFACT_NAMES = {
     'size_failure_shadow_hgb.json',
 }
 PATTERNS = [
-    ('windows-user-path', re.compile(r'C:[\\/]Users[\\/][^\\/\s]+', re.I)),
+    ('windows-user-path', re.compile(r'C:[\\/]+Users[\\/]+[^\\/\s]+', re.I)),
     ('msys-user-path', re.compile(r'/c/Users/[^/\s]+', re.I)),
     ('explicit-seb', re.compile(r'\bseb(?:astian|_m)?\b', re.I)),
-    ('windows-media-drive', re.compile(r'\b[D-Z]:[\\/](?:TV|Movies|Media|Downloads)\b', re.I)),
+    ('windows-media-drive', re.compile(r'\b[D-Z]:[\\/]+(?:TV|Movies|Media|Downloads)\b', re.I)),
     (
         'personal-media-mount',
         re.compile(r'/media/(?:TV|Movies)(?:_[A-Za-z0-9]+)?(?:/|\\b)', re.I),

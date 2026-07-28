@@ -14,8 +14,8 @@ for (const suffix of ['', '-journal', '-wal', '-shm']) {
   try { fs.unlinkSync(dbPath + suffix); } catch (_) {}
 }
 const db = vmafdb.openDb(dbPath);
-assert.strictEqual(vmafdb.SCHEMA_VERSION, 15);
-assert.strictEqual(db.prepare('PRAGMA user_version').get().user_version, 15);
+assert.strictEqual(vmafdb.SCHEMA_VERSION, 17);
+assert.strictEqual(db.prepare('PRAGMA user_version').get().user_version, 17);
 const sweepColumns = new Set(db.prepare('PRAGMA table_info(sweep_points)').all().map((row) => row.name));
 const jobColumns = new Set(db.prepare('PRAGMA table_info(jobs)').all().map((row) => row.name));
 for (const column of ['cambi_time_sec', 'measurement_disposition']) assert(sweepColumns.has(column), column);

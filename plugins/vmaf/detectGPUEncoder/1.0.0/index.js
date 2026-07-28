@@ -44,7 +44,7 @@ var plugin = function (args) {
     var targetCodec = String(args.inputs.targetCodec) || 'av1';
     var gpuEncoder = null;
     var useGPU = false;
-    var execSync = require('child_process').execSync;
+    var spawnSync = require('child_process').spawnSync;
     try {
         // Ensure library paths are available (system-wide via ldconfig or fallback to env)
         var env = Object.assign({}, process.env);
@@ -58,11 +58,19 @@ var plugin = function (args) {
 
         args.jobLog('Checking for GPU encoder using: ' + args.ffmpegPath);
 
-        var encoderList = execSync('"' + args.ffmpegPath + '" -hide_banner -encoders 2>&1', {
+        var probe = spawnSync(args.ffmpegPath, ['-hide_banner', '-encoders'], {
             encoding: 'utf8',
+            shell: false,
+            windowsHide: true,
             env: env,
             maxBuffer: 10 * 1024 * 1024 // 10MB buffer
         });
+        if (probe.error) throw probe.error;
+        if (probe.status !== 0) {
+            throw new Error('FFmpeg encoder probe exited ' + probe.status + ': ' +
+                String(probe.stderr || probe.stdout || '').trim().slice(-1200));
+        }
+        var encoderList = String(probe.stdout || '') + '\n' + String(probe.stderr || '');
 
         if (targetCodec === 'av1' && encoderList.indexOf('av1_nvenc') !== -1) {
             gpuEncoder = 'av1_nvenc';

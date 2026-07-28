@@ -97,6 +97,63 @@ work_root=${VMAF_V1_WORK_ROOT:-${TMPDIR:-/temp}}
   printf 'VMAF scorer work root is not writable: %s\n' "$work_root" >&2
   exit 73
 }
+max_parallel=${VMAF_V1_MAX_PARALLEL:-1}
+lease_wait_seconds=${VMAF_V1_LEASE_WAIT_SECONDS:-43200}
+case "$max_parallel:$lease_wait_seconds" in
+  *[!0-9:]*|'':*|*:) printf '%s\n' 'invalid CPU VMAF lease configuration' >&2; exit 78 ;;
+esac
+[ "$max_parallel" -ge 1 ] && [ "$max_parallel" -le 4 ] &&
+[ "$lease_wait_seconds" -ge 1 ] || {
+  printf '%s\n' 'VMAF_V1_MAX_PARALLEL must be 1-4 and VMAF_V1_LEASE_WAIT_SECONDS must be positive' >&2
+  exit 78
+}
+lease_root=$work_root/vmaf-v1-leases
+if [ -L "$lease_root" ]; then
+  printf 'refusing symlink CPU VMAF lease root: %s\n' "$lease_root" >&2
+  exit 73
+fi
+mkdir -p "$lease_root"
+[ -d "$lease_root" ] && [ -w "$lease_root" ] && [ ! -L "$lease_root" ] || {
+  printf 'CPU VMAF lease root is not a writable directory: %s\n' "$lease_root" >&2
+  exit 73
+}
+
+# The Tdarr flow can run several calculateVMAF instances at once. Per-plugin
+# concurrency therefore cannot protect the host. Keep one flock-backed slot
+# for each explicitly configured host-wide scorer lease. Lock files are stable
+# inodes; metadata is advisory and is replaced only while the slot is held.
+lease_fd=''
+lease_slot=''
+lease_metadata=''
+lease_started=$SECONDS
+while [ -z "$lease_fd" ]; do
+  slot=1
+  while [ "$slot" -le "$max_parallel" ]; do
+    slot_lock=$lease_root/slot-$slot.lock
+    exec {candidate_fd}>"$slot_lock"
+    if flock -n "$candidate_fd"; then
+      lease_fd=$candidate_fd
+      lease_slot=$slot
+      break
+    fi
+    exec {candidate_fd}>&-
+    slot=$((slot + 1))
+  done
+  [ -z "$lease_fd" ] || break
+  elapsed=$((SECONDS - lease_started))
+  [ "$elapsed" -lt "$lease_wait_seconds" ] || {
+    printf 'timed out after %ss waiting for a host-wide CPU VMAF scorer lease\n' "$elapsed" >&2
+    exit 75
+  }
+  if [ "$elapsed" -eq 0 ] || [ $((elapsed % 60)) -eq 0 ]; then
+    printf 'waiting for a host-wide CPU VMAF scorer lease (%ss)\n' "$elapsed" >&2
+  fi
+  sleep 1
+done
+lease_metadata=$lease_root/slot-$lease_slot.json
+printf '{"schema":1,"pid":%s,"slot":%s,"startedAt":"%s"}\n' \
+  "$$" "$lease_slot" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$lease_metadata"
+
 work_dir=$(mktemp -d "$work_root/vmaf-v1-score.XXXXXX")
 output_partial=$output.partial.$$
 metadata_partial=$metadata_output.partial.$$
@@ -115,6 +172,11 @@ cleanup() {
   [ -z "$vmaf_pid" ] || kill "$vmaf_pid" 2>/dev/null || true
   rm -f "$output_partial" "$metadata_partial"
   rm -rf "$work_dir"
+  [ -z "$lease_metadata" ] || rm -f "$lease_metadata"
+  if [ -n "$lease_fd" ]; then
+    flock -u "$lease_fd" 2>/dev/null || true
+    exec {lease_fd}>&-
+  fi
 }
 trap cleanup EXIT HUP INT TERM
 [ ! -e "$output" ] || { printf 'refusing to replace existing VMAF output: %s\n' "$output" >&2; exit 73; }

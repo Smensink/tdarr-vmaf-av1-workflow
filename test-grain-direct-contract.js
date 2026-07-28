@@ -375,6 +375,7 @@ try {
   );
   assert.strictEqual(synthesisNode.inputsDB.mode, 'active');
   assert.strictEqual(synthesisNode.inputsDB.sourcePathRegex, '^/media/');
+  assert.strictEqual(synthesisNode.inputsDB.preserveProductionReview, 'false');
   assert(
     canonicalFlow.flowEdges.some((edge) =>
       edge.source === 'grainSynthesis1' &&
@@ -399,12 +400,13 @@ try {
     };
   }
   function pipelineContract(outputDepth) {
+    const producerLog = `${contractOutput}.nvencc.log`;
     const coordinatorOptions = {
       nvenccPath: tools.nvencc,
       coordinatorPath: tools.coordinator,
       sourcePath,
       outputDepth,
-      producerLog: `${contractOutput}.nvencc.log`,
+      producerLog,
       ffmpegPath: tools.ffmpeg,
       ffmpegArgs: consumerArgs,
     };
@@ -415,6 +417,7 @@ try {
       argv: nvenccKnn.buildCoordinatorArgs(coordinatorOptions).map((value) => {
         if (value === sourcePath) return '<SOURCE>';
         if (value === contractOutput) return '<OUTPUT>';
+        if (value === producerLog) return '<PRODUCER_LOG>';
         return value;
       }),
       pipeline: nvenccKnn.contractDescriptor(coordinatorOptions),
@@ -534,6 +537,68 @@ try {
     tenBitPlan.checkpointKey,
     legacyPlan.checkpointKey,
     'legacy FFmpeg and coordinator-pipeline checkpoints must never collide'
+  );
+
+  const synthesisSource = fs.readFileSync(
+    './custom-cont-init.d/vmaf-plugin-patches/synthesizeFilmGrain/1.0.0/index.js',
+    'utf8'
+  );
+  assert(synthesisSource.includes("mode: 'direct-' + mode"));
+  assert(synthesisSource.includes('requireFullTitle: true'));
+  assert(synthesisSource.includes('full_title_decode_validation_performed: true'));
+  assert(!synthesisSource.includes('full_title_decode_validation_performed: false'));
+  const fullDecodeIndex = synthesisSource.indexOf(
+    'Running mandatory full-title AV1 decode validation after direct grain bitstream rewrite.'
+  );
+  const promotionIndex = synthesisSource.indexOf(
+    'fs.renameSync(finalPartialPath, validatedOutputPath)',
+    fullDecodeIndex
+  );
+  assert(fullDecodeIndex >= 0 && promotionIndex > fullDecodeIndex,
+    'full-title decode must complete before the rewritten bitstream can be promoted');
+  assert(synthesisSource.includes('result = directFallbackResult(args, originalObj, error)'),
+    'decode failure must route from the untouched original rather than publish the rewritten bitstream');
+
+  const rejectedJobDir = path.join(root, 'direct-size-rejected-job');
+  fs.mkdirSync(rejectedJobDir);
+  fs.writeFileSync(path.join(rejectedJobDir, 'grain-output.partial.mkv'), 'rejected');
+  fs.mkdirSync(path.join(rejectedJobDir, 'inspection'));
+  fs.writeFileSync(path.join(rejectedJobDir, 'inspection', 'result.txt'), 'rejected');
+  assert.strictEqual(
+    synthesize._test.discardRejectedDirectGrainJob({ workDir: root }, rejectedJobDir),
+    null
+  );
+  assert.strictEqual(fs.existsSync(rejectedJobDir), false,
+    'direct size rejection must remove its complete owned scratch directory');
+  assert.throws(
+    () => synthesize._test.discardRejectedDirectGrainJob(
+      { workDir: root },
+      path.resolve(root, '..', 'outside-direct-size-rejection')
+    ),
+    /outside args\.workDir/
+  );
+  const directSizeRejectionStart = synthesisSource.indexOf(
+    'var directGrainOriginalRejection = assessGrainOutputAgainstOriginal('
+  );
+  const directSizeRejectionReturn = synthesisSource.indexOf(
+    "return makeResult(args, 3, args.inputFileObj, 'size_rejected'",
+    directSizeRejectionStart
+  );
+  assert(directSizeRejectionStart >= 0 && directSizeRejectionReturn > directSizeRejectionStart,
+    'direct grain original-size rejection block is missing');
+  assert.match(
+    synthesisSource.slice(directSizeRejectionStart, directSizeRejectionReturn),
+    /jobDir = discardRejectedDirectGrainJob\(args, jobDir\)/,
+    'direct grain size rejection must clean its owned scratch before returning'
+  );
+  const productionReviewCall = synthesisSource.indexOf(
+    'productionReview = preserveProductionReview('
+  );
+  assert(productionReviewCall >= 0, 'production review implementation is missing');
+  assert.match(
+    synthesisSource.slice(Math.max(0, productionReviewCall - 220), productionReviewCall),
+    /if \(boolValue\(args\.inputs\.preserveProductionReview, false\)\)/,
+    'full production media review copies must require explicit opt-in'
   );
 
   console.log('PASS direct film-grain analysis, artifact, synthesis, and Flow contracts');

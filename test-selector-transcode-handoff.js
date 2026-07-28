@@ -174,9 +174,11 @@ assert.throws(() => selector.setParameterSetCQ({ quality: 30 }, '   '), /non-fin
 
 const selectorSource = fs.readFileSync(selectorPayloadPath, 'utf8');
 assert.strictEqual((selectorSource.match(/\bexecSync\s*\(/g) || []).length, 0,
-  'holdout shell work must not use an undeclared execSync alias');
-assert.strictEqual((selectorSource.match(/execFileSync\('\/bin\/sh', \['-c'/g) || []).length, 1,
-  'the GPU holdout VMAF command uses the declared shell runner exactly once');
+  'holdout work must not use a shell-command execSync alias');
+assert.strictEqual((selectorSource.match(/execFileSync\('\/bin\/sh', \['-c'/g) || []).length, 0,
+  'the GPU holdout must not cross a /bin/sh -c boundary');
+assert(selectorSource.includes('execFileSync(args.ffmpegPath, holdoutVmafArgs'),
+  'the GPU holdout VMAF command must execute its argv directly');
 assert(selectorSource.includes("safeId + '_candidate'") &&
   selectorSource.includes("safeId + '_source'") &&
   selectorSource.includes('measureHoldoutPreFgsCambi(args, distortedPath') &&
@@ -200,7 +202,8 @@ assert(measuredCapture > 0 && measuredCapture < interpolationStart,
   'the measured fallback must be captured immediately before interpolation');
 assert.strictEqual((selectorSource.match(/setParameterSetCQ\(/g) || []).length, 4,
   'all three synthetic CQ mutations must use the shared synchronized setter');
-assert(selectorSource.indexOf('publishFinalSelection(args.variables, bestParams);') >
+assert(selectorSource.indexOf(
+  'var _ffCommit = commitForcedFullSelection(args, bestParams, {') >
   selectorSource.indexOf('catch (_acErr)'),
 'the final downstream handoff must be published after override validation and reversion');
 

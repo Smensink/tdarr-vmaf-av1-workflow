@@ -38,9 +38,11 @@ for (const file of [
 }
 
 const monitor = fs.readFileSync('custom-cont-init.d/vmaf-plugin-patches/monitorTranscodeRetry/1.0.0/index.js', 'utf8');
-assert.ok(monitor.includes('Single authoritative terminal-outcome write'));
-assert.ok(monitor.includes('final_output_ratio_pct:'));
-assert.ok(monitor.includes('transcode_succeeded: 1'));
+assert.ok(monitor.includes('post-replacement delivery authority'));
+assert.ok(monitor.includes("outcome_stage: 'candidate_ready'"));
+assert.ok(monitor.includes('final_output_ratio_pct: null'));
+assert.ok(!monitor.includes('transcode_succeeded: 1'),
+  'monitor must not claim delivery success before grain/remux/replacement');
 assert.ok(monitor.includes('transcode_succeeded: 0'));
 
-console.log('PASS SQLite learning/terminal outcome authority');
+console.log('PASS SQLite learning keeps pre-delivery candidates non-terminal');

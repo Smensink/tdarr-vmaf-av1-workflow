@@ -10,6 +10,52 @@ var grainVmafContract = require('../../_lib/grainVmafContract.js');
 var vmafMetricContract = require('../../_lib/vmafMetricContract.js');
 var vmafV1Cpu = require('../../_lib/vmafV1Cpu.js');
 var preFgsCambi = require('../../_lib/preFgsCambi.js');
+var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
+
+function buildHoldoutVmafArgs(options) {
+    options = options || {};
+    var modelParam = options.modelPath ? ':model=path=' + options.modelPath : '';
+    var filterComplex = '[0:v]settb=1/1000,setpts=N' + (options.tonemap || '') +
+        ',format=' + options.scoringPixelFormat +
+        ',hwupload[dis];[1:v]settb=1/1000,setpts=N' + (options.tonemap || '') +
+        ',format=' + options.scoringPixelFormat +
+        ',hwupload[ref];[dis][ref]' + options.filterName +
+        '=log_path=' + options.logPath + ':log_fmt=json' + modelParam +
+        ':shortest=1:repeatlast=0:ts_sync_mode=nearest';
+    var argv = [
+        '-hide_banner', '-y',
+        '-init_hw_device', 'cuda=cuda0:0',
+        '-filter_hw_device', 'cuda0',
+        '-hwaccel', 'cuda',
+        '-hwaccel_device', '0',
+        '-c:v', 'av1_cuvid',
+        '-i', String(options.distortedPath),
+    ];
+    if (options.referenceCuvid) {
+        argv.push('-hwaccel', 'cuda', '-hwaccel_device', '0',
+            '-c:v', String(options.referenceCuvid));
+    }
+    argv.push(
+        '-i', String(options.referencePath),
+        '-filter_complex', filterComplex,
+        '-f', 'null', '-'
+    );
+    return argv;
+}
+
+function buildXpsnrArgs(distortedPath, referencePath) {
+    return [
+        '-hide_banner',
+        '-hwaccel', 'nvdec',
+        '-hwaccel_device', '0',
+        '-c:v', 'av1_cuvid',
+        '-i', String(distortedPath),
+        '-i', String(referencePath),
+        '-filter_complex',
+        '[0:v]settb=1/1000,setpts=N[d];[1:v]settb=1/1000,setpts=N[r];[d][r]xpsnr',
+        '-f', 'null', '-',
+    ];
+}
 
 function resolveMeasuredSweepContract(args, policy) {
     var variables = args.variables || {};
@@ -52,16 +98,34 @@ function cpuV1ScorerGeometryFromContract(contract) {
     var sampleAspectRatio = String(contract.sourceSampleAspectRatio || '').trim();
     var displayAspectRatio = String(contract.sourceDisplayAspectRatio || '').trim();
     var geometryNormalization = String(contract.geometryNormalization || '').trim();
-    if (!isFinite(width) || width <= 0 || !isFinite(height) || height <= 0 ||
-            !sampleAspectRatio || !displayAspectRatio || geometryNormalization !== 'none') {
-        throw new Error('CPU-v1 scorer contract lacks exact coded geometry, SAR/DAR, or no-normalization identity');
+    var validated;
+    try {
+        validated = vmafV1Cpu.validateGeometry({
+            width: width,
+            height: height,
+            sampleAspectRatio: sampleAspectRatio,
+            displayAspectRatio: displayAspectRatio,
+            geometryNormalization: geometryNormalization,
+        });
+        var selectedModel = vmafV1Cpu.selectModel({
+            width: validated.width,
+            height: validated.height,
+            modelProfile: vmafV1Cpu.profileForModelVersion(contract.modelVersion),
+        });
+        if (selectedModel.version !== contract.modelVersion ||
+                selectedModel.resolutionClass !== validated.resolutionClass) {
+            throw new Error('CPU-v1 model does not match the authenticated geometry family');
+        }
+    } catch (error) {
+        throw new Error('CPU-v1 scorer contract lacks supported, exact coded geometry/SAR/DAR identity: ' +
+            error.message);
     }
     return {
-        width: width,
-        height: height,
-        sampleAspectRatio: sampleAspectRatio,
-        displayAspectRatio: displayAspectRatio,
-        geometryNormalization: geometryNormalization,
+        width: validated.width,
+        height: validated.height,
+        sampleAspectRatio: validated.sampleAspectRatio,
+        displayAspectRatio: validated.displayAspectRatio,
+        geometryNormalization: validated.geometryNormalization,
     };
 }
 
@@ -151,6 +215,12 @@ function finiteMeasuredNumber(value) {
     if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) return null;
     var number = Number(value);
     return isFinite(number) ? number : null;
+}
+
+function cpuV1ThreadsPerScore(args) {
+    var value = Number(args && args.inputs && args.inputs.cpuV1ThreadsPerScore);
+    if (!isFinite(value) || value < 1) value = 2;
+    return Math.max(1, Math.min(4, Math.floor(value)));
 }
 
 function accumulateTimingSeconds(variables, key, seconds) {
@@ -246,19 +316,25 @@ function measuredCandidateId(result) {
     return String((result && result.parameterSetId) || '').trim();
 }
 
-function publishFinalSelection(variables, bestParams) {
-    if (!variables || !bestParams || !bestParams.parameterSet) {
-        throw new Error('cannot publish an incomplete VMAF selection');
+function validateFinalSelection(bestParams) {
+    if (!bestParams || !bestParams.parameterSet) {
+        throw new Error('cannot validate an incomplete VMAF selection');
     }
     var cq = finiteMeasuredNumber(bestParams.parameterSet.quality);
     var parameterSetId = String(bestParams.parameterSet.id || bestParams.parameterSetId || '').trim();
     if (cq === null || !parameterSetId) {
-        throw new Error('cannot publish VMAF selection without a finite CQ and parameter-set ID');
+        throw new Error('cannot validate VMAF selection without a finite CQ and parameter-set ID');
     }
-    variables.vmafBestParameters = bestParams.parameterSet;
-    variables.vmafFinalSelectedCQ = cq;
-    variables.vmafSelectedParameterSetId = parameterSetId;
     return { cq: cq, parameterSetId: parameterSetId };
+}
+
+function publishFinalSelection(variables, bestParams, validatedSelection) {
+    if (!variables) throw new Error('cannot publish VMAF selection without a variables object');
+    var selection = validatedSelection || validateFinalSelection(bestParams);
+    variables.vmafBestParameters = bestParams.parameterSet;
+    variables.vmafFinalSelectedCQ = selection.cq;
+    variables.vmafSelectedParameterSetId = selection.parameterSetId;
+    return selection;
 }
 
 function markConstraintAwareHoldoutTechnicalFailure(variables, preSelectParams, error) {
@@ -547,7 +623,7 @@ var details = function () { return ({
 
             type: 'number',
 
-            defaultValue: '10',
+            defaultValue: '20',
 
             inputUI: {
 
@@ -555,7 +631,7 @@ var details = function () { return ({
 
             },
 
-            tooltip: 'Minimum required size reduction compared to original file. Parameter sets that would result in larger or insufficiently smaller files are rejected. Set to 0 to disable. Default: 10 (10% smaller)',
+            tooltip: 'Fixed current delivered minimum: 20% compared with the original (80% output/source cap). Values other than 20 fail closed.',
 
         },
 
@@ -592,6 +668,22 @@ var details = function () { return ({
             inputUI: { type: 'switch' },
 
             tooltip: 'Log whether a conservative margin rule would have skipped reserved holdout validation. Shadow only: the holdout always runs and remains authoritative.',
+
+        },
+
+        {
+
+            label: 'CPU VMAF-v1 Threads Per Holdout Score',
+
+            name: 'cpuV1ThreadsPerScore',
+
+            type: 'number',
+
+            defaultValue: '2',
+
+            inputUI: { type: 'text' },
+
+            tooltip: 'Worker threads for the authoritative CPU-v1 holdout score, independently clamped to 1-4.',
 
         },
 
@@ -764,22 +856,406 @@ function evaluateSizeGate(projectedRatioPct, options) {
     return { action: 'allow', band: 'clear', forcedFull: false, legacyWouldReject: false };
 }
 
+var SIZE_GATE_FORCED_FULL_ROOT = '/app/configs/vmaf_size_gate_forced_full_reservations_v1';
 var SIZE_GATE_FORCED_FULL_LOG = '/app/configs/vmaf_size_gate_forced_full.jsonl';
+var SIZE_GATE_FORCED_FULL_SCHEMA = 1;
+var SIZE_GATE_FORCED_FULL_ID_DOMAIN = 'tdarr-vmaf-size-gate-forced-full-v1\0';
 
-function countForcedFullSelections(logPath) {
-    try {
-        var raw = require('fs').readFileSync(logPath, 'utf8');
-        var count = 0;
-        raw.split('\n').forEach(function (line) {
-            if (!line) return;
-            try {
-                if (JSON.parse(line).event === 'forced_full_selected') count += 1;
-            } catch (parseError) { /* tolerate partial trailing line */ }
-        });
-        return count;
-    } catch (readError) {
-        return 0;
+function forcedFullFailure(code, error) {
+    return {
+        ok: false,
+        code: code,
+        error: error && error.message ? error.message : String(error || code),
+    };
+}
+
+function normalizeForcedFullCap(value) {
+    var cap = Number(value);
+    if (!isFinite(cap) || cap < 0 || Math.floor(cap) !== cap || cap > 999999) {
+        throw new Error('forced-full reservation cap must be an integer from 0 through 999999');
     }
+    return cap;
+}
+
+function resolveForcedFullCap(value) {
+    if (value === undefined || value === null) {
+        return { ok: true, cap: 12, defaulted: true };
+    }
+    if ((typeof value === 'string' && !value.trim()) ||
+        (typeof value !== 'string' && typeof value !== 'number')) {
+        return forcedFullFailure('reservation_cap_invalid',
+            'forced-full reservation cap must be an explicit integer');
+    }
+    try {
+        return { ok: true, cap: normalizeForcedFullCap(value), defaulted: false };
+    } catch (error) {
+        return forcedFullFailure('reservation_cap_invalid', error);
+    }
+}
+
+function resetForcedFullAttemptState(variables) {
+    if (!variables || typeof variables !== 'object') {
+        throw new Error('forced-full attempt reset requires a variables object');
+    }
+    variables.vmafSizeGateForcedFull = false;
+    delete variables.vmafSizeGateForcedFullJobHash;
+    delete variables.vmafSizeGateForcedFullReservationSlot;
+    delete variables.vmafSizeGateForcedFullReservationStatus;
+    delete variables.vmafSizeGateForcedFullReservationFailure;
+    delete variables.vmafSizeGateForcedFullReservationError;
+}
+
+function forcedFullSlotName(slot) {
+    return 'slot-' + String(slot).padStart(6, '0') + '.json';
+}
+
+function hashForcedFullJobIdentity(jobIdentity) {
+    var normalized = String(jobIdentity === undefined || jobIdentity === null ? '' : jobIdentity).trim();
+    if (!normalized) throw new Error('forced-full reservation requires a stable job identity');
+    return require('crypto').createHash('sha256')
+        .update(SIZE_GATE_FORCED_FULL_ID_DOMAIN, 'utf8')
+        .update(normalized, 'utf8')
+        .digest('hex');
+}
+
+function resolveForcedFullJobIdentityHash(args) {
+    var variables = args && args.variables ? args.variables : {};
+    // vmafCanonicalJobId/vmafJobId is seeded once by extractVideoSamples and is
+    // deliberately retained by monitorTranscodeRetry. vmafRunId and a file path
+    // are not acceptable fallbacks: the former can change on retry, while the
+    // latter would let a later, unrelated job reuse an old cohort reservation.
+    var identity = variables.vmafCanonicalJobId || variables.vmafJobId;
+    return hashForcedFullJobIdentity(identity);
+}
+
+function isPrivateMode(stat) {
+    // Windows does not expose POSIX ownership bits usefully. The production
+    // runtime is Linux, where group/other permissions on this private ledger
+    // are rejected rather than silently accepted.
+    return process.platform === 'win32' || ((Number(stat.mode) & 0o077) === 0);
+}
+
+function inspectForcedFullReservations(options) {
+    options = options || {};
+    var fs = options.fs || require('fs');
+    var path = options.path || require('path');
+    var rootPath = String(options.rootPath || SIZE_GATE_FORCED_FULL_ROOT);
+    var identityHash = options.jobIdentityHash
+        ? String(options.jobIdentityHash).toLowerCase() : null;
+    var cap;
+    try {
+        cap = normalizeForcedFullCap(options.cap);
+        if (identityHash && !/^[a-f0-9]{64}$/.test(identityHash)) {
+            throw new Error('forced-full reservation job hash is invalid');
+        }
+        var rootStat;
+        try {
+            rootStat = fs.lstatSync(rootPath);
+        } catch (rootError) {
+            if (rootError && rootError.code === 'ENOENT') {
+                return {
+                    ok: true,
+                    rootExists: false,
+                    used: 0,
+                    ownedSlot: null,
+                    firstFreeSlot: cap > 0 ? 1 : null,
+                };
+            }
+            throw rootError;
+        }
+        if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+            throw new Error('forced-full reservation root is not a real directory');
+        }
+        if (!isPrivateMode(rootStat)) {
+            throw new Error('forced-full reservation root is not private (mode must deny group/other access)');
+        }
+
+        var entries = fs.readdirSync(rootPath);
+        var slots = {};
+        var identities = {};
+        var ownedSlot = null;
+        for (var entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+            var entry = String(entries[entryIndex]);
+            if (entry === '.pending') {
+                var pendingStat = fs.lstatSync(path.join(rootPath, entry));
+                if (!pendingStat.isDirectory() || pendingStat.isSymbolicLink() || !isPrivateMode(pendingStat)) {
+                    throw new Error('forced-full reservation pending directory is invalid');
+                }
+                continue;
+            }
+            var match = /^slot-(\d{6})\.json$/.exec(entry);
+            if (!match) {
+                throw new Error('unexpected entry in forced-full reservation root: ' + entry);
+            }
+            var slot = Number(match[1]);
+            if (slot < 1 || slot > cap || slots[slot]) {
+                throw new Error('forced-full reservation slot is outside the configured hard cap or duplicated');
+            }
+            var slotPath = path.join(rootPath, entry);
+            var slotStat = fs.lstatSync(slotPath);
+            if (!slotStat.isFile() || slotStat.isSymbolicLink() || !isPrivateMode(slotStat) ||
+                Number(slotStat.size) < 1 || Number(slotStat.size) > 4096) {
+                throw new Error('forced-full reservation slot is not a private regular file: ' + entry);
+            }
+            var record = JSON.parse(fs.readFileSync(slotPath, 'utf8'));
+            if (!record || Array.isArray(record) ||
+                record.schema !== SIZE_GATE_FORCED_FULL_SCHEMA ||
+                record.event !== 'forced_full_reserved' ||
+                record.slot !== slot ||
+                !/^[a-f0-9]{64}$/.test(String(record.job_identity_sha256 || '')) ||
+                typeof record.reserved_at !== 'string' ||
+                !isFinite(Date.parse(record.reserved_at))) {
+                throw new Error('forced-full reservation slot record is corrupt: ' + entry);
+            }
+            var owner = String(record.job_identity_sha256).toLowerCase();
+            if (identities[owner]) {
+                throw new Error('forced-full job identity owns multiple reservation slots');
+            }
+            identities[owner] = slot;
+            slots[slot] = record;
+            if (identityHash === owner) ownedSlot = slot;
+        }
+
+        var firstFreeSlot = null;
+        for (var candidateSlot = 1; candidateSlot <= cap; candidateSlot++) {
+            if (!slots[candidateSlot]) {
+                firstFreeSlot = candidateSlot;
+                break;
+            }
+        }
+        return {
+            ok: true,
+            rootExists: true,
+            used: Object.keys(slots).length,
+            ownedSlot: ownedSlot,
+            firstFreeSlot: firstFreeSlot,
+        };
+    } catch (error) {
+        return forcedFullFailure('reservation_root_invalid', error);
+    }
+}
+
+function ensureForcedFullDirectory(fs, directoryPath, mode) {
+    try {
+        fs.mkdirSync(directoryPath, { mode: mode });
+    } catch (error) {
+        if (!error || error.code !== 'EEXIST') throw error;
+    }
+    var stat = fs.lstatSync(directoryPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !isPrivateMode(stat)) {
+        throw new Error('forced-full reservation directory is invalid or not private: ' + directoryPath);
+    }
+}
+
+function writeForcedFullPendingRecord(fs, filePath, record) {
+    var fd = fs.openSync(filePath, 'wx', 0o600);
+    try {
+        fs.writeFileSync(fd, JSON.stringify(record) + '\n', { encoding: 'utf8' });
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+function fsyncForcedFullDirectory(fs, directoryPath, forceDirectoryFsync) {
+    if (process.platform === 'win32' && forceDirectoryFsync !== true) return;
+    var directoryFd = fs.openSync(directoryPath, 'r');
+    try {
+        fs.fsyncSync(directoryFd);
+    } finally {
+        fs.closeSync(directoryFd);
+    }
+}
+
+function verifyForcedFullReservation(fs, path, rootPath, cap, identityHash, expectedSlot, status,
+    forceDirectoryFsync) {
+    try {
+        // The slot file was fsynced before link publication. Re-fsync the
+        // containing directory on every acquisition and every reuse so a prior
+        // post-link error can never be converted into admission without a fresh
+        // durability barrier and complete ledger readback.
+        fsyncForcedFullDirectory(fs, rootPath, forceDirectoryFsync);
+        var committed = inspectForcedFullReservations({
+            rootPath: rootPath,
+            cap: cap,
+            jobIdentityHash: identityHash,
+            fs: fs,
+            path: path,
+        });
+        if (!committed.ok || committed.ownedSlot !== expectedSlot) {
+            return forcedFullFailure('reservation_commit_unverified',
+                committed.error || 'forced-full reservation could not be read back');
+        }
+        return {
+            ok: true,
+            status: status,
+            slot: expectedSlot,
+            used: committed.used,
+            jobIdentityHash: identityHash,
+        };
+    } catch (error) {
+        return forcedFullFailure('reservation_commit_unverified', error);
+    }
+}
+
+function reserveForcedFullSlot(options) {
+    options = options || {};
+    var fs = options.fs || require('fs');
+    var path = options.path || require('path');
+    var rootPath = String(options.rootPath || SIZE_GATE_FORCED_FULL_ROOT);
+    var identityHash = String(options.jobIdentityHash || '').toLowerCase();
+    var cap;
+    try {
+        cap = normalizeForcedFullCap(options.cap);
+        if (!/^[a-f0-9]{64}$/.test(identityHash)) {
+            throw new Error('forced-full reservation job hash is invalid');
+        }
+        ensureForcedFullDirectory(fs, rootPath, 0o700);
+        // Persist the ledger root's directory entry as well as its later
+        // contents. This runs on every attempt, so a transient parent-fsync
+        // failure cannot become a successful retry without a fresh barrier.
+        fsyncForcedFullDirectory(fs, path.dirname(rootPath), options.forceDirectoryFsync);
+        var pendingPath = path.join(rootPath, '.pending');
+        ensureForcedFullDirectory(fs, pendingPath, 0o700);
+
+        // Every contender chooses the lowest free slot. The complete, fsynced
+        // pending record is hard-linked into that slot with one atomic link(2);
+        // EEXIST means another process won and triggers a full rescan. This both
+        // enforces the cap and makes concurrent retries for one job converge on
+        // the same hashed owner rather than consuming multiple slots.
+        for (var attempt = 0; attempt <= cap + 1; attempt++) {
+            var snapshot = inspectForcedFullReservations({
+                rootPath: rootPath,
+                cap: cap,
+                jobIdentityHash: identityHash,
+                fs: fs,
+                path: path,
+            });
+            if (!snapshot.ok) return snapshot;
+            if (snapshot.ownedSlot !== null) {
+                return verifyForcedFullReservation(fs, path, rootPath, cap,
+                    identityHash, snapshot.ownedSlot, 'reused', options.forceDirectoryFsync);
+            }
+            if (snapshot.firstFreeSlot === null || snapshot.used >= cap) {
+                return {
+                    ok: false,
+                    code: 'reservation_cap_exhausted',
+                    error: 'forced-full reservation hard cap is exhausted',
+                    used: snapshot.used,
+                };
+            }
+
+            var slot = snapshot.firstFreeSlot;
+            var record = {
+                schema: SIZE_GATE_FORCED_FULL_SCHEMA,
+                event: 'forced_full_reserved',
+                slot: slot,
+                job_identity_sha256: identityHash,
+                reserved_at: new Date().toISOString(),
+            };
+            var nonce = require('crypto').randomBytes(12).toString('hex');
+            var pendingFile = path.join(pendingPath,
+                identityHash + '.' + String(process.pid) + '.' + nonce + '.json');
+            var slotPath = path.join(rootPath, forcedFullSlotName(slot));
+            try {
+                writeForcedFullPendingRecord(fs, pendingFile, record);
+                try {
+                    fs.linkSync(pendingFile, slotPath);
+                } catch (linkError) {
+                    try { fs.unlinkSync(pendingFile); } catch (_) {}
+                    if (linkError && linkError.code === 'EEXIST') continue;
+                    return forcedFullFailure('reservation_write_failed', linkError);
+                }
+                try { fs.unlinkSync(pendingFile); } catch (_) {
+                    // A leftover name in .pending is not authority; the immutable
+                    // slot link is complete and remains the reservation.
+                }
+                return verifyForcedFullReservation(fs, path, rootPath, cap,
+                    identityHash, slot, 'acquired', options.forceDirectoryFsync);
+            } catch (writeError) {
+                try { fs.unlinkSync(pendingFile); } catch (_) {}
+                return forcedFullFailure('reservation_write_failed', writeError);
+            }
+        }
+        return forcedFullFailure('reservation_contention_exhausted',
+            'forced-full reservation contention did not converge');
+    } catch (error) {
+        return forcedFullFailure('reservation_write_failed', error);
+    }
+}
+
+function requiresForcedFullReservation(bestParams, legacyRatioPct, emergencyRatioPct) {
+    var projected = Number(bestParams && bestParams.projectedOutputRatioPct);
+    return isFinite(projected) && projected >= legacyRatioPct && projected < emergencyRatioPct;
+}
+
+function forcedFullDeniedResult(args, reservation, bestParams) {
+    delete args.variables.vmafBestParameters;
+    delete args.variables.vmafFinalSelectedCQ;
+    delete args.variables.vmafSelectedParameterSetId;
+    args.variables.vmafSizeGateForcedFull = false;
+    args.variables.vmafSizeGateForcedFullReservationFailure = reservation.code;
+    args.variables.vmafSizeGateForcedFullReservationError = reservation.error;
+    args.variables.vmafSelectOutput = 2;
+    var projected = Number(bestParams && bestParams.projectedOutputRatioPct);
+    try {
+        args.jobLog('SIZE-GATE FORCED-FULL DENIED (fail closed): selected CQ '
+            + (bestParams && bestParams.parameterSet && bestParams.parameterSet.quality)
+            + ' projected ' + (isFinite(projected) ? projected.toFixed(1) : 'unknown') + '%; '
+            + reservation.code + ': ' + reservation.error);
+    } catch (_) {}
+    return {
+        outputFileObj: args.inputFileObj,
+        outputNumber: 2,
+        variables: args.variables,
+    };
+}
+
+function commitForcedFullSelection(args, bestParams, options) {
+    options = options || {};
+    // Validation is deliberately before reservation. Callers may supply the
+    // exact prevalidated contract, but the default path remains independently
+    // testable and cannot consume a slot for an invalid selection.
+    var validatedSelection = validateFinalSelection(bestParams);
+    if (options.validatedSelection &&
+        (Number(options.validatedSelection.cq) !== validatedSelection.cq ||
+            String(options.validatedSelection.parameterSetId) !== validatedSelection.parameterSetId)) {
+        throw new Error('VMAF selection changed after prevalidation');
+    }
+    var reservation = null;
+    if (requiresForcedFullReservation(bestParams,
+        Number(options.legacyRatioPct), Number(options.emergencyRatioPct))) {
+        var capResolution = options.capResolution;
+        reservation = capResolution && !capResolution.ok
+            ? capResolution
+            : (options.jobIdentityHash
+                ? reserveForcedFullSlot({
+                    rootPath: options.rootPath || SIZE_GATE_FORCED_FULL_ROOT,
+                    cap: options.cap,
+                    jobIdentityHash: options.jobIdentityHash,
+                    fs: options.fs,
+                    path: options.path,
+                })
+                : forcedFullFailure('reservation_identity_unavailable',
+                    options.reservationReadError || 'stable job identity is unavailable'));
+        if (!reservation.ok) {
+            return {
+                ok: false,
+                reservation: reservation,
+                result: forcedFullDeniedResult(args, reservation, bestParams),
+            };
+        }
+        args.variables.vmafSizeGateForcedFull = true;
+        args.variables.vmafSizeGateForcedFullJobHash = options.jobIdentityHash;
+        args.variables.vmafSizeGateForcedFullReservationSlot = reservation.slot;
+        args.variables.vmafSizeGateForcedFullReservationStatus = reservation.status;
+    }
+    var selection = publishFinalSelection(args.variables, bestParams, validatedSelection);
+    return {
+        ok: true,
+        reservation: reservation,
+        selection: selection,
+    };
 }
 
 var plugin = function (args) {
@@ -1114,8 +1590,7 @@ var plugin = function (args) {
             contentClass: holdoutMetricContract.contentClass,
             allowProvisionalHdr: holdoutMetricContract.contentClass === 'hdr-pq',
             subsample: 1,
-            threads: Math.max(1, Math.min(4,
-                Number(args.inputs && args.inputs.maxParallelVmaf) || 4)),
+            threads: cpuV1ThreadsPerScore(args),
             pooling: holdoutMetricContract.poolingPrimary,
         });
         var startedAt = Date.now();
@@ -1273,11 +1748,8 @@ var plugin = function (args) {
         }
         var modelPath = holdoutMetricContract.modelPath;
 
-        var modelParam = modelPath ? ':model=path=' + modelPath : '';
-
         // CAMBI is measured in a separate required CPU pass. libvmaf_cuda does
         // not publish it reliably and must remain VMAF-only.
-        var cambiFeatureParam = '';
 
         // Do NOT tonemap for VMAF/CAMBI. libvmaf_cuda requires 8-bit (yuv420p) input, which the
         // `format=yuv420p` step below already provides — the 8-bit requirement does NOT require a
@@ -1305,22 +1777,27 @@ var plugin = function (args) {
         // must be software-decoded. Only the distorted AV1 uses CUVID.
         var refCuvid = null;
 
-        var vcmd = '"' + args.ffmpegPath + '" -hide_banner -y -init_hw_device cuda=cuda0:0 -filter_hw_device cuda0'
+        var holdoutVmafArgs = buildHoldoutVmafArgs({
+            distortedPath: distortedPath,
+            referencePath: holdout.path,
+            referenceCuvid: refCuvid,
+            scoringPixelFormat: holdoutMetricContract.scoringPixelFormat,
+            filterName: holdoutMetricContract.filterName,
+            logPath: logPath,
+            modelPath: modelPath,
+            tonemap: tonemap,
+        });
 
-            + ' -hwaccel cuda -hwaccel_device 0 -c:v av1_cuvid -i "' + distortedPath + '"';
 
-        if (refCuvid) vcmd += ' -hwaccel cuda -hwaccel_device 0 -c:v ' + refCuvid;
 
-        vcmd += ' -i "' + holdout.path + '"'
 
-            + ' -filter_complex "[0:v]settb=1/1000,setpts=N' + tonemap + ',format=' + holdoutMetricContract.scoringPixelFormat + ',hwupload[dis];[1:v]settb=1/1000,setpts=N' + tonemap + ',format=' + holdoutMetricContract.scoringPixelFormat + ',hwupload[ref];[dis][ref]' + holdoutMetricContract.filterName + '=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest"'
 
-            + ' -f null -';
 
         var holdoutVmafStartedAt = Date.now();
         try {
-            execFileSync('/bin/sh', ['-c', vcmd], {
-                stdio: 'pipe', timeout: 240000, windowsHide: true, maxBuffer: 32 * 1024 * 1024
+            execFileSync(args.ffmpegPath, holdoutVmafArgs, {
+                stdio: 'pipe', timeout: 240000, windowsHide: true,
+                shell: false, maxBuffer: 32 * 1024 * 1024
             });
         } finally {
             accumulateTimingSeconds(args.variables, 'vmafHoldoutVmafTimeSec',
@@ -1551,13 +2028,15 @@ var plugin = function (args) {
 
     var minSizeReduction = Number(args.inputs.minSizeReduction);
 
-    if (isNaN(minSizeReduction) || minSizeReduction < 0 || minSizeReduction > 100) {
+    if (!isFinite(minSizeReduction) ||
+            minSizeReduction !== deliveryPolicy.DEFAULT_MINIMUM_REDUCTION_PCT) {
 
-        args.jobLog('WARNING: Invalid minSizeReduction (' + args.inputs.minSizeReduction + '), using default 10');
-
-        minSizeReduction = 10;
+        throw new Error('minSizeReduction must equal the current policy value ' +
+            deliveryPolicy.DEFAULT_MINIMUM_REDUCTION_PCT);
 
     }
+    args.variables.vmafMinimumSizeReductionPct = minSizeReduction;
+    var selectedDeliveryPolicy = deliveryPolicy.resolve(args.variables);
 
     var vmafBuffer10Bit = Number(args.inputs.vmafBuffer10Bit);
 
@@ -1841,11 +2320,11 @@ var plugin = function (args) {
 
     args.jobLog('File size will be verified during actual transcode using live monitoring.');
 
-    if (minSizeReduction > 0) {
-
-        args.jobLog('Minimum size reduction target: ' + minSizeReduction + '% (enforced during transcode)');
-
-    }
+    args.jobLog('Delivery size policy: search target ' +
+        selectedDeliveryPolicy.targetReductionPct + '%, minimum delivered reduction ' +
+        selectedDeliveryPolicy.minimumReductionPct + '%, final byte cap ' +
+        selectedDeliveryPolicy.maxFinalOutputRatioPct + '% (' +
+        selectedDeliveryPolicy.version + '). Projected-size gates remain separate.');
 
     args.jobLog('');
 
@@ -1919,24 +2398,53 @@ var plugin = function (args) {
         cambiLimit: sharedCambiLimit
     };
 
-    // Size-gate demotion policy (see evaluateSizeGate for rationale). One forced-full
-    // attempt per job at most: on sweep retries within the same job the shadow band
-    // hard-rejects again so a single stubborn file cannot drain the global label budget.
+    // Size-gate demotion policy (see evaluateSizeGate for rationale). The private
+    // per-slot reservation ledger is the only budget authority. A retry derives
+    // the same job hash and reuses its slot; the JSONL stream is telemetry only.
     var sizeGateLegacyPct = Number(args.variables.vmafMaxOutputRatioPct);
     if (!isFinite(sizeGateLegacyPct) || sizeGateLegacyPct <= 0) sizeGateLegacyPct = 90;
     var sizeGateEmergencyPct = Number(args.variables.vmafSizeGateEmergencyRatioPct);
     if (!isFinite(sizeGateEmergencyPct) || sizeGateEmergencyPct <= sizeGateLegacyPct) {
         sizeGateEmergencyPct = Math.max(110, sizeGateLegacyPct);
     }
-    var sizeGateForcedFullCap = Number(args.variables.vmafSizeGateForcedFullCap);
-    if (!isFinite(sizeGateForcedFullCap) || sizeGateForcedFullCap < 0) sizeGateForcedFullCap = 12;
-    var sizeGateForcedFullUsed = countForcedFullSelections(SIZE_GATE_FORCED_FULL_LOG);
-    var sizeGateForcedFullRemaining = Math.max(0, sizeGateForcedFullCap - sizeGateForcedFullUsed);
-    if (args.variables.vmafSizeGateForcedFull === true) sizeGateForcedFullRemaining = 0;
+    resetForcedFullAttemptState(args.variables);
+    var sizeGateCapResolution = resolveForcedFullCap(args.variables.vmafSizeGateForcedFullCap);
+    var sizeGateForcedFullCap = sizeGateCapResolution.ok ? sizeGateCapResolution.cap : 0;
+    var sizeGateForcedFullJobHash = null;
+    var sizeGateReservationSnapshot = null;
+    var sizeGateReservationReadError = sizeGateCapResolution.ok
+        ? null : sizeGateCapResolution.error;
+    if (sizeGateCapResolution.ok) {
+        try {
+            sizeGateForcedFullJobHash = resolveForcedFullJobIdentityHash(args);
+            args.variables.vmafSizeGateForcedFullJobHash = sizeGateForcedFullJobHash;
+            sizeGateReservationSnapshot = inspectForcedFullReservations({
+                rootPath: SIZE_GATE_FORCED_FULL_ROOT,
+                cap: sizeGateForcedFullCap,
+                jobIdentityHash: sizeGateForcedFullJobHash,
+            });
+            if (!sizeGateReservationSnapshot.ok) {
+                sizeGateReservationReadError = sizeGateReservationSnapshot.error;
+            }
+        } catch (reservationIdentityError) {
+            sizeGateReservationReadError = reservationIdentityError && reservationIdentityError.message
+                ? reservationIdentityError.message : String(reservationIdentityError);
+        }
+    }
+    var sizeGateForcedFullUsed = sizeGateReservationSnapshot && sizeGateReservationSnapshot.ok
+        ? sizeGateReservationSnapshot.used : sizeGateForcedFullCap;
+    var sizeGateForcedFullRemaining = sizeGateReservationSnapshot && sizeGateReservationSnapshot.ok
+        ? (sizeGateReservationSnapshot.ownedSlot !== null
+            ? 1
+            : Math.max(0, sizeGateForcedFullCap - sizeGateForcedFullUsed))
+        : 0;
     args.jobLog('Size gate: legacy ' + sizeGateLegacyPct + '% cap demoted to shadow; hard emergency cutoff '
         + sizeGateEmergencyPct + '%; forced-full label budget used ' + sizeGateForcedFullUsed
         + '/' + sizeGateForcedFullCap
-        + (args.variables.vmafSizeGateForcedFull === true ? ' (already consumed by this job)' : ''));
+        + (sizeGateReservationSnapshot && sizeGateReservationSnapshot.ownedSlot !== null
+            ? ' (this job already owns slot ' + sizeGateReservationSnapshot.ownedSlot + ')' : '')
+        + (sizeGateReservationReadError
+            ? ' (reservation ledger unavailable; shadow band fails closed: ' + sizeGateReservationReadError + ')' : ''));
 
     var validResults = [];
 
@@ -2978,7 +3486,7 @@ var plugin = function (args) {
 
         try {
 
-            var xpExecSync = require('child_process').execSync;
+            var xpSpawnSync = require('child_process').spawnSync;
 
             var xpTests = (args.variables.vmafTestResults || []).filter(function(t) {
 
@@ -2992,17 +3500,24 @@ var plugin = function (args) {
 
                 try {
 
-                    // xpsnr prints its summary on stderr; merge it into stdout to capture.
-
-                    var xpOut = xpExecSync('"' + args.ffmpegPath + '" -hide_banner'
-
-                        + ' -hwaccel nvdec -hwaccel_device 0 -c:v av1_cuvid -i "' + xpTests[xi].outputPath + '"'
-
-                        + ' -i "' + xpTests[xi].originalSamplePath + '"'
-
-                        + ' -filter_complex "[0:v]settb=1/1000,setpts=N[d];[1:v]settb=1/1000,setpts=N[r];[d][r]xpsnr"'
-
-                        + ' -f null - 2>&1', { stdio: 'pipe', timeout: 180000, shell: '/bin/sh', maxBuffer: 16 * 1024 * 1024 }).toString();
+                    // XPSNR prints its summary on stderr. Capture both streams
+                    // directly instead of asking a shell to merge descriptors.
+                    var xpRun = xpSpawnSync(args.ffmpegPath, buildXpsnrArgs(
+                        xpTests[xi].outputPath, xpTests[xi].originalSamplePath
+                    ), {
+                        encoding: 'utf8',
+                        stdio: 'pipe',
+                        timeout: 180000,
+                        shell: false,
+                        windowsHide: true,
+                        maxBuffer: 16 * 1024 * 1024
+                    });
+                    if (xpRun.error) throw xpRun.error;
+                    if (xpRun.status !== 0) {
+                        throw new Error('XPSNR exited ' + xpRun.status + ': ' +
+                            String(xpRun.stderr || xpRun.stdout || '').trim().slice(-1000));
+                    }
+                    var xpOut = String(xpRun.stdout || '') + '\n' + String(xpRun.stderr || '');
 
                     var xpm = xpOut.match(/minimum:\s*([0-9.]+|inf)/);
 
@@ -3877,9 +4392,10 @@ var plugin = function (args) {
             }
         }
 
-        // Publish only after every selection-changing guard. The final transcode consumes this
-        // exact object and verifies the CQ/ID contract before starting FFmpeg.
-        publishFinalSelection(args.variables, bestParams);
+        // Validate the exact downstream handoff now, but do not publish it yet.
+        // All remaining report/invariant work runs before a finite forced-full
+        // slot is consumed.
+        var finalSelectionContract = validateFinalSelection(bestParams);
 
         args.variables.vmafBestVMAF = bestParams.avgVMAF;
 
@@ -4359,37 +4875,62 @@ var plugin = function (args) {
             args.jobLog('Size-failure pre-skip shadow skipped (non-fatal): ' + (_shadowErr && _shadowErr.message ? _shadowErr.message : String(_shadowErr)));
         }
 
-        // ── Forced-full label collection (size-gate demotion) ──
-        // If the winning candidate sits in the retired >=90% band, this job is one of the
-        // bounded forced-full cohort: record the decision durably so the budget counter and
-        // later label joins (jobs.final_output_ratio_pct via canonical job id) work, and mark
-        // the job so a sweep retry cannot consume a second budget slot.
-        try {
-            var _ffProjected = Number(bestParams.projectedOutputRatioPct);
-            if (isFinite(_ffProjected) && _ffProjected >= sizeGateLegacyPct
-                && args.variables.vmafSizeGateForcedFull !== true) {
-                var _ffRecord = {
-                    schema: 1,
-                    event: 'forced_full_selected',
-                    ts: new Date().toISOString(),
-                    job_id: args.variables.vmafCanonicalJobId || args.variables.vmafJobId || args.variables.vmafRunId || null,
-                    file_path: args.inputFileObj && (args.inputFileObj._id || args.inputFileObj.file || null),
-                    selected_cq: bestParams.parameterSet && bestParams.parameterSet.quality,
-                    projected_output_ratio_pct: _ffProjected,
-                    legacy_gate_pct: sizeGateLegacyPct,
-                    emergency_cutoff_pct: sizeGateEmergencyPct,
-                    budget_used_before: sizeGateForcedFullUsed,
-                    budget_cap: sizeGateForcedFullCap,
-                    action: 'forced_full_label_collection_monitor_remains_kill_switch'
-                };
-                require('fs').appendFileSync(SIZE_GATE_FORCED_FULL_LOG, JSON.stringify(_ffRecord) + '\n', 'utf8');
-                args.variables.vmafSizeGateForcedFull = true;
-                args.jobLog('SIZE-GATE FORCED-FULL: selected CQ ' + _ffRecord.selected_cq + ' projected '
-                    + _ffProjected.toFixed(1) + '% (retired gate ' + sizeGateLegacyPct + '%); running full encode for'
-                    + ' label collection, budget now ' + (sizeGateForcedFullUsed + 1) + '/' + sizeGateForcedFullCap);
+        // Candidate filtering used a reservation snapshot. Commit the atomic
+        // slot only after every selection guard, invariant, report, and shadow
+        // step above has completed, then publish the already-validated handoff.
+        // No uncaught work remains between this point and output 1.
+        var _ffProjected = Number(bestParams.projectedOutputRatioPct);
+        var _ffCommit = commitForcedFullSelection(args, bestParams, {
+            validatedSelection: finalSelectionContract,
+            legacyRatioPct: sizeGateLegacyPct,
+            emergencyRatioPct: sizeGateEmergencyPct,
+            capResolution: sizeGateCapResolution,
+            cap: sizeGateForcedFullCap,
+            jobIdentityHash: sizeGateForcedFullJobHash,
+            reservationReadError: sizeGateReservationReadError,
+            rootPath: SIZE_GATE_FORCED_FULL_ROOT,
+        });
+        if (!_ffCommit.ok) {
+            return _ffCommit.result;
+        }
+        var _ffReservation = _ffCommit.reservation;
+
+        if (_ffReservation) {
+            // Derived telemetry only. It carries no raw job/file identity, and
+            // failure cannot create capacity or invalidate the private slot.
+            var _ffRecord = {
+                schema: 2,
+                event: 'forced_full_selected',
+                ts: new Date().toISOString(),
+                job_identity_sha256: sizeGateForcedFullJobHash,
+                reservation_slot: _ffReservation.slot,
+                reservation_status: _ffReservation.status,
+                selected_cq: bestParams.parameterSet && bestParams.parameterSet.quality,
+                projected_output_ratio_pct: _ffProjected,
+                legacy_gate_pct: sizeGateLegacyPct,
+                emergency_cutoff_pct: sizeGateEmergencyPct,
+                budget_used_after: _ffReservation.used,
+                budget_cap: sizeGateForcedFullCap,
+                action: 'forced_full_label_collection_monitor_remains_kill_switch',
+                authority: 'atomic_private_slot_reservation_v1',
+            };
+            try {
+                require('fs').appendFileSync(SIZE_GATE_FORCED_FULL_LOG,
+                    JSON.stringify(_ffRecord) + '\n', { encoding: 'utf8', mode: 0o600 });
+            } catch (_ffTelemetryError) {
+                try {
+                    args.jobLog('Size-gate forced-full telemetry write failed (non-fatal; reservation remains authoritative): '
+                        + (_ffTelemetryError && _ffTelemetryError.message
+                            ? _ffTelemetryError.message : String(_ffTelemetryError)));
+                } catch (_) {}
             }
-        } catch (_ffErr) {
-            args.jobLog('Size-gate forced-full record failed (non-fatal): ' + (_ffErr && _ffErr.message ? _ffErr.message : String(_ffErr)));
+            try {
+                args.jobLog('SIZE-GATE FORCED-FULL: selected CQ ' + _ffRecord.selected_cq + ' projected '
+                    + _ffProjected.toFixed(1) + '% (retired gate ' + sizeGateLegacyPct + '%); '
+                    + (_ffReservation.status === 'reused' ? 'reusing' : 'acquired')
+                    + ' private reservation slot ' + _ffReservation.slot + ', budget '
+                    + _ffReservation.used + '/' + sizeGateForcedFullCap);
+            } catch (_) {}
         }
 
         // Store output number for retry check
@@ -4430,14 +4971,25 @@ var plugin = function (args) {
 
 exports.plugin = plugin;
 exports._test = {
+    buildHoldoutVmafArgs: buildHoldoutVmafArgs,
+    buildXpsnrArgs: buildXpsnrArgs,
     assessHoldoutSkipShadow: assessHoldoutSkipShadow,
     shouldApplyFractionalOverride: shouldApplyFractionalOverride,
     evaluateSizeGate: evaluateSizeGate,
-    countForcedFullSelections: countForcedFullSelections,
+    resolveForcedFullCap: resolveForcedFullCap,
+    resetForcedFullAttemptState: resetForcedFullAttemptState,
+    hashForcedFullJobIdentity: hashForcedFullJobIdentity,
+    resolveForcedFullJobIdentityHash: resolveForcedFullJobIdentityHash,
+    inspectForcedFullReservations: inspectForcedFullReservations,
+    reserveForcedFullSlot: reserveForcedFullSlot,
+    requiresForcedFullReservation: requiresForcedFullReservation,
+    forcedFullDeniedResult: forcedFullDeniedResult,
+    commitForcedFullSelection: commitForcedFullSelection,
     buildHoldoutEncodeArgs: buildHoldoutEncodeArgs,
     classifyToleranceRejection: classifyToleranceRejection,
     measuredQualityPasses: measuredQualityPasses,
     chooseMeasuredToleranceFallback: chooseMeasuredToleranceFallback,
+    validateFinalSelection: validateFinalSelection,
     publishFinalSelection: publishFinalSelection,
     markConstraintAwareHoldoutTechnicalFailure: markConstraintAwareHoldoutTechnicalFailure,
     revertPredictionOnlyFractionalSelection: revertPredictionOnlyFractionalSelection,
@@ -4445,6 +4997,7 @@ exports._test = {
     finiteMeasuredNumber: finiteMeasuredNumber,
     setParameterSetCQ: setParameterSetCQ,
     accumulateTimingSeconds: accumulateTimingSeconds,
+    cpuV1ThreadsPerScore: cpuV1ThreadsPerScore,
     resolveMeasuredSweepContract: resolveMeasuredSweepContract,
     cpuV1ScorerGeometryFromContract: cpuV1ScorerGeometryFromContract,
     assertMeasuredSweepRuntime: assertMeasuredSweepRuntime,

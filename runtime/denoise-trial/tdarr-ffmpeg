@@ -1,0 +1,3 @@
+#!/bin/sh
+export LD_LIBRARY_PATH=/custom-libvmaf-lib:/usr/local/ffmpeg-custom/lib:/usr/local/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}
+exec /usr/local/ffmpeg-custom/bin/ffmpeg "$@"

@@ -8,6 +8,8 @@ var path = require('path');
 var crypto = require('crypto');
 var childProcess = require('child_process');
 var grainArtifact = require('../../_lib/grainAnalysisArtifact.js');
+var gpuPipelineLock = require('../../_lib/gpuPipelineLock.js');
+var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
 
 var CALIBRATION_REPORT_SCHEMA = 3;
 var ENERGY_VALIDATION_REPORT_SCHEMA = 2;
@@ -17,6 +19,7 @@ var FIT_TABLE_IDENTITY_MODEL = 'fit-table-identity-gain1-v1';
 var POSTENCODE_CORRECTION_POLICY =
     'bounded-luma-log-affine-then-robust-global-log-median-then-fit-table-identity-v1';
 var LUMA_CURVE_TRANSFORM_ID = 'multiply-av1-scaling-curves-v1';
+var GPU_PIPELINE_LOCK_DIR = '/temp/tdarr-vmaf-gpu-pipeline.lock';
 
 var VOLATILE_TAGS = {
     encoder: true,
@@ -38,7 +41,7 @@ var MKV_VIDEO_SEMANTIC_FLAG_OPTIONS = [
 
 var details = function () { return ({
     name: 'Synthesize Film Grain',
-    description: 'Applies the authenticated direct grav1synth table exactly once, performs one final ancillary mux, and runs bounded structural checks before replacement.',
+    description: 'Applies the authenticated direct grav1synth table exactly once, performs one final ancillary mux, and requires a full-title AV1 decode before replacement.',
     style: { borderColor: 'gold' },
     tags: 'video,av1,grain,vmaf,validation,canary',
     isStartPlugin: false,
@@ -109,7 +112,15 @@ var details = function () { return ({
             type: 'string',
             defaultValue: '/grain-pilot-review',
             inputUI: { type: 'text' },
-            tooltip: 'Durable mounted directory for validated canary MKV, table, pipeline manifest, and validation report.',
+            tooltip: 'Durable mounted directory for validated canary evidence and any explicitly enabled production review pair.',
+        },
+        {
+            label: 'Preserve Production Review Pair',
+            name: 'preserveProductionReview',
+            type: 'boolean',
+            defaultValue: 'false',
+            inputUI: { type: 'dropdown', options: ['false', 'true'] },
+            tooltip: 'Explicit opt-in. Copies one full source and grain output into a two-slot private review area. Disabled by default because the copies are large and contain production media.',
         },
         {
             label: 'Maximum Output Size Ratio %',
@@ -133,7 +144,7 @@ var details = function () { return ({
             type: 'number',
             defaultValue: '240',
             inputUI: { type: 'text' },
-            tooltip: 'Hard timeout for header application, probing, semantic inspection, and the final ancillary mux. No extra full-title decode is performed.',
+            tooltip: 'Per-command hard timeout for header application, probing, semantic inspection, final ancillary mux, and mandatory full-title decode validation.',
         },
     ],
     outputs: [
@@ -1727,7 +1738,7 @@ function assessGrainOutputAgainstOriginal(originalPath, outputPath, maximumRatio
     if (!Number.isFinite(ratioPct)) {
         throw new Error('grain output original-size ratio is non-finite');
     }
-    if (ratioPct < maximumRatioPct) return null;
+    if (ratioPct <= maximumRatioPct) return null;
     return {
         ratioPct: ratioPct,
         originalBytes: originalBytes,
@@ -1740,9 +1751,7 @@ function assessGrainOutputAgainstOriginal(originalPath, outputPath, maximumRatio
 
 /** Cap for grain output measured against the original library file. */
 function grainOriginalRatioCap(args) {
-    var cap = Number(args.variables && args.variables.vmafMaxFinalOutputRatioPct);
-    if (!Number.isFinite(cap) || cap <= 0) cap = 100;
-    return cap;
+    return deliveryPolicy.resolve(args.variables || {}).maxFinalOutputRatioPct;
 }
 
 function recordQualityWarning(args, warnings, stage, warning) {
@@ -1833,44 +1842,6 @@ function requireSourceAllowlist(mode, regexText) {
         throw new Error('source path allowlist regex is required in ' + mode + ' mode');
     }
     return pattern;
-}
-
-function requireExistingLock(args, lockDir) {
-    var lockInfo = args.variables && args.variables.vmafGpuPipelineLock || {};
-    var token = lockInfo.token;
-    if (!args.variables || args.variables.vmafGpuPipelineLockAcquired !== true || !token) {
-        throw new Error('existing GPU pipeline lock is required but is not recorded in flow variables');
-    }
-    var lock = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/gpuPipelineLock.js');
-    var effectiveDir = String(lockInfo.lockDir || lockDir);
-    var owner = lock.readOwner(effectiveDir);
-    if (!owner || owner.token !== token) throw new Error('recorded GPU pipeline lock is absent or owned by another job');
-    return { lock: lock, lockDir: effectiveDir, token: token, selfAcquired: false };
-}
-
-function acquireOwnLock(args, lockDir) {
-    var lock = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/gpuPipelineLock.js');
-    var sourcePath = getOriginalPath(args);
-    var ownerId = stableId(sourcePath + ':' + process.pid + ':' + Date.now());
-    var result = lock.acquireBlocking({
-        lockDir: lockDir,
-        owner: {
-            ownerId: ownerId,
-            workerName: process.env.Tdarr_Node_Name || process.env.TDARR_NODE_NAME || process.env.HOSTNAME || 'unknown-worker',
-            filePath: sourcePath,
-            stage: 'grain-synthesis',
-            plugin: 'synthesizeFilmGrain',
-        },
-        waitPollSeconds: 5,
-        waitLogSeconds: 60,
-        maxWaitSeconds: 12 * 3600,
-        staleHeartbeatSeconds: 2 * 3600,
-        maxLockAgeSeconds: 8 * 3600,
-        orphanProcessGraceSeconds: 180,
-        heartbeatIntervalSeconds: 30,
-        log: function (message) { args.jobLog(message); },
-    });
-    return { lock: lock, lockDir: lockDir, token: result.owner.token, selfAcquired: true };
 }
 
 async function inspectGrain(grav1synthPath, inputPath, outputPath, timeoutMs) {
@@ -1994,6 +1965,16 @@ function softwareSampleDecodeArgs(outputPath, primaryIndex, sample) {
     ];
 }
 
+function softwareFullDecodeArgs(outputPath, primaryIndex) {
+    return [
+        '-hide_banner', '-nostdin', '-loglevel', 'error',
+        '-xerror', '-err_detect', 'explode',
+        '-i', outputPath,
+        '-map', '0:' + primaryIndex,
+        '-an', '-sn', '-dn', '-f', 'null', '-',
+    ];
+}
+
 async function runDecodeCommand(runner, ffmpegPath, argv, timeoutMs) {
     try {
         return await runner(ffmpegPath, argv, {
@@ -2012,6 +1993,157 @@ async function runDecodeCommand(runner, ffmpegPath, argv, timeoutMs) {
     }
 }
 
+function flowGpuLeaseIdentity(args, lock, lockDir) {
+    var variables = args && args.variables || {};
+    if (variables.vmafGpuPipelineLockAcquired !== true) return null;
+    var info = variables.vmafGpuPipelineLock || {};
+    if (!info.token || !info.leaseGeneration) {
+        throw new Error('flow GPU lease is marked acquired without an exact token and generation');
+    }
+    var recordedDir = lock.resolveLockDir(info.lockDir || lockDir);
+    if (recordedDir !== lockDir) {
+        throw new Error('flow GPU lease does not use the canonical fixed lock path');
+    }
+    var owner = lock.readOwner(lockDir);
+    if (!owner || owner.token !== info.token ||
+            owner.leaseGeneration !== info.leaseGeneration) {
+        throw new Error('flow GPU lease variables do not match the current exact lock owner');
+    }
+    return {
+        token: info.token,
+        leaseGeneration: info.leaseGeneration,
+    };
+}
+
+function createGpuDecodeLeaseController(args, lockOverride) {
+    var lock = lockOverride || gpuPipelineLock;
+    var lockDir = lock.resolveLockDir(GPU_PIPELINE_LOCK_DIR);
+    var log = args && typeof args.jobLog === 'function'
+        ? function (message) { args.jobLog(message); }
+        : function () {};
+
+    return {
+        acquire: async function () {
+            var existing = flowGpuLeaseIdentity(args, lock, lockDir);
+            var sourcePath = getOriginalPath(args || {});
+            var result = await lock.acquire({
+                lockDir: lockDir,
+                owner: {
+                    ownerId: stableId(sourcePath + ':grain-final-av1-decode'),
+                    workerName: process.env.Tdarr_Node_Name ||
+                        process.env.TDARR_NODE_NAME || process.env.HOSTNAME ||
+                        'unknown-worker',
+                    filePath: sourcePath,
+                    stage: 'grain-final-av1-decode',
+                    plugin: 'synthesizeFilmGrain',
+                },
+                waitPollSeconds: 5,
+                waitLogSeconds: 60,
+                maxWaitSeconds: 12 * 3600,
+                staleHeartbeatSeconds: 2 * 3600,
+                maxLockAgeSeconds: 8 * 3600,
+                orphanProcessGraceSeconds: 180,
+                heartbeatIntervalSeconds: 30,
+                existingToken: existing ? existing.token : null,
+                log: log,
+            });
+            var owner = result && result.owner;
+            if (!owner || !owner.token || !owner.leaseGeneration) {
+                throw new Error('GPU decode lease acquisition returned no exact token and generation');
+            }
+            if (existing && (result.reentrant !== true ||
+                    owner.token !== existing.token ||
+                    owner.leaseGeneration !== existing.leaseGeneration)) {
+                if (result.reentrant !== true) {
+                    var cleanup = lock.release(lockDir, owner.token, {
+                        force: false,
+                        expectedGeneration: owner.leaseGeneration,
+                    });
+                    if (!cleanup.released) {
+                        var cleanupError = new Error(
+                            'GPU decode lease changed during reentrant acquisition and exact cleanup failed: ' +
+                            cleanup.reason);
+                        cleanupError.gpuPipelineLeaseReleaseFailed = true;
+                        throw cleanupError;
+                    }
+                }
+                throw new Error('GPU decode lease changed during reentrant acquisition');
+            }
+            args.variables = args.variables || {};
+            args.variables.vmafGpuPipelineLock = {
+                lockDir: lockDir,
+                token: owner.token,
+                leaseGeneration: owner.leaseGeneration,
+                ownerId: owner.ownerId || null,
+                workerName: owner.workerName || null,
+                acquiredAt: owner.acquiredAt || null,
+                stage: 'grain-final-av1-decode',
+            };
+            args.variables.vmafGpuPipelineLockAcquired = true;
+            args.variables.vmafGpuPipelineLockReleased = false;
+            log(result.reentrant
+                ? 'Borrowed the exact flow-owned GPU lease for final CUVID validation.'
+                : 'Acquired the internal GPU lease for final CUVID validation.');
+            return {
+                lock: lock,
+                lockDir: lockDir,
+                token: owner.token,
+                leaseGeneration: owner.leaseGeneration,
+                borrowed: result.reentrant === true,
+            };
+        },
+        release: async function (lease) {
+            if (!lease || !lease.token || !lease.leaseGeneration) {
+                throw new Error('cannot release GPU decode lease without its exact token and generation');
+            }
+            var released = lock.release(lease.lockDir, lease.token, {
+                force: false,
+                expectedGeneration: lease.leaseGeneration,
+            });
+            if (!released.released) {
+                var releaseError = new Error(
+                    'exact GPU decode lease release failed: ' + released.reason);
+                releaseError.gpuPipelineLeaseReleaseFailed = true;
+                throw releaseError;
+            }
+            args.variables.vmafGpuPipelineLockAcquired = false;
+            args.variables.vmafGpuPipelineLockReleased = true;
+            if (lease.borrowed) {
+                log('Released the exact reentrant flow-owned GPU lease after final CUVID validation.');
+            } else {
+                log('Released the internal GPU lease after final CUVID validation.');
+            }
+            return released;
+        },
+    };
+}
+
+async function withGpuDecodeLease(controller, operation) {
+    if (!controller || typeof controller.acquire !== 'function' ||
+            typeof controller.release !== 'function') {
+        throw new Error('final CUVID validation requires a GPU lease controller');
+    }
+    var lease = await controller.acquire();
+    var value;
+    var operationError = null;
+    try {
+        value = await operation();
+    } catch (error) {
+        operationError = error;
+    }
+    try {
+        await controller.release(lease);
+    } catch (releaseError) {
+        var fatalReleaseError = new Error(
+            'GPU decode lease release failed closed: ' + releaseError.message +
+            (operationError ? '; GPU validation also failed: ' + operationError.message : ''));
+        fatalReleaseError.gpuPipelineLeaseReleaseFailed = true;
+        throw fatalReleaseError;
+    }
+    if (operationError) throw operationError;
+    return value;
+}
+
 async function validateFinalAv1Decode(ffmpegPath, outputPath, outputProbe, options) {
     options = options || {};
     var primary = primaryVideo(outputProbe);
@@ -2023,14 +2155,16 @@ async function validateFinalAv1Decode(ffmpegPath, outputPath, outputProbe, optio
     var timeoutMs = Math.max(1000, finiteNumber(options.timeoutMs, 240 * 60 * 1000));
     var mode = lower(options.mode);
     var auditMode = mode === 'canary' || mode === 'audit';
+    var requireFullTitle = options.requireFullTitle === true;
     var log = typeof options.log === 'function' ? options.log : function () {};
 
-    // Active production has already passed ffprobe packet/stream/duration
+    // The legacy calibrated active path has already passed ffprobe packet/stream/duration
     // inventory, remux payload hashes, grav1synth semantic inspection, and
     // calibration plus held-out decoded-region validation before reaching this
     // point. Re-decoding an entire feature adds catastrophic latency without
-    // enough incremental production value to justify it.
-    if (!auditMode) {
+    // enough incremental production value to justify it. Direct bitstream
+    // rewriting sets requireFullTitle and is never eligible for this fast path.
+    if (!auditMode && !requireFullTitle) {
         log('Final AV1 validation mode: active structural, semantic, payload, and held-out sampled evidence; no additional full-title decode.');
         return {
             schema: 1,
@@ -2058,32 +2192,77 @@ async function validateFinalAv1Decode(ffmpegPath, outputPath, outputProbe, optio
     // the exhaustive GPU pass is authoritative and any later error fails
     // closed; it can never fall back to a sampled software success.
     var preflightTimeoutMs = Math.min(timeoutMs, 30 * 1000);
-    var preflight = await runDecodeCommand(
-        runner, ffmpegPath, gpuAv1DecodeArgs(outputPath, primary.index, true), preflightTimeoutMs);
-    if (preflight.code === 0 && !preflight.timedOut && !preflight.spawnError) {
-        log('Final AV1 decode validation mode: exhaustive GPU NVDEC/CUVID (av1_cuvid).');
-        var gpuFull = await runDecodeCommand(
-            runner, ffmpegPath, gpuAv1DecodeArgs(outputPath, primary.index, false), timeoutMs);
-        if (gpuFull.code !== 0 || gpuFull.timedOut || gpuFull.spawnError) {
+    var gpuOutcome = await withGpuDecodeLease(options.gpuLease, async function () {
+        var preflight = await runDecodeCommand(
+            runner, ffmpegPath,
+            gpuAv1DecodeArgs(outputPath, primary.index, true),
+            preflightTimeoutMs);
+        if (preflight.code === 0 && !preflight.timedOut && !preflight.spawnError) {
+            log('Final AV1 decode validation mode: exhaustive GPU NVDEC/CUVID (av1_cuvid).');
+            var gpuFull = await runDecodeCommand(
+                runner, ffmpegPath,
+                gpuAv1DecodeArgs(outputPath, primary.index, false),
+                timeoutMs);
+            if (gpuFull.code !== 0 || gpuFull.timedOut || gpuFull.spawnError) {
+                throw decodeCommandFailure(
+                    'exhaustive GPU AV1 decode validation after successful preflight; sampled fallback is forbidden',
+                    gpuFull);
+            }
+            return {
+                validation: {
+                    schema: 1,
+                    mode: mode + '_nvdec_full_v1',
+                    exhaustive: true,
+                    sampled: false,
+                    hardware_accelerated: true,
+                    decoder: 'av1_cuvid',
+                    additional_decode_commands: 2,
+                    gpu_preflight: {
+                        attempted: true,
+                        available: true,
+                        decoded_frames: 1,
+                    },
+                },
+            };
+        }
+        if (!gpuDecodeUnavailableBeforePass(preflight)) {
+            throw decodeCommandFailure('GPU AV1 decode preflight', preflight);
+        }
+        return { unavailablePreflight: preflight };
+    });
+    if (gpuOutcome.validation) return gpuOutcome.validation;
+
+    // The internal lease is intentionally released before any software decode.
+    var preflight = gpuOutcome.unavailablePreflight;
+    var unavailableReason = boundedDecodeReason(preflight);
+    if (requireFullTitle) {
+        log('GPU AV1 decode preflight unavailable (' + unavailableReason +
+            '); mandatory full-title validation is using the software AV1 decoder.');
+        var softwareFull = await runDecodeCommand(
+            runner,
+            ffmpegPath,
+            softwareFullDecodeArgs(outputPath, primary.index),
+            timeoutMs);
+        if (softwareFull.code !== 0 || softwareFull.timedOut || softwareFull.spawnError) {
             throw decodeCommandFailure(
-                'exhaustive GPU AV1 decode validation after successful preflight; sampled fallback is forbidden',
-                gpuFull);
+                'mandatory full-title software AV1 decode after grain bitstream rewrite',
+                softwareFull);
         }
         return {
             schema: 1,
-            mode: mode + '_nvdec_full_v1',
+            mode: mode + '_software_full_gpu_unavailable_v1',
             exhaustive: true,
             sampled: false,
-            hardware_accelerated: true,
-            decoder: 'av1_cuvid',
-            gpu_preflight: { attempted: true, available: true, decoded_frames: 1 },
+            hardware_accelerated: false,
+            decoder: 'software-auto',
+            additional_decode_commands: 2,
+            gpu_preflight: {
+                attempted: true,
+                available: false,
+                reason: unavailableReason,
+            },
         };
     }
-
-    if (!gpuDecodeUnavailableBeforePass(preflight)) {
-        throw decodeCommandFailure('GPU AV1 decode preflight', preflight);
-    }
-    var unavailableReason = boundedDecodeReason(preflight);
     var samples = distributedDecodeSamples(outputProbe, options.samplePolicy);
     var fallbackBudgetMs = Math.min(timeoutMs, 5 * 60 * 1000);
     var fallbackStarted = Date.now();
@@ -3089,17 +3268,20 @@ async function plugin(args) {
         return makeResult(args, 4, originalObj, 'failed', { grainSynthesisReason: 'missing_source_or_working_path' });
     }
     try {
-        if (!ensurePathAllowed(
+        var canonicalSourcePath = grainArtifact.resolveAllowlistedSourcePath(
             sourcePath,
             sourcePathRegex,
-            String(args.inputs.sourcePathRegexFlags === undefined ? 'i' : args.inputs.sourcePathRegexFlags)
-        )) {
+            String(args.inputs.sourcePathRegexFlags === undefined ? 'i' : args.inputs.sourcePathRegexFlags));
+        if (!canonicalSourcePath) {
             args.jobLog('Original path is outside the mounted grain source scope; bypassing grain: ' + sourcePath);
             return makeResult(args, 3, args.inputFileObj, 'ineligible', { grainSynthesisReason: 'source_path_not_allowlisted' });
         }
+        sourcePath = canonicalSourcePath;
     } catch (regexErr) {
-        args.jobLog('Film-grain configuration error: ' + regexErr.message);
-        return makeResult(args, 4, originalObj, 'failed', { grainSynthesisReason: 'invalid_source_path_regex' });
+        args.jobLog('Film-grain source-scope safety error: ' + regexErr.message);
+        return makeResult(args, 4, originalObj, 'failed', {
+            grainSynthesisReason: 'invalid_or_unsafe_source_scope',
+        });
     }
 
     var pipelinePath = String(args.inputs.pipelinePath);
@@ -3111,7 +3293,6 @@ async function plugin(args) {
     var jobDir = null;
     var activeOutput = null;
     var promotedReviewPaths = [];
-    var lockState = null;
     var result = null;
     var sourceMkvIdentify = null;
     var qualityWarnings = [];
@@ -3248,12 +3429,6 @@ async function plugin(args) {
         }
         grainArtifact.registerTemporaryFile(args.variables, args, fitTablePath);
         grainArtifact.registerTemporaryFile(args.variables, args, fitManifestPath);
-
-        var lockDir = String(args.inputs.lockDir || '/temp/tdarr-vmaf-gpu-pipeline.lock');
-        lockState = boolValue(args.inputs.requireExistingGpuLock, false)
-            ? requireExistingLock(args, lockDir)
-            : acquireOwnLock(args, lockDir);
-        args.jobLog('GPU pipeline lock verified for grain synthesis.');
 
         jobDir = fs.mkdtempSync(path.join(workRoot, safeSlug(path.basename(sourcePath, path.extname(sourcePath))) + '-' + stableId(sourcePath) + '-'));
         grainArtifact.assertJobOwnedPath(args, jobDir, 'grain synthesis job directory');
@@ -3461,6 +3636,7 @@ async function plugin(args) {
             ffmpegPath, finalPartialPath, outputProbe, {
                 mode: mode,
                 timeoutMs: validationTimeoutMs,
+                gpuLease: createGpuDecodeLeaseController(args),
                 log: function (message) { args.jobLog(message); },
             });
         args.variables.grainSynthesisDecodeValidationMode = decodeValidation.mode;
@@ -3617,29 +3793,6 @@ async function plugin(args) {
             });
     }
 
-    if (lockState && lockState.selfAcquired) {
-        var release = lockState.lock.release(lockState.lockDir, lockState.token, { force: false });
-        if (!release.released && release.reason !== 'no lock owner found') {
-            args.jobLog('Self-acquired GPU lock release failed: ' + release.reason);
-            if (activeOutput) {
-                try { fs.unlinkSync(activeOutput); } catch (_) {}
-                args.variables.vmafTemporaryFiles = Array.isArray(args.variables.vmafTemporaryFiles)
-                    ? args.variables.vmafTemporaryFiles.filter(function (filePath) {
-                        return path.resolve(String(filePath)) !== path.resolve(activeOutput);
-                    }) : [];
-                activeOutput = null;
-            }
-            rollbackPromotedReviewArtifacts(args, promotedReviewPaths).forEach(function (failure) {
-                args.jobLog('Grain review rollback after lock failure also failed: ' + failure);
-            });
-            result = makeResult(args, 4, originalObj, 'failed', {
-                grainSynthesisReason: 'self_acquired_gpu_lock_release_failed: ' + release.reason,
-                grainSynthesisOutputPath: null,
-            });
-        } else {
-            args.jobLog('Self-acquired GPU pipeline lock released.');
-        }
-    }
     return result;
 }
 async function runOutputCommandTwice(args, label, executable, argv, outputPath, options) {
@@ -3698,6 +3851,14 @@ function directFallbackResult(args, originalObj, reason) {
         grainSynthesisReason: diagnostic,
         grainSynthesisOutputPath: null,
     });
+}
+
+function discardRejectedDirectGrainJob(args, jobDir) {
+    if (!jobDir) {
+        throw new Error('direct grain size rejection has no owned job directory');
+    }
+    grainArtifact.removeOwnedJobDir(args, jobDir);
+    return null;
 }
 
 function reserveProductionReviewSlot(reviewDir) {
@@ -3829,11 +3990,15 @@ async function directPlugin(args) {
     try {
         var sourceScope = requireSourceAllowlist(mode, args.inputs.sourcePathRegex);
         if (!sourcePath || !workingPath) throw new Error('missing source or completed AV1 path');
-        if (!ensurePathAllowed(sourcePath, sourceScope,
+        var canonicalSourcePath = grainArtifact.resolveAllowlistedSourcePath(
+            sourcePath,
+            sourceScope,
             String(args.inputs.sourcePathRegexFlags === undefined
-                ? 'i' : args.inputs.sourcePathRegexFlags))) {
+                ? 'i' : args.inputs.sourcePathRegexFlags));
+        if (!canonicalSourcePath) {
             throw new Error('source is outside the mounted /media scope');
         }
+        sourcePath = canonicalSourcePath;
 
         var pipelinePath = String(args.inputs.pipelinePath);
         var grav1synthPath = String(args.inputs.grav1synthPath);
@@ -4036,6 +4201,23 @@ async function directPlugin(args) {
         if (!postGrain.present) {
             throw new Error('final mux does not expose semantic AV1 film-grain headers');
         }
+        args.jobLog('Running mandatory full-title AV1 decode validation after direct grain bitstream rewrite.');
+        var directDecodeValidation = await validateFinalAv1Decode(
+            ffmpegPath, finalPartialPath, outputProbe, {
+                mode: 'direct-' + mode,
+                requireFullTitle: true,
+                timeoutMs: validationTimeoutMs,
+                gpuLease: createGpuDecodeLeaseController(args),
+                log: function (message) { args.jobLog(message); },
+            });
+        if (directDecodeValidation.exhaustive !== true ||
+                directDecodeValidation.sampled !== false) {
+            throw new Error('direct grain output did not receive exhaustive full-title decode validation');
+        }
+        args.variables.grainSynthesisDecodeValidationMode =
+            directDecodeValidation.mode;
+        args.jobLog('Mandatory full-title AV1 decode validation completed: ' +
+            directDecodeValidation.mode + '.');
 
         var baseBytes = fs.statSync(workingPath).size;
         var outputBytes = fs.statSync(finalPartialPath).size;
@@ -4052,7 +4234,7 @@ async function directPlugin(args) {
         if (directGrainOriginalRejection) {
             args.jobLog('FILM GRAIN REJECTED ON SIZE: ' + directGrainOriginalRejection.reason
                 + '; discarding the grained output and continuing with the non-grained AV1 output.');
-            try { fs.unlinkSync(finalPartialPath); } catch (_unlinkErr2) {}
+            jobDir = discardRejectedDirectGrainJob(args, jobDir);
             return makeResult(args, 3, args.inputFileObj, 'size_rejected', {
                 grainSynthesisReason: 'grain_output_not_smaller_than_original',
                 grainSynthesisOriginalRatioPct: directGrainOriginalRejection.ratioPct,
@@ -4074,7 +4256,8 @@ async function directPlugin(args) {
             table_application_count: 1,
             gain_fit_performed: false,
             energy_validation_performed: false,
-            full_title_decode_validation_performed: false,
+            full_title_decode_validation_performed: true,
+            decode_validation: directDecodeValidation,
             apply_attempts: applyAttempts,
             remux_attempts: remuxAttempts,
             ancillary_remux_method: remuxMethod,
@@ -4125,14 +4308,17 @@ async function directPlugin(args) {
                 grainSynthesisValidation: validationReport,
             });
         } else {
-            var productionReview = preserveProductionReview(
-                args,
-                args.inputs.reviewDir || '/grain-pilot-review',
-                sourcePath,
-                validatedOutputPath,
-                fitTablePath,
-                fitManifestPath,
-                validationReport);
+            var productionReview = null;
+            if (boolValue(args.inputs.preserveProductionReview, false)) {
+                productionReview = preserveProductionReview(
+                    args,
+                    args.inputs.reviewDir || '/grain-pilot-review',
+                    sourcePath,
+                    validatedOutputPath,
+                    fitTablePath,
+                    fitManifestPath,
+                    validationReport);
+            }
             activeOutput = activeReplacementPath(workRoot, sourcePath);
             fs.renameSync(validatedOutputPath, activeOutput);
             grainArtifact.removeOwnedJobDir(args, jobDir);
@@ -4165,6 +4351,9 @@ async function directPlugin(args) {
         rollbackPromotedReviewArtifacts(args, promotedReviewPaths).forEach(function (failure) {
             args.jobLog('Direct grain review rollback also failed: ' + failure);
         });
+        if (error && error.gpuPipelineLeaseReleaseFailed === true) {
+            throw error;
+        }
         result = directFallbackResult(args, originalObj, error);
     }
 
@@ -4211,6 +4400,10 @@ exports._test = {
     gpuAv1DecodeArgs: gpuAv1DecodeArgs,
     distributedDecodeSamples: distributedDecodeSamples,
     softwareSampleDecodeArgs: softwareSampleDecodeArgs,
+    softwareFullDecodeArgs: softwareFullDecodeArgs,
+    flowGpuLeaseIdentity: flowGpuLeaseIdentity,
+    createGpuDecodeLeaseController: createGpuDecodeLeaseController,
+    withGpuDecodeLease: withGpuDecodeLease,
     validateFinalAv1Decode: validateFinalAv1Decode,
     buildRemuxArgs: buildRemuxArgs,
     validMatroskaDate: validMatroskaDate,
@@ -4238,6 +4431,9 @@ exports._test = {
     assertDynamicEnergyAlignment: assertDynamicEnergyAlignment,
     recordQualityWarning: recordQualityWarning,
     assessOutputSizeRatio: assessOutputSizeRatio,
+    assessGrainOutputAgainstOriginal: assessGrainOutputAgainstOriginal,
+    grainOriginalRatioCap: grainOriginalRatioCap,
+    discardRejectedDirectGrainJob: discardRejectedDirectGrainJob,
     activeReplacementPath: activeReplacementPath,
     validateDeferredGrainBaseContract: validateDeferredGrainBaseContract,
     makeResult: makeResult,

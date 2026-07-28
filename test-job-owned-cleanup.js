@@ -24,12 +24,29 @@ fs.writeFileSync(owned, 'owned');
 fs.writeFileSync(original, 'original');
 fs.writeFileSync(foreign, 'foreign');
 try {
-  const variables = { vmafOriginalFile: original, vmafTemporaryFiles: [owned, original, foreign] };
+  const variables = { vmafOriginalFile: original, vmafTemporaryFiles: [owned, original] };
   cleanup({ inputFileObj: { _id: original }, inputs: {}, variables, workDir: jobRoot, jobLog() {} });
   assert.ok(!fs.existsSync(owned), 'owned manifest file should be deleted');
   assert.ok(fs.existsSync(original), 'original must be protected');
-  assert.ok(fs.existsSync(foreign), 'path outside the job root must be protected');
   assert.deepStrictEqual(variables.vmafTemporaryFiles, []);
+
+  const poisonedOwned = path.join(jobRoot, 'poisoned-owned.tmp');
+  fs.writeFileSync(poisonedOwned, 'owned');
+  const poisoned = {
+    vmafOriginalFile: original,
+    vmafTemporaryFiles: [poisonedOwned, foreign],
+  };
+  assert.throws(
+    () => cleanup({
+      inputFileObj: { _id: original }, inputs: {}, variables: poisoned,
+      workDir: jobRoot, jobLog() {},
+    }),
+    /containment validation failed/,
+    'an out-of-job mutable manifest path must fail closed',
+  );
+  assert.ok(fs.existsSync(poisonedOwned),
+    'manifest validation must happen before any deletion');
+  assert.ok(fs.existsSync(foreign), 'path outside the job root must be protected');
 } finally {
   fs.rmSync(base, { recursive: true, force: true });
 }

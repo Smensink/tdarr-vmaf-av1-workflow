@@ -35,9 +35,11 @@ docker exec -it tdarr bash /usr/local/build-scripts/rebuild-ffmpeg-compute120.sh
 - `verify-grain-toolchain.sh` verifies the persisted binary checksum, pipeline
   syntax, CLI subcommands, exact FFmpeg wrapper identity, `av1_nvenc`
   availability, and the pinned NVEncC binary/coordinator artifact.
-- `healthcheck-grain-toolchain.sh` is an on-demand quiet wrapper around that
-  deep preflight. The tracked Compose health check is a cheap TCP liveness
-  probe so routine health monitoring does not contend with active GPU work.
+- `healthcheck-grain-toolchain.sh` is the cheap TCP liveness probe used by
+  Compose. It never launches FFmpeg, NVEncC, VMAF, grav1synth, or a GPU
+  self-test, so routine health monitoring does not contend with active work.
+- `verify-grain-toolchain.sh` is the explicit deep qualification. Run it
+  manually only in a drained maintenance window.
 
 ```bash
 docker exec tdarr bash /usr/local/build-scripts/verify-grain-toolchain.sh
@@ -61,6 +63,63 @@ automatically.
 - NVEncC and its KNN-to-FFmpeg coordinator: `./custom-nvencc/` (mounted
   read-only as one checksummed artifact)
 - Grain canary evidence: `./grain-pilot-review/`
+
+## Post-recovery private evidence
+
+`create-post-recovery-evidence.js` is the one-shot, read-only live-state
+capture used after independently proved terminal recovery. It creates online
+SQLite backups, exact regular-file config/report archives, the consistent
+active-Flow snapshot, and the schema-2 receipt consumed by
+`apply-tdarr-runtime-settings.js`. It requires pre/post quiescence, an existing
+reviewed exact-four library manifest, and an externally reviewed
+terminal-recovery receipt bound by its full SHA-256. It also rehashes the
+receipt-bound JSONL journal and the exact frozen watcher implementation before
+copying all three into the private generation.
+
+Run it only in the isolated helper-container layout documented in
+[`docs/post-recovery-private-evidence.md`](../docs/post-recovery-private-evidence.md).
+The live mounts, including `/temp`, remain read-only; only a unique private
+destination volume is writable. Generated data is private and must never be
+committed.
+
+## Deployment security qualification
+
+`verify-compose-security-model.js` consumes
+`docker compose config --format json` on standard input and emits only a
+generic result. It requires the exact reviewed image reference, private
+evidence volume, staged init/build/NVEncC bind sources, and (when non-default)
+host ports through `TDARR_EXPECTED_*` environment values. The host-port
+variables default to 8265/8266. It then proves that the resolved model has:
+
+- only loopback-published web/API ports;
+- authentication enabled with matching non-empty server/internal-node keys;
+- the literal loopback internal-node URL;
+- updater and Flow bootstrap controls disabled;
+- the cheap TCP health check;
+- exact read-only init/build/NVEncC binds; and
+- exactly one read-only private evidence volume, declared external under the
+  fixed Compose key `tdarr-private-runtime` and bound to the separately
+  reviewed volume name;
+- no unreviewed additional Compose service.
+
+The verifier additionally requires
+`TDARR_EXPECTED_SANITIZED_MODEL_SHA256`, the digest recorded during the
+separate review of the complete resolved model. Its
+`--print-sanitized-sha256` mode emits only that digest; it replaces API keys,
+tokens, passwords, and secret values before hashing. Record the digest after
+review, then run normal verification immediately before recreate. This binds
+the full service, mount, label, build, logging, volume, and network model
+without printing private paths or credentials. Do not derive and approve a
+new digest inside the same command that performs release verification.
+
+The resolved Compose JSON contains credentials. Pipe it directly into the
+verifier; never print or save it as release evidence.
+
+`verify-tdarr-auth-boundary.js` is the complementary post-start probe. It sends
+an intentionally unauthenticated `GET /api/v2/get-nodes` to the literal
+loopback API and accepts only HTTP 401 or 403. HTTP 2xx, a missing route,
+redirect, oversized response, timeout, or transport error fails
+qualification. It never reads or sends the configured API key.
 
 ## Reproducibility and runtime pinning
 

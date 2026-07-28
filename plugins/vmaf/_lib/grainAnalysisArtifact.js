@@ -493,6 +493,29 @@ function ensurePathAllowed(sourcePath, regexText, flagsText) {
     return regex.test(sourcePath);
 }
 
+function resolveAllowlistedSourcePath(sourcePath, regexText, flagsText) {
+    const requested = String(sourcePath || '').trim();
+    if (!requested || !path.isAbsolute(requested)) {
+        throw new Error('grain source path must be absolute');
+    }
+    const lexical = path.resolve(requested);
+    if (!ensurePathAllowed(lexical, regexText, flagsText)) return null;
+    const lexicalStat = fs.lstatSync(lexical);
+    if (!lexicalStat.isFile() || lexicalStat.isSymbolicLink()) {
+        throw new Error(`grain source is not a non-symlink regular file: ${lexical}`);
+    }
+    const canonical = path.resolve(fs.realpathSync(lexical));
+    const lexicalIdentity = process.platform === 'win32' ? lexical.toLowerCase() : lexical;
+    const canonicalIdentity = process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+    if (canonicalIdentity !== lexicalIdentity) {
+        throw new Error(`grain source contains a symlinked path component: ${lexical}`);
+    }
+    if (!ensurePathAllowed(canonical, regexText, flagsText)) {
+        throw new Error(`canonical grain source escaped the configured source scope: ${canonical}`);
+    }
+    return canonical;
+}
+
 function sampledSourceFingerprint(filePath) {
     const resolved = fs.realpathSync(filePath);
     const before = fs.statSync(resolved, { bigint: true });
@@ -4163,6 +4186,7 @@ module.exports = {
     profileAllowed,
     classifySource,
     ensurePathAllowed,
+    resolveAllowlistedSourcePath,
     sampledSourceFingerprint,
     assertFingerprint,
     hasSemanticGrain,

@@ -38,25 +38,43 @@ var details = function () { return ({
     ],
 }); };
 exports.details = details;
+
+var CODEC_ALIASES = {
+    av1: { av1: true },
+    hevc: { hevc: true, h265: true },
+    h264: { h264: true, avc: true, x264: true },
+};
+
+function canonicalCodec(codecName) {
+    var codec = String(codecName || '').trim().toLowerCase();
+    var targets = Object.keys(CODEC_ALIASES);
+    for (var i = 0; i < targets.length; i++) {
+        if (CODEC_ALIASES[targets[i]][codec] === true) return targets[i];
+    }
+    return codec;
+}
+
+function ordinaryVideoStreams(inputFileObj) {
+    var streams = (((inputFileObj || {}).ffProbeData || {}).streams || []);
+    return streams.filter(function(stream) {
+        if (!stream || stream.codec_type !== 'video') return false;
+        var disposition = stream.disposition || {};
+        return Number(disposition.attached_pic || 0) !== 1;
+    });
+}
+
 var plugin = function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
 
-    var targetCodec = String(args.inputs.targetCodec || 'av1').toLowerCase();
-    var currentCodec = '';
+    var targetCodec = canonicalCodec(args.inputs.targetCodec || 'av1');
+    var videoStreams = ordinaryVideoStreams(args.inputFileObj);
+    var currentCodecs = videoStreams.map(function(stream) {
+        return canonicalCodec(stream.codec_name);
+    });
 
-    if (args.inputFileObj.ffProbeData && args.inputFileObj.ffProbeData.streams) {
-        for (var i = 0; i < args.inputFileObj.ffProbeData.streams.length; i++) {
-            var stream = args.inputFileObj.ffProbeData.streams[i];
-            if (stream.codec_type === 'video') {
-                currentCodec = String(stream.codec_name || '').toLowerCase();
-                break;
-            }
-        }
-    }
-
-    if (!currentCodec) {
-        args.jobLog('WARNING: Could not determine video codec. Proceeding with transcoding.');
+    if (currentCodecs.length === 0 || currentCodecs.some(function(codec) { return !codec; })) {
+        args.jobLog('WARNING: Could not determine every ordinary video-stream codec. Proceeding with transcoding.');
         return {
             outputFileObj: args.inputFileObj,
             outputNumber: 1,
@@ -64,25 +82,14 @@ var plugin = function (args) {
         };
     }
 
-    // Normalize codec names for comparison
-    var codecMap = {
-        'av1': ['av1'],
-        'hevc': ['hevc', 'h265'],
-        'h264': ['h264', 'avc', 'x264'],
-    };
-
-    var targetCodecs = codecMap[targetCodec] || [targetCodec];
-    var isTargetCodec = false;
-
-    for (var j = 0; j < targetCodecs.length; j++) {
-        if (currentCodec.indexOf(targetCodecs[j]) !== -1) {
-            isTargetCodec = true;
-            break;
-        }
-    }
+    // Skip only when every ordinary video stream is exactly the requested
+    // codec. Attached pictures are deliberately ignored.
+    var isTargetCodec = currentCodecs.every(function(codec) {
+        return codec === targetCodec;
+    });
 
     if (isTargetCodec) {
-        args.jobLog('File is already in target codec (' + currentCodec + '). Skipping VMAF optimization to avoid unnecessary re-encoding.');
+        args.jobLog('All ordinary video streams are already in target codec (' + targetCodec + '). Skipping VMAF optimization to avoid unnecessary re-encoding.');
         return {
             outputFileObj: args.inputFileObj,
             outputNumber: 2,
@@ -90,7 +97,7 @@ var plugin = function (args) {
         };
     }
 
-    args.jobLog('File codec: ' + currentCodec + ' (target: ' + targetCodec + ') - proceeding with transcoding');
+    args.jobLog('Ordinary video codecs: ' + currentCodecs.join(', ') + ' (target: ' + targetCodec + ') - proceeding with transcoding');
     return {
         outputFileObj: args.inputFileObj,
         outputNumber: 1,
@@ -98,3 +105,7 @@ var plugin = function (args) {
     };
 };
 exports.plugin = plugin;
+exports._test = {
+    canonicalCodec: canonicalCodec,
+    ordinaryVideoStreams: ordinaryVideoStreams,
+};

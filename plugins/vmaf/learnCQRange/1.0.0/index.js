@@ -132,7 +132,23 @@ var details = function () { return ({
 
         {
 
-            label: 'Enable EMA Trend Tracking',
+            label: 'Emit Per-Job Legacy CSV Telemetry',
+
+            name: 'emitLegacyCsvSidecar',
+
+            type: 'boolean',
+
+            defaultValue: 'false',
+
+            inputUI: { type: 'switch' },
+
+            tooltip: 'Optional non-authoritative compatibility export. Writes one exclusive file per job under <csvPath>.d; never appends to the shared historical CSV.',
+
+        },
+
+        {
+
+            label: 'Emit Per-Job EMA Diagnostic Snapshot',
 
             name: 'emaEnabled',
 
@@ -146,7 +162,7 @@ var details = function () { return ({
 
             },
 
-            tooltip: 'Track exponential moving average trends over time to adapt to system changes',
+            tooltip: 'Optional diagnostic-only per-job snapshot. Shared EMA state is retired; SQLite similarity data is authoritative.',
 
         },
 
@@ -216,6 +232,53 @@ var details = function () { return ({
 
 exports.details = details;
 
+
+
+function exclusiveTelemetryPath(path, configuredPath, jobKey, suffix) {
+
+    var bundleDir = configuredPath + '.d';
+
+    var safeKey = String(jobKey || 'unknown').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 96) || 'unknown';
+
+    var base = path.basename(configuredPath, path.extname(configuredPath))
+
+        .replace(/[^A-Za-z0-9._-]+/g, '_') || 'vmaf_learning';
+
+    return {
+
+        directory: bundleDir,
+
+        file: path.join(bundleDir, base + '-' + safeKey + '-' + Date.now() + '-' + process.pid + suffix),
+
+    };
+
+}
+
+
+function writeExclusiveText(fs, outputPath, content) {
+
+    var fd = fs.openSync(outputPath, 'wx', 0o644);
+
+    try {
+
+        fs.writeFileSync(fd, content, 'utf8');
+
+    } finally {
+
+        fs.closeSync(fd);
+
+    }
+
+}
+
+
+function preTranscodeOutcomeLabel() {
+
+    // Terminal outcome is owned by monitorTranscodeRetry after the encode and
+    // post-encode checks. This pre-transcode node can only report "unknown".
+    return '';
+
+}
 
 
 var plugin = function (args) {
@@ -1737,7 +1800,9 @@ var plugin = function (args) {
 
         var finalCQ = learningData.selected_cq;
 
-        var transcodeSucceeded = true;
+        // This node runs before the final transcode. Absence of a failure is
+        // not evidence of success, so terminal outcome stays unknown here.
+        var transcodeSucceeded = null;
 
         var totalRetries = transcodeRetryCount;
 
@@ -1754,8 +1819,6 @@ var plugin = function (args) {
             }
 
             totalRetries = lastFailure.retries || 0;
-
-            transcodeSucceeded = lastFailure.succeeded !== false;
 
         }
 
@@ -1865,7 +1928,7 @@ var plugin = function (args) {
 
             totalRetries,
 
-            transcodeSucceeded ? '1' : '0',
+            preTranscodeOutcomeLabel(),
 
             transcodeRetryCount,
 
@@ -1929,7 +1992,17 @@ var plugin = function (args) {
 
 
 
-        var fileExists = fs.existsSync(csvPath);
+        var emitLegacyCsvSidecar = args.inputs.emitLegacyCsvSidecar === true
+            || args.inputs.emitLegacyCsvSidecar === 'true';
+        var fileExists = false;
+        if (emitLegacyCsvSidecar) {
+            var legacyJobKey = args.variables.vmafCanonicalJobId
+                || args.variables.vmafJobId
+                || (args.inputFileObj && args.inputFileObj._id)
+                || timestamp;
+            var legacyOutput = exclusiveTelemetryPath(path, csvPath, legacyJobKey, '.csv');
+            csvPath = legacyOutput.file;
+        }
 
         var csvDir = path.dirname(csvPath);
 
@@ -2022,13 +2095,9 @@ var plugin = function (args) {
 
 
 
-        if (fileExists) {
+        if (emitLegacyCsvSidecar) {
 
-            fs.appendFileSync(csvPath, '\n' + csvRow);
-
-        } else {
-
-            fs.writeFileSync(csvPath, csvHeader + '\n' + csvRow);
+            writeExclusiveText(fs, csvPath, csvHeader + '\n' + csvRow + '\n');
 
         }
 
@@ -2036,7 +2105,15 @@ var plugin = function (args) {
 
         args.jobLog('');
 
-        args.jobLog('✓ Saved enhanced learning data to CSV: ' + csvPath);
+        if (emitLegacyCsvSidecar) {
+
+            args.jobLog('Saved optional per-job legacy learning telemetry: ' + csvPath);
+
+        } else {
+
+            args.jobLog('Legacy learning CSV write disabled; SQLite selection data is authoritative.');
+
+        }
 
         args.jobLog('  Total retries tracked: ' + totalRetries);
 
@@ -2100,7 +2177,14 @@ var plugin = function (args) {
 
         var path = require('path');
 
-        var emaStatePath = path.join(path.dirname(csvPath), 'ema_cq_state.json');
+        var emaConfiguredPath = args.inputs.emaPriorsPath || '/app/configs/vmaf_ema_priors.json';
+        var emaJobKey = args.variables.vmafCanonicalJobId
+            || args.variables.vmafJobId
+            || (args.inputFileObj && args.inputFileObj._id)
+            || new Date().toISOString();
+        var emaOutput = exclusiveTelemetryPath(path, emaConfiguredPath, emaJobKey, '.json');
+        var emaStatePath = emaOutput.file;
+        fs.mkdirSync(emaOutput.directory, { recursive: true });
 
         var emaState = {
 
@@ -2172,11 +2256,11 @@ var plugin = function (args) {
 
             // Save updated state
 
-            fs.writeFileSync(emaStatePath, JSON.stringify(emaState, null, 2));
+            writeExclusiveText(fs, emaStatePath, JSON.stringify(emaState, null, 2) + '\n');
 
 
 
-            args.jobLog('Updated EMA for ' + tier + ': ' + emaState.ema[tier].toFixed(2) + ' CQ (N=' + emaState.sampleCounts[tier] + ')');
+            args.jobLog('Wrote per-job EMA diagnostic snapshot for ' + tier + ': ' + emaState.ema[tier].toFixed(2) + ' CQ (N=' + emaState.sampleCounts[tier] + ')');
 
         }
 
@@ -2203,3 +2287,8 @@ var plugin = function (args) {
 };
 
 exports.plugin = plugin;
+exports._test = {
+    exclusiveTelemetryPath: exclusiveTelemetryPath,
+    writeExclusiveText: writeExclusiveText,
+    preTranscodeOutcomeLabel: preTranscodeOutcomeLabel,
+};

@@ -1,10 +1,12 @@
 #!/bin/sh
-set -e
+set -eu
 
 echo '=== Applying VMAF flow plugin patches ==='
 PATCH_ROOT='/custom-cont-init.d/vmaf-plugin-patches'
 FILTER_PATCH_ROOT='/custom-cont-init.d/filter-plugin-patches'
 TOOLS_PATCH_ROOT='/custom-cont-init.d/tools-plugin-patches'
+SERVER_PLUGINS_ROOT='/app/server/Tdarr/Plugins'
+NODE_PLUGINS_ROOT='/app/Tdarr_Node/assets/app/plugins'
 LOCAL_NODE_ROOT='/app/Tdarr_Node/assets/app/plugins/FlowPlugins/LocalFlowPlugins'
 LOCAL_SERVER_ROOT='/app/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins'
 NODE_TARGET_ROOT="$LOCAL_NODE_ROOT/vmaf"
@@ -15,14 +17,25 @@ TOOLS_NODE_TARGET_ROOT='/app/Tdarr_Node/assets/app/plugins/FlowPlugins/LocalFlow
 TOOLS_SERVER_TARGET_ROOT='/app/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins/tools'
 
 # The server catalog is persistent, while the internal node catalog lives in the
-# container image and is lost on recreation. Seed every local plugin before the
-# pinned payloads below are applied so an existing Flow cannot reference a plugin
-# that the internal node has never indexed.
-if [ -d "$LOCAL_SERVER_ROOT" ]; then
-  mkdir -p "$LOCAL_NODE_ROOT"
-  cp -a "$LOCAL_SERVER_ROOT/." "$LOCAL_NODE_ROOT/"
-  echo "Seeded internal-node local plugin catalog from $LOCAL_SERVER_ROOT"
+# container image and is lost on recreation. The pin sentinel below suppresses
+# Tdarr's later plugin ZIP download, so seed the complete catalog first. Copying
+# only LocalFlowPlugins leaves FlowHelpers absent and makes Tdarr_Node's hardware
+# encoder probe (hardwareUtils.test.js) fail before a real job can start.
+if [ ! -d "$SERVER_PLUGINS_ROOT" ] || [ -L "$SERVER_PLUGINS_ROOT" ]; then
+  echo "Persistent server plugin catalog is missing or unsafe: $SERVER_PLUGINS_ROOT" >&2
+  exit 1
 fi
+if [ -L "$NODE_PLUGINS_ROOT" ]; then
+  echo "Internal-node plugin catalog root is an unsafe symlink: $NODE_PLUGINS_ROOT" >&2
+  exit 1
+fi
+if find "$SERVER_PLUGINS_ROOT" -type l -print -quit | grep -q .; then
+  echo "Persistent server plugin catalog contains a symlink" >&2
+  exit 1
+fi
+mkdir -p "$NODE_PLUGINS_ROOT"
+cp -a "$SERVER_PLUGINS_ROOT/." "$NODE_PLUGINS_ROOT/"
+echo "Seeded complete internal-node plugin catalog from $SERVER_PLUGINS_ROOT"
 
 apply_patch_file() {
   rel="$1"
@@ -105,6 +118,9 @@ apply_patch_file 'acquireGpuPipelineLock/1.0.0'
 apply_patch_file 'releaseGpuPipelineLock/1.0.0'
 apply_patch_file 'analyzeFilmGrain/1.0.0'
 apply_patch_file 'synthesizeFilmGrain/1.0.0'
+apply_patch_file 'validateDeliveryCandidate/1.0.0'
+apply_patch_file 'replaceOriginalFileAttested/1.0.0'
+apply_patch_file 'finalizeDeliveredOutcome/1.0.0'
 apply_patch_file 'cleanupTempFiles/1.0.0'
 apply_filter_patch_file 'checkFileAge/1.0.0'
 apply_tools_patch_file 'unmonitorRadarrOrSonarr/1.0.0'
@@ -119,6 +135,10 @@ apply_shared_lib_file 'emptyBandShadow.js'
 apply_shared_lib_file 'rejectionReasons.js'
 apply_shared_lib_file 'grainAnalysisArtifact.js'
 apply_shared_lib_file 'postEncodeCheckpoint.js'
+apply_shared_lib_file 'postReplaceAttestation.js'
+apply_shared_lib_file 'deliveryPolicy.js'
+apply_shared_lib_file 'deliveryFinalization.js'
+apply_shared_lib_file 'deliveryTransaction.js'
 apply_shared_lib_file 'canonicalDenoise.js'
 apply_shared_lib_file 'nvencTemporalFilter.js'
 apply_shared_lib_file 'nvenccKnn.js'
@@ -150,9 +170,30 @@ echo "Initialized protected post-encode reuse registry: $VMAF_POSTENCODE_REUSE_R
 # Tdarr_Node runs as abc and refreshes nodePlugins.Zip after init. Leaving any
 # pre-seeded file owned by root makes that refresh abort on chmod before later
 # local plugins are indexed (detectGPUEncoder was the first observed casualty).
-if id abc >/dev/null 2>&1 && [ -d "$LOCAL_NODE_ROOT" ]; then
-  chown -R abc:abc "$LOCAL_NODE_ROOT"
-  echo "Assigned internal-node local plugin catalog to abc"
+if id abc >/dev/null 2>&1 && [ -d "$NODE_PLUGINS_ROOT" ]; then
+  chown -R abc:abc "$NODE_PLUGINS_ROOT"
+  echo "Assigned complete internal-node plugin catalog to abc"
 fi
+
+# Tdarr_Node downloads the server's cached nodePlugins.Zip after custom init
+# unless <pluginsPath>/.git exists. That late download can contain a zip made
+# before these pinned bytes were installed and silently roll the node catalog
+# back to a mixed generation. The complete server catalog was seeded above, so
+# use Tdarr's own development-preservation interlock to keep this internal node
+# pinned. Deliberate catalog upgrades occur only through a drained recreate,
+# which reseeds the whole catalog before recreating this sentinel.
+NODE_PLUGIN_PIN_SENTINEL="$NODE_PLUGINS_ROOT/.git"
+if [ -e "$NODE_PLUGIN_PIN_SENTINEL" ] && [ ! -d "$NODE_PLUGIN_PIN_SENTINEL" ]; then
+  echo "Unsafe node plugin pin sentinel: $NODE_PLUGIN_PIN_SENTINEL" >&2
+  exit 1
+fi
+mkdir -p "$NODE_PLUGIN_PIN_SENTINEL"
+chmod 755 "$NODE_PLUGIN_PIN_SENTINEL"
+# The base image may transfer the whole plugin root to abc later in startup.
+# Match the parent's current ownership now so the immediate parity gate is
+# deterministic; any later recursive ownership transfer then moves both
+# together.
+chown --reference="$NODE_PLUGINS_ROOT" "$NODE_PLUGIN_PIN_SENTINEL"
+echo 'Pinned internal-node plugin catalog against post-init zip replacement'
 
 echo '=== VMAF plugin patches complete ==='

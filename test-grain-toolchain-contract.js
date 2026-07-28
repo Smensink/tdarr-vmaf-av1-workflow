@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 
 const verify = fs.readFileSync('build-scripts/verify-grain-toolchain.sh', 'utf8');
+const gpuSelftestRunner = fs.readFileSync(
+  'build-scripts/run-grain-gpu-selftests.js', 'utf8');
 const installer = fs.readFileSync('custom-cont-init.d/98-install-grain-pipeline.sh', 'utf8');
 const gravInstaller = fs.readFileSync('custom-cont-init.d/98-install-grav1synth.sh', 'utf8');
 const gravRebuild = fs.readFileSync('build-scripts/rebuild-grav1synth.sh', 'utf8');
@@ -14,6 +16,8 @@ const gravRegression = fs.readFileSync(
 const startup = fs.readFileSync('custom-cont-init.d/99-verify-grain-toolchain.sh', 'utf8');
 const healthcheck = fs.readFileSync('build-scripts/healthcheck-grain-toolchain.sh', 'utf8');
 const compose = fs.readFileSync('docker-compose.example.yml', 'utf8');
+const runtimeImageDocs = fs.readFileSync('docs/runtime-image.md', 'utf8');
+const troubleshootingDocs = fs.readFileSync('docs/troubleshooting.md', 'utf8');
 
 function capture(text, expression, description) {
   const match = text.match(expression);
@@ -157,9 +161,27 @@ assert.deepStrictEqual(
   'grav1synth checksum manifest is not the exact pinned binary');
 assert.match(gravInstaller, /sha256sum --check --strict SHA256SUMS/,
   'grav1synth installer does not strictly validate SHA256SUMS');
-assert.match(verify,
-  /runuser -u "\$RUNTIME_USER" -- env GRAV1SYNTH_REGRESSION_QUIET=1[\s\\]+bash "\$GRAV1SYNTH_NVENC_REGRESSION" "\$GRAV1SYNTH" "\$FFMPEG"/,
+assert.match(gpuSelftestRunner,
+  /await run\('runuser', \[[\s\S]+GRAV1SYNTH_REGRESSION_QUIET=1[\s\S]+config\.grav1synthRegression[\s\S]+config\.grav1synth[\s\S]+config\.ffmpeg/,
   'grain preflight does not execute the NVENC regression as the runtime user');
+assert.match(verify,
+  /GPU_PIPELINE_LOCK_DIR="\$\{TDARR_GPU_PIPELINE_LOCK_DIR:-\/temp\/tdarr-vmaf-gpu-pipeline\.lock\}"/,
+  'grain preflight does not use the exact shared GPU-pipeline lock');
+assert.match(gpuSelftestRunner,
+  /lock\.tryAcquireOnce\([\s\S]+gpu-pipeline-busy[\s\S]+lock\.release\([\s\S]+expectedGeneration/,
+  'grain preflight does not own and generation-release the shared pipeline lock');
+assert.match(gpuSelftestRunner,
+  /automaticStaleBreakDisabled:\s*true/,
+  'grain GPU self-test lease can be stolen after hard supervisor loss');
+assert.match(gpuSelftestRunner,
+  /SIGTERM[\s\S]+SIGKILL[\s\S]+childTreeUnconfirmed[\s\S]+manual recovery is required/,
+  'grain GPU self-test runner can release before detached descendants are proven absent');
+assert.match(verify,
+  /node "\$GPU_SELFTEST_RUNNER"[\s\S]+SKIPPED_BUSY/,
+  'grain preflight does not route runtime tests through the owned-lease runner');
+assert.match(verify,
+  /if "\$GPU_RUNTIME_SELFTESTS_RAN"; then[\s\S]+OK: NVEncC CUDA KNN 8-bit and 10-bit runtime-user paths[\s\S]+else[\s\S]+runtime paths were not exercised while busy/,
+  'grain preflight claims a GPU runtime pass after a lock-gated skip');
 assert.match(compose,
   /\.\/custom-grav1synth:\/opt\/grav1synth-artifact:ro/,
   'Compose does not mount the grav1synth artifact read-only');
@@ -170,10 +192,17 @@ assert.match(compose,
   'Compose healthcheck must remain a cheap TCP liveness probe');
 assert.match(compose, /Run build-scripts\/verify-grain-toolchain\.sh[\s\S]*queue is idle/,
   'Compose must direct operators to the idle-time grain qualification');
+assert.match(runtimeImageDocs,
+  /detached process-group leader[\s\S]+automaticStaleBreakDisabled[\s\S]+manual recovery/,
+  'runtime documentation omits self-test process-group fail-closed behavior');
+assert.match(troubleshootingDocs,
+  /grain-toolchain-runtime-selftests[\s\S]+expectedGeneration[\s\S]+force[^.\n]+remains false/,
+  'troubleshooting does not define the non-stealable self-test lease recovery contract');
 
 assert.match(verify, /grep -Fq -- "--vpp-knn"/,
   'grain preflight does not require the selected NVEncC CUDA KNN filter');
-assert.match(verify, /NVEncC 8-bit\/10-bit KNN smoke test failed/,
+assert.match(gpuSelftestRunner,
+  /await run\('env', \[[\s\S]+TDARR_NVENCC=[\s\S]+config\.nvenccSmoke/,
   'grain preflight does not exercise both supported native KNN bit depths');
 assert.match(verify, /mkvmerge is required for lossless Matroska ancillary preservation/,
   'grain preflight does not require MKVToolNix for ancillary FFmpeg bypass');
@@ -199,7 +228,15 @@ assert.match(verify, /refusing unsafe scratch cleanup/,
   'grain preflight scratch cleanup lacks a path guard');
 assert.ok(startup.includes('/usr/local/build-scripts/verify-grain-toolchain.sh'),
   'container startup does not enforce the extended grain preflight');
-assert.ok(healthcheck.includes('/usr/local/build-scripts/verify-grain-toolchain.sh'),
-  'container healthcheck does not enforce the extended grain preflight');
+const healthcheckCommands = healthcheck
+  .split(/\r?\n/)
+  .filter((line) => !line.trimStart().startsWith('#'))
+  .join('\n');
+assert.match(healthcheckCommands,
+  /exec bash -c 'exec 3<>\/dev\/tcp\/127\.0\.0\.1\/8266'/,
+  'container healthcheck is not the reviewed cheap loopback TCP probe');
+assert.doesNotMatch(healthcheckCommands,
+  /verify-grain-toolchain|run-grain-gpu-selftests|nvencc|grav1synth|ffmpeg|python3/i,
+  'container healthcheck must not run heavyweight toolchain qualification');
 
 console.log('PASS grain toolchain media self-test contract');

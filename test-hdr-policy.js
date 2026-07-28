@@ -62,12 +62,46 @@ for (const transfer of ['bt2020-10', 'bt2020-12']) {
   assert.ok(wcgSdr.logs.some((line) => line.includes('Wide-gamut SDR')));
 }
 
-const unknownBt2020HighBit = run({
-  color_transfer: 'unknown', color_primaries: 'bt2020', color_space: 'bt2020nc', pix_fmt: 'yuv420p10le',
+for (const transfer of ['', 'unknown', 'unspecified', 'reserved']) {
+  for (const pixFmt of ['yuv420p10le', 'yuv444p12le', 'p010le', 'p012le']) {
+    const ambiguousBt2020 = run({
+      color_transfer: transfer,
+      color_primaries: 'bt2020',
+      color_space: 'bt2020nc',
+      pix_fmt: pixFmt,
+    });
+    assert.strictEqual(ambiguousBt2020.result.outputNumber, 3,
+      `${transfer || 'missing'} ${pixFmt} must keep the original`);
+    assert.strictEqual(ambiguousBt2020.args.variables.isHDR, false);
+    assert.strictEqual(ambiguousBt2020.args.variables.vmafColorMetadataUnsupported, true);
+    assert.strictEqual(ambiguousBt2020.args.variables.vmafProcessingDisposition,
+      'keep_original_ambiguous_color_transfer');
+    assert.strictEqual(ambiguousBt2020.args.variables.vmafProcessingDispositionReason,
+      'bt2020_high_bit_depth_unknown_transfer');
+    assert.notStrictEqual(ambiguousBt2020.args.variables.color_trc, 'smpte2084');
+    assert.ok(ambiguousBt2020.logs.some((line) =>
+      line.includes('unknown transfer function')));
+  }
+}
+
+const ambiguousWithStaticMetadata = run({
+  color_transfer: 'unknown',
+  color_primaries: 'bt2020',
+  color_space: 'bt2020nc',
+  pix_fmt: 'yuv420p10le',
+  side_data_list: [{
+    side_data_type: 'Mastering display metadata',
+    red_x: '34000/50000', red_y: '16000/50000',
+    green_x: '13250/50000', green_y: '34500/50000',
+    blue_x: '7500/50000', blue_y: '3000/50000',
+    white_point_x: '15635/50000', white_point_y: '16450/50000',
+    min_luminance: '50/10000', max_luminance: '10000000/10000',
+  }],
 });
-assert.strictEqual(unknownBt2020HighBit.result.outputNumber, 1,
-  'BT.2020/high-bit heuristic remains available only for unknown transfer');
-assert.strictEqual(unknownBt2020HighBit.args.variables.color_trc, 'smpte2084');
+assert.strictEqual(ambiguousWithStaticMetadata.result.outputNumber, 3,
+  'mastering metadata alone must not invent a PQ transfer');
+assert.strictEqual(ambiguousWithStaticMetadata.args.variables.vmafProcessingDispositionReason,
+  'bt2020_high_bit_depth_unknown_transfer');
 
 const staticHdrStream = {
   color_transfer: 'smpte2084', color_primaries: 'bt2020', color_space: 'bt2020nc', pix_fmt: 'yuv420p10le',

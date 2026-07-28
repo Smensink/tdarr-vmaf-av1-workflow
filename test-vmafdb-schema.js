@@ -18,7 +18,7 @@ const migrationPath = path.join(os.tmpdir(), `vmafdb-migration-${process.pid}-${
 const mismatchMigrationPath = path.join(os.tmpdir(), `vmafdb-mismatch-${process.pid}-${Date.now()}.db`);
 try {
   const db = dbModule.openDb(dbPath);
-  assert.strictEqual(db.prepare('PRAGMA user_version').get().user_version, 15);
+  assert.strictEqual(db.prepare('PRAGMA user_version').get().user_version, 17);
 
   const sweepColumns = new Set(db.prepare('PRAGMA table_info(sweep_points)').all().map((row) => row.name));
   const jobColumns = new Set(db.prepare('PRAGMA table_info(jobs)').all().map((row) => row.name));
@@ -33,6 +33,13 @@ try {
   for (const column of [
     'source_cambi_time_sec', 'holdout_encode_time_sec', 'holdout_vmaf_time_sec',
     'holdout_candidate_cambi_time_sec', 'holdout_source_cambi_time_sec',
+  ]) assert(jobColumns.has(column));
+  for (const column of [
+    'target_size_reduction_pct', 'minimum_size_reduction_pct',
+    'max_final_output_ratio_pct', 'size_policy_version', 'outcome_stage',
+    'delivered_at', 'replacement_attestation_version',
+    'replacement_backup_retained', 'delivery_transaction_id',
+    'delivery_checkpoint_key',
   ]) assert(jobColumns.has(column));
   assert(jobColumns.has('reference_contract_id'));
   assert(jobColumns.has('metric_contract_id'));
@@ -51,7 +58,71 @@ try {
     'trg_jobs_encoder_profile_update_immutable',
     'trg_sweep_measurement_contract_insert_consistency',
     'trg_sweep_measurement_contract_update_consistency',
+    'trg_jobs_candidate_ready_insert_guard',
+    'trg_jobs_candidate_ready_update_guard',
+    'trg_jobs_delivery_committing_insert_guard',
+    'trg_jobs_delivery_committing_update_guard',
+    'trg_jobs_delivered_insert_guard',
+    'trg_jobs_delivered_update_guard',
+    'trg_jobs_delivery_stage_transition_guard',
+    'trg_jobs_delivered_immutable',
   ]) assert(triggers.has(trigger));
+
+  assert.throws(() => dbModule.upsertJob(db, {
+    job_id: 'invalid-candidate-ready',
+    outcome_stage: 'candidate_ready',
+    transcode_succeeded: null,
+    met_vmaf_target: null,
+    met_size_target: null,
+    final_output_size_mb: null,
+    final_output_ratio_pct: null,
+    actual_size_reduction_pct: null,
+    size_target_status: 'pending_delivery',
+    target_size_reduction_pct: 30,
+    minimum_size_reduction_pct: 20,
+    max_final_output_ratio_pct: 80,
+    size_policy_version: 'delivered-minimum-reduction-v1',
+  }), /invalid candidate-ready delivery state/);
+  dbModule.upsertJob(db, {
+    job_id: 'delivery-state-job',
+    outcome_stage: 'candidate_ready',
+    transcode_succeeded: null,
+    met_vmaf_target: null,
+    met_size_target: null,
+    final_output_size_mb: null,
+    final_output_ratio_pct: null,
+    actual_size_reduction_pct: null,
+    size_target_status: 'pending_delivery',
+    target_size_reduction_pct: 30,
+    minimum_size_reduction_pct: 20,
+    max_final_output_ratio_pct: 80,
+    size_policy_version: 'delivered-minimum-reduction-v1',
+    delivery_transaction_id: null,
+    delivery_checkpoint_key: 'a'.repeat(64),
+  });
+  const transactionId = 'b'.repeat(64);
+  assert.strictEqual(db.prepare(
+    "UPDATE jobs SET outcome_stage='replacement_committing', " +
+    'delivery_transaction_id=? WHERE job_id=? AND outcome_stage=?'
+  ).run(transactionId, 'delivery-state-job', 'candidate_ready').changes, 1);
+  assert.strictEqual(db.prepare(
+    "UPDATE jobs SET outcome_stage='delivery_committing' " +
+    'WHERE job_id=? AND outcome_stage=? AND delivery_transaction_id=?'
+  ).run('delivery-state-job', 'replacement_committing', transactionId).changes, 1);
+  const deliveredAt = new Date().toISOString();
+  assert.strictEqual(db.prepare(
+    "UPDATE jobs SET outcome_stage='delivered', transcode_succeeded=1, " +
+    "met_vmaf_target=1, met_size_target=1, size_target_status='met', " +
+    'final_output_size_mb=0.0008, final_output_ratio_pct=80, ' +
+    'actual_size_reduction_pct=20, delivered_at=?, ' +
+    "replacement_attestation_version='tdarr-vmaf-post-replace-attestation/v2', " +
+    'replacement_backup_retained=0, skip_reason=NULL ' +
+    'WHERE job_id=? AND outcome_stage=? AND delivery_transaction_id=?'
+  ).run(deliveredAt, 'delivery-state-job', 'delivery_committing', transactionId)
+    .changes, 1);
+  assert.throws(() => db.prepare(
+    "UPDATE jobs SET delivered_at='changed' WHERE job_id=?"
+  ).run('delivery-state-job'), /delivered outcome is immutable/);
 
   dbModule.upsertJob(db, {
     job_id: 'job-1',
@@ -245,7 +316,7 @@ try {
   v11.close();
 
   const migrated = dbModule.openDb(migrationPath);
-  assert.strictEqual(migrated.prepare('PRAGMA user_version').get().user_version, 15);
+  assert.strictEqual(migrated.prepare('PRAGMA user_version').get().user_version, 17);
   const migratedPoint = migrated.prepare(
     'SELECT reference_contract_id, metric_contract_id, encoder_profile_id FROM sweep_points WHERE job_id = ?'
   ).get('legacy-job');
@@ -303,7 +374,7 @@ try {
   rawMismatch.close();
 
   const quarantined = dbModule.openDb(mismatchMigrationPath);
-  assert.strictEqual(quarantined.prepare('PRAGMA user_version').get().user_version, 15);
+  assert.strictEqual(quarantined.prepare('PRAGMA user_version').get().user_version, 17);
   assert.strictEqual(dbModule.getSimilarSweepCurves(quarantined, { tier: '1080p' }, {
     limit: 10, referenceContractId: 'canonical-hqdn3d-v1',
   }).length, 1);
@@ -326,7 +397,7 @@ try {
     dbModule.LEGACY_METRIC_CONTRACT_ID, dbModule.LEGACY_ENCODER_PROFILE_ID),
   /sweep reference contract must match its job/);
   quarantined.close();
-  console.log('PASS VMAF DB schema v15 measurement-contract and timing integrity');
+  console.log('PASS VMAF DB schema v17 measurement, timing, and delivery-state integrity');
 } finally {
   for (const file of [dbPath, migrationPath, mismatchMigrationPath]) {
     for (const suffix of ['', '-journal', '-wal', '-shm']) {

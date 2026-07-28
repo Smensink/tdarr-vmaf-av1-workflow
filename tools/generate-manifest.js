@@ -95,7 +95,7 @@ function listHelperFiles(deployedHelpers) {
 function main() {
   const flow = JSON.parse(fs.readFileSync(flowPath, 'utf8'));
   const initSource = fs.readFileSync(initPath, 'utf8');
-  const activeLocalPlugins = new Set(
+  const trackedLocalPlugins = new Set(
     flow.flowPlugins
       .filter((plugin) => plugin.sourceRepo === 'Local')
       .map((plugin) => plugin.pluginName),
@@ -116,17 +116,17 @@ function main() {
 
   const plugins = listPlugins().map((plugin) => ({
     ...plugin,
-    activeInLiveFlow: activeLocalPlugins.has(plugin.name),
+    activeInTrackedFlow: trackedLocalPlugins.has(plugin.name),
     pinnedAtContainerStart:
       (plugin.category === 'vmaf' && pinnedVmafPlugins.has(plugin.name))
       || (plugin.category === 'filter' && pinnedFilterPlugins.has(plugin.name))
       || (plugin.category === 'tools' && pinnedToolsPlugins.has(plugin.name)),
   }));
   const manifest = {
-    schema: 'tdarr-vmaf-av1-manifest/v3',
+    schema: 'tdarr-vmaf-av1-manifest/v4',
     generatedAtUtc: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     source: {
-      type: 'redacted live-flow export plus parity-verified host plugin payloads',
+      type: 'tracked redacted flow plus checkout-parity-verified deployment payloads',
       flowId: flow._id,
       flowName: flow.name,
       flowNodes: flow.flowPlugins.length,

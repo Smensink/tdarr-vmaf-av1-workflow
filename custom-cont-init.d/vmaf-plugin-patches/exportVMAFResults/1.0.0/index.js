@@ -15,20 +15,28 @@ var details = function () { return ({
     icon: 'faFileCsv',
     inputs: [
         {
-            label: 'CSV Sidecar Output Path',
+            label: 'Enable Per-Job CSV Sidecars',
+            name: 'enableCsvSidecar',
+            type: 'boolean',
+            defaultValue: 'false',
+            inputUI: { type: 'switch' },
+            tooltip: 'Optional non-authoritative export. Writes one exclusive file per job under <csvPath>.d; SQLite remains authoritative.',
+        },
+        {
+            label: 'CSV Sidecar Bundle Prefix',
             name: 'csvPath',
             type: 'string',
             defaultValue: '/app/configs/vmaf_results.csv',
             inputUI: {
                 type: 'text',
             },
-            tooltip: 'Path where CSV sidecar file will be saved (SQLite is the primary store). Default: /app/configs/vmaf_results.csv (accessible on host)',
+            tooltip: 'Prefix for optional per-job CSV bundles. Files are written under <csvPath>.d without shared append operations.',
         },
     ],
     outputs: [
         {
             number: 1,
-            tooltip: 'CSV export completed',
+            tooltip: 'SQLite export completed; optional per-job CSV bundle attempted',
         },
     ],
 }); };
@@ -104,6 +112,26 @@ function isOrdinaryMeasuredAggregate(aggregate) {
     return true;
 }
 
+function writeExclusiveSidecar(fs, path, csvPath, jobKey, kind, content) {
+    var bundleDir = csvPath + '.d';
+    fs.mkdirSync(bundleDir, { recursive: true, mode: 0o755 });
+    var safeKey = String(jobKey || 'unknown')
+        .replace(/[^A-Za-z0-9._-]+/g, '_')
+        .slice(0, 96) || 'unknown';
+    var safeKind = String(kind || 'results').replace(/[^A-Za-z0-9_-]+/g, '_');
+    var base = path.basename(csvPath, path.extname(csvPath))
+        .replace(/[^A-Za-z0-9._-]+/g, '_') || 'vmaf_results';
+    var stamp = Date.now() + '-' + process.pid;
+    var outputPath = path.join(bundleDir, base + '-' + safeKind + '-' + safeKey + '-' + stamp + '.csv');
+    var fd = fs.openSync(outputPath, 'wx', 0o644);
+    try {
+        fs.writeFileSync(fd, content, 'utf8');
+    } finally {
+        fs.closeSync(fd);
+    }
+    return outputPath;
+}
+
 var plugin = function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
@@ -111,6 +139,8 @@ var plugin = function (args) {
     var path = require('path');
     var pairedCqShadow = require('../../_lib/pairedCqShadow.js');
     var csvPath = args.inputs.csvPath || '/app/configs/vmaf_results.csv';
+    var enableCsvSidecar = args.inputs.enableCsvSidecar === true
+        || args.inputs.enableCsvSidecar === 'true';
 
     // Get all data
     var inputFile = args.inputFileObj;
@@ -595,79 +625,21 @@ var plugin = function (args) {
         }
     }
 
-    // Write CSV file (append mode)
-    try {
-        // Ensure directory exists
-        var dirPath = path.dirname(csvPath);
-        if (!fs.existsSync(dirPath)) {
-            try {
-                fs.mkdirSync(dirPath, { recursive: true, mode: 0o755 });
-                args.jobLog('Created directory: ' + dirPath);
-            } catch (mkdirErr) {
-                args.jobLog('Warning: Could not create directory ' + dirPath + ': ' + mkdirErr.message);
-            }
-        }
-
-        var csvContent = csvLines.join('\n') + '\n';
-        var fileExists = fs.existsSync(csvPath);
-
-        if (fileExists) {
-            // Append to existing file (without header if file exists)
-            fs.appendFileSync(csvPath, csvContent.split('\n').slice(1).join('\n'));
-            args.jobLog('Appended to CSV sidecar (SQLite is primary): ' + csvPath);
-        } else {
-            // Create new file with header
-            fs.writeFileSync(csvPath, csvContent, { mode: 0o644 });
-            args.jobLog('Created CSV sidecar (SQLite is primary): ' + csvPath);
-        }
-
-        args.jobLog('Exported ' + (vmafResults.length || aggregatedResults.length) + ' result rows to CSV');
-        args.jobLog('CSV sidecar location: ' + csvPath);
-    } catch (err) {
-        args.jobLog('Error writing CSV file: ' + err.message);
-        args.jobLog('CSV path: ' + csvPath);
-        args.jobLog('Directory exists: ' + fs.existsSync(path.dirname(csvPath)));
-        args.jobLog('File exists: ' + fs.existsSync(csvPath));
-
-        // Try alternative path in /temp (cache directory) if configs fails
-        if (csvPath.indexOf('/app/configs') === 0) {
-            var altPath = csvPath.replace('/app/configs', '/temp');
-            args.jobLog('Attempting alternative path: ' + altPath);
-            try {
-                var altDirPath = path.dirname(altPath);
-                if (!fs.existsSync(altDirPath)) {
-                    fs.mkdirSync(altDirPath, { recursive: true, mode: 0o755 });
-                }
-                var csvContent = csvLines.join('\n') + '\n';
-                var fileExists = fs.existsSync(altPath);
-                if (fileExists) {
-                    fs.appendFileSync(altPath, csvContent.split('\n').slice(1).join('\n'));
-                } else {
-                    fs.writeFileSync(altPath, csvContent, { mode: 0o644 });
-                }
-                args.jobLog('Successfully exported to alternative path: ' + altPath);
-                args.jobLog('Note: Original path failed due to permissions. Using cache directory instead.');
-            } catch (altErr) {
-                args.jobLog('Alternative path also failed: ' + altErr.message);
-                // Don't throw - just log the error and continue
-                args.jobLog('WARNING: CSV sidecar write failed (SQLite already stored the results). Continuing.');
-            }
-        } else {
-            // For other paths, just log and continue
-            args.jobLog('WARNING: CSV sidecar write failed (SQLite already stored the results). Continuing.');
-        }
-    }
+    // Build optional telemetry now, but do not write it until after the
+    // authoritative SQLite transaction. Shared CSV append is intentionally not
+    // supported because concurrent workers can interleave or lose rows.
+    var csvContent = csvLines.join('\n') + '\n';
 
     // FFmpeg 8.1/libvmaf 3.1 runtime sidecar export. Keep this separate from the long-lived
     // legacy CSV so older historical rows/header don't need an 80MB schema migration.
-    try {
-        var runtimeCsvPath = '/app/configs/vmaf_results_runtime.csv';
-        var runtimeHeaders = [
+    var runtimeHeaders = [
             'timestamp', 'file_path', 'file_name', 'parameter_set_id', 'sample_index',
             'vmaf_method', 'vmaf_model_name', 'vmaf_model_path', 'ffmpeg_version', 'libvmaf_version',
             'gpu_vmaf_available', 'gpu_vmaf_used', 'sample_vmaf_score', 'sample_vmaf_mean', 'sample_vmaf_min', 'sample_vmaf_max'
         ];
-        var runtimeRows = [];
+    var runtimeRows = [];
+    var runtimeContent = '';
+    try {
         var modelName = args.variables.vmafModelName || '';
         var modelPath = args.variables.vmafModelPath || '';
         var ffmpegVersion = args.variables.vmafFfmpegVersion || '';
@@ -696,17 +668,11 @@ var plugin = function (args) {
             ]);
         }
         if (runtimeRows.length > 0) {
-            var runtimeExists = fs.existsSync(runtimeCsvPath);
-            var runtimeContent = '';
-            if (!runtimeExists) {
-                runtimeContent += runtimeHeaders.map(escapeCsvField).join(',') + '\n';
-            }
+            runtimeContent += runtimeHeaders.map(escapeCsvField).join(',') + '\n';
             runtimeContent += runtimeRows.map(function(row) { return row.map(escapeCsvField).join(','); }).join('\n') + '\n';
-            fs.appendFileSync(runtimeCsvPath, runtimeContent);
-            args.jobLog('Exported FFmpeg/libvmaf runtime metrics to: ' + runtimeCsvPath);
         }
     } catch (runtimeErr) {
-        args.jobLog('WARNING: Could not export FFmpeg/libvmaf runtime metrics sidecar CSV: ' + runtimeErr.message);
+        args.jobLog('WARNING: Could not build FFmpeg/libvmaf runtime sidecar CSV: ' + runtimeErr.message);
     }
 
     // ── Unified SQLite training store (primary write; CSV is a sidecar) ──
@@ -881,6 +847,26 @@ var plugin = function (args) {
         args.jobLog('WARNING: SQLite training-store write failed (non-fatal): ' + (dbErr && dbErr.message ? dbErr.message : String(dbErr)));
     }
 
+    if (enableCsvSidecar) {
+        var sidecarJobKey = args.variables.vmafCanonicalJobId
+            || args.variables.vmafJobId || fileMetadata.fileName || timestamp;
+        try {
+            var resultsSidecar = writeExclusiveSidecar(
+                fs, path, csvPath, sidecarJobKey, 'results', csvContent);
+            args.jobLog('Optional per-job CSV telemetry: ' + resultsSidecar);
+            if (runtimeContent) {
+                var runtimeSidecar = writeExclusiveSidecar(
+                    fs, path, csvPath, sidecarJobKey, 'runtime', runtimeContent);
+                args.jobLog('Optional per-job runtime CSV telemetry: ' + runtimeSidecar);
+            }
+        } catch (sidecarError) {
+            args.jobLog('WARNING: Optional per-job CSV telemetry failed (SQLite remains authoritative): '
+                + sidecarError.message);
+        }
+    } else {
+        args.jobLog('Optional CSV telemetry disabled; SQLite training store is authoritative.');
+    }
+
     return {
         outputFileObj: args.inputFileObj,
         outputNumber: 1,
@@ -892,4 +878,5 @@ exports._test = {
     resolveAggregateEncodeTime: resolveAggregateEncodeTime,
     isOrdinaryMeasuredAggregate: isOrdinaryMeasuredAggregate,
     buildPairedCqAuthorityRecord: buildPairedCqAuthorityRecord,
+    writeExclusiveSidecar: writeExclusiveSidecar,
 };

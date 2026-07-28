@@ -35,6 +35,7 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: "all"
       NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-all}"
       enableDockerAutoUpdater: "false"
+      cronPluginUpdate: ""
       LD_LIBRARY_PATH: "/usr/local/ffmpeg-custom/lib:/usr/local/lib:/usr/lib/x86_64-linux-gnu"
       TDARR_GRAV1SYNTH: "/usr/local/bin/grav1synth"
       TDARR_GRAIN_PIPELINE: "/opt/grain-pipeline/current/grain_pipeline_v5_direct.py"
@@ -42,6 +43,11 @@ services:
       TDARR_NVENCC_COORDINATOR: "/usr/local/libexec/tdarr-nvencc-knn-ffmpeg.js"
       TDARR_NVENCC_REQUIRED: "1"
       VMAF_V1_WORK_ROOT: "/var/lib/tdarr-vmaf-score"
+      # Host-wide CPU-v1 scorer semaphore. Keep one scorer plus two FFmpeg
+      # decoders below host saturation; raise only after measured qualification.
+      VMAF_V1_MAX_PARALLEL: "1"
+      VMAF_V1_LEASE_WAIT_SECONDS: "43200"
+      TDARR_GPU_PIPELINE_LOCK_DIR: "/temp/tdarr-vmaf-gpu-pipeline.lock"
       VMAF_POSTENCODE_CHECKPOINT_ROOT: "/temp/.vmaf-postencode-checkpoints-v1"
       VMAF_POSTENCODE_REUSE_REQUIRED_ROOT: "/app/configs/vmaf-postencode-reuse-required-v1"
       TDARR_FLOW_PARITY_BOOTSTRAP: "${TDARR_FLOW_PARITY_BOOTSTRAP:-0}"
@@ -72,6 +78,10 @@ services:
       - "./logs:/app/logs"
       - "./cache:/temp"
       - "vmaf-v1-score:/var/lib/tdarr-vmaf-score"
+      - type: volume
+        source: tdarr-private-runtime
+        target: /private/tdarr-runtime
+        read_only: true
       - "./custom-ffmpeg:/usr/local/ffmpeg-custom"
       - "./custom-libvmaf-lib:/custom-libvmaf-lib"
       - "./custom-libvmaf-include:/usr/local/include/libvmaf"
@@ -98,3 +108,6 @@ volumes:
     name: "${TDARR_SQL_VOLUME:-tdarr-db-sql}"
   vmaf-v1-score:
     name: "${TDARR_VMAF_SCORE_VOLUME:-tdarr-vmaf-v1-score}"
+  tdarr-private-runtime:
+    name: "${TDARR_PRIVATE_RUNTIME_VOLUME:?Set TDARR_PRIVATE_RUNTIME_VOLUME in .env}"
+    external: true

@@ -169,6 +169,20 @@ function terminate(child, signal) {
     try { child.kill(signal); } catch (_) {}
 }
 
+function childIsRunning(child) {
+    return Boolean(child && child.exitCode === null && child.signalCode === null);
+}
+
+function shouldStopPeerAfterExit(role, result, peerRunning) {
+    if (!peerRunning) return false;
+    // A producer may finish successfully while FFmpeg drains its final buffered
+    // frames. The reverse is never healthy: once FFmpeg has closed, allowing
+    // NVEncC to keep writing can leave the coordinator and Tdarr job alive
+    // indefinitely even when FFmpeg returned zero.
+    if (role === 'FFmpeg') return true;
+    return Boolean(result && (result.error || result.code !== 0));
+}
+
 async function run(parsed) {
     fs.mkdirSync(path.dirname(parsed.producerLog), { recursive: true });
     const producerLog = fs.createWriteStream(parsed.producerLog, {
@@ -237,10 +251,17 @@ async function run(parsed) {
     const producerPromise = childResult(producer, 'NVEncC');
     const consumerPromise = childResult(consumer, 'FFmpeg');
     producerPromise.then((result) => {
-        if (result.error || result.code !== 0) stopBoth('SIGTERM');
+        if (shouldStopPeerAfterExit('NVEncC', result, childIsRunning(consumer))) {
+            stopBoth('SIGTERM');
+        }
     });
     consumerPromise.then((result) => {
-        if (result.error || result.code !== 0) stopBoth('SIGTERM');
+        if (shouldStopPeerAfterExit('FFmpeg', result, childIsRunning(producer))) {
+            process.stderr.write(
+                `[${CONTRACT_ID}] FFmpeg exited before NVEncC; stopping the producer\n`
+            );
+            stopBoth('SIGTERM');
+        }
     });
     const [producerResult, consumerResult] = await Promise.all([
         producerPromise,
@@ -283,5 +304,7 @@ module.exports = {
     validate,
     assertExecutableTarget,
     buildProducerArgs,
+    childIsRunning,
+    shouldStopPeerAfterExit,
     run,
 };

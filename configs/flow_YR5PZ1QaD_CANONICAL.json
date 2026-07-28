@@ -162,9 +162,10 @@
         "pairedCqShadowAnchors": "6",
         "vmafCpuV1QualificationEnabled": "false",
         "vmafCpuV1ProductionEnabled": "true",
-        "vmafCpuV1ProductionAllowProvisionalHdr": "true",
-        "maxParallelCpuV1": "2",
-        "vmafPairedCqActingEnabled": "true"
+        "vmafCpuV1ProductionAllowProvisionalHdr": "false",
+        "maxParallelCpuV1": "1",
+        "cpuV1ThreadsPerScore": "2",
+        "vmafPairedCqActingEnabled": "false"
       },
       "fpEnabled": true,
       "id": "vmaf1",
@@ -183,7 +184,8 @@
         "minSizeReduction": "20",
         "vmafBuffer10Bit": "0",
         "minVMAF": "95",
-        "minFrameVMAF": "88"
+        "minFrameVMAF": "88",
+        "cpuV1ThreadsPerScore": "2"
       },
       "fpEnabled": true,
       "id": "select1",
@@ -197,6 +199,11 @@
       "sourceRepo": "Local",
       "pluginName": "checkCQRangeRetry",
       "version": "1.0.0",
+      "inputsDB": {
+        "maxRetries": "4",
+        "vmafHeadroomThreshold": "5",
+        "vmafBelowThresholdMargin": "5"
+      },
       "fpEnabled": true,
       "id": "retry1",
       "position": {
@@ -291,6 +298,7 @@
         "grav1synthPath": "/usr/local/bin/grav1synth",
         "workRoot": "grain-synthesis",
         "reviewDir": "/grain-pilot-review",
+        "preserveProductionReview": "false",
         "maxOutputSizeRatioPct": "101",
         "durationToleranceSeconds": "0.25",
         "validationTimeoutMinutes": "240"
@@ -322,9 +330,21 @@
       }
     },
     {
-      "name": "Replace Original File",
-      "sourceRepo": "Community",
-      "pluginName": "replaceOriginalFile",
+      "name": "Validate Delivery Candidate",
+      "sourceRepo": "Local",
+      "pluginName": "validateDeliveryCandidate",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "deliveryValidate1",
+      "position": {
+        "x": 620,
+        "y": 1206
+      }
+    },
+    {
+      "name": "Replace Original File (Attested)",
+      "sourceRepo": "Local",
+      "pluginName": "replaceOriginalFileAttested",
       "version": "1.0.0",
       "fpEnabled": true,
       "id": "replace1",
@@ -334,13 +354,25 @@
       }
     },
     {
+      "name": "Finalize Delivered Outcome",
+      "sourceRepo": "Local",
+      "pluginName": "finalizeDeliveredOutcome",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "deliveryFinalize1",
+      "position": {
+        "x": 620,
+        "y": 1242
+      }
+    },
+    {
       "name": "Notify Radarr or Sonarr",
       "sourceRepo": "Community",
       "pluginName": "notifyRadarrOrSonarr",
       "version": "2.0.0",
       "inputsDB": {
         "arr_host": "http://host.docker.internal:7878",
-        "arr_api_key": "${TDARR_ARR_API_KEY}"
+        "arr_api_key": "${TDARR_RADARR_API_KEY}"
       },
       "fpEnabled": true,
       "id": "fk_oDdIer",
@@ -356,7 +388,7 @@
       "version": "2.0.0",
       "inputsDB": {
         "arr": "sonarr",
-        "arr_api_key": "${TDARR_ARR_API_KEY}",
+        "arr_api_key": "${TDARR_SONARR_API_KEY}",
         "arr_host": "http://host.docker.internal:8989"
       },
       "fpEnabled": true,
@@ -372,7 +404,7 @@
       "pluginName": "unmonitorRadarrOrSonarr",
       "version": "1.0.0",
       "inputsDB": {
-        "arr_api_key": "${TDARR_ARR_API_KEY}",
+        "arr_api_key": "${TDARR_RADARR_API_KEY}",
         "arr_host": "http://host.docker.internal:7878"
       },
       "fpEnabled": true,
@@ -389,7 +421,7 @@
       "version": "1.0.0",
       "inputsDB": {
         "arr": "sonarr",
-        "arr_api_key": "${TDARR_ARR_API_KEY}",
+        "arr_api_key": "${TDARR_SONARR_API_KEY}",
         "arr_host": "http://host.docker.internal:8989"
       },
       "fpEnabled": true,
@@ -424,7 +456,7 @@
       }
     },
     {
-      "name": "Fail Grain Technical Error",
+      "name": "Fail Technical Error",
       "sourceRepo": "Community",
       "pluginName": "failFlow",
       "version": "1.0.0",
@@ -471,7 +503,13 @@
       },
       "fpEnabled": true,
       "inputsDB": {
-        "targetVMAF": "95"
+        "targetVMAF": "95",
+        "expansionCQCount": "2",
+        "highMarginVMAFHeadroom": "1.5",
+        "highMarginVMAFHeadroom4K": "2",
+        "highMarginExpansionCQCount4K": "4",
+        "threeStageVmaf": "false",
+        "intermediateVmafSubsample": "2"
       }
     },
     {
@@ -588,9 +626,9 @@
     {
       "source": "gpu1",
       "sourceHandle": "2",
-      "target": "hdr1",
+      "target": "grainFailureFail1",
       "targetHandle": null,
-      "id": "edge2b",
+      "id": "no-gpu-to-hard-fail",
       "animated": true,
       "type": "smoothstep"
     },
@@ -705,9 +743,36 @@
     {
       "source": "replace1",
       "sourceHandle": "1",
+      "target": "deliveryFinalize1",
+      "targetHandle": null,
+      "id": "replace-installed-to-delivery-finalizer",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "source": "replace1",
+      "sourceHandle": "2",
+      "target": "deliveryFinalize1",
+      "targetHandle": null,
+      "id": "replace-backup-retained-to-delivery-finalizer",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "source": "deliveryFinalize1",
+      "sourceHandle": "1",
       "target": "fk_oDdIer",
       "targetHandle": null,
-      "id": "TksTAd-42",
+      "id": "delivery-finalized-to-radarr-notify",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "source": "replace1",
+      "sourceHandle": "3",
+      "target": "F1jkDv0qn",
+      "targetHandle": null,
+      "id": "replace-keep-original-to-cleanup",
       "animated": true,
       "type": "smoothstep"
     },
@@ -795,9 +860,9 @@
     {
       "source": "grainSynthesis1",
       "sourceHandle": "1",
-      "target": "replace1",
+      "target": "deliveryValidate1",
       "targetHandle": null,
-      "id": "grain-active-to-replacement",
+      "id": "grain-active-to-delivery-validation",
       "animated": true,
       "type": "smoothstep"
     },
@@ -858,9 +923,27 @@
     {
       "source": "BthcE0uii",
       "sourceHandle": "1",
+      "target": "deliveryValidate1",
+      "targetHandle": null,
+      "id": "remux-to-delivery-validation",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "source": "deliveryValidate1",
+      "sourceHandle": "1",
       "target": "replace1",
       "targetHandle": null,
-      "id": "0dIpdmIZC",
+      "id": "delivery-validation-accepted-to-replacement",
+      "animated": true,
+      "type": "smoothstep"
+    },
+    {
+      "source": "deliveryValidate1",
+      "sourceHandle": "2",
+      "target": "F1jkDv0qn",
+      "targetHandle": null,
+      "id": "delivery-validation-rejected-to-cleanup",
       "animated": true,
       "type": "smoothstep"
     },
@@ -912,9 +995,9 @@
     {
       "source": "sizeCheck1",
       "sourceHandle": "2",
-      "target": "gpuLockAcquireTranscode1",
+      "target": "F1jkDv0qn",
       "targetHandle": null,
-      "id": "edgeLockT_in2",
+      "id": "size-check-reject-to-cleanup",
       "animated": true,
       "type": "smoothstep"
     },

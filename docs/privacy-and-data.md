@@ -24,7 +24,9 @@ flow. Credential-shaped keys are replaced with environment placeholders or
 redacted values.
 
 `data/public/vmaf-learning-public.sqlite3` is a new database created from
-scratch. It contains:
+scratch under export schema `tdarr-vmaf-public-learning/v3`. That public schema
+is separate from the private live learning database's runtime schema 17. It
+contains:
 
 - `snapshot_metadata`;
 - `cq_priors`;
@@ -103,9 +105,13 @@ TDARR_RADARR_API_KEY
 TDARR_SONARR_API_KEY
 ```
 
-The redacted flow may still show placeholder strings in plugin inputs so its
-shape is understandable. Placeholders are not secrets and are not guaranteed
-to be expanded by Community plugins. Configure those nodes deliberately.
+The flow exporter derives each `arr_api_key` placeholder from unambiguous
+Radarr/Sonarr input evidence. It writes `TDARR_RADARR_API_KEY` or
+`TDARR_SONARR_API_KEY` for both notification and unmonitor nodes, rejects
+conflicting or unknown service identity, and never emits one shared Arr
+placeholder. Placeholders are not secrets and are not guaranteed to be
+expanded by Community plugins. Configure those nodes deliberately and verify
+their private readback.
 
 If a raw DB, backup, or flow export was ever pushed:
 

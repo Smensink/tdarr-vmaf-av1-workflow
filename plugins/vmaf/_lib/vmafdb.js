@@ -19,7 +19,7 @@
 var DEFAULT_DB_PATH = '/app/configs/vmaf_training.db';
 var metricContracts = require('./vmafMetricContract.js');
 
-var SCHEMA_VERSION = 15;
+var SCHEMA_VERSION = 17;
 var LEGACY_REFERENCE_CONTRACT_ID = 'legacy-original-tf4-v1';
 var LEGACY_METRIC_CONTRACT_ID = metricContracts.LEGACY_METRIC_CONTRACT_ID;
 var LEGACY_ENCODER_PROFILE_ID = metricContracts.LEGACY_ENCODER_PROFILE_ID;
@@ -40,6 +40,11 @@ var JOB_COLUMNS = [
   'selected_vmaf', 'selected_vmaf_min', 'selected_cambi', 'selected_size_mb',
   'projected_output_ratio_pct', 'projected_size_reduction_pct',
   'final_output_size_mb', 'final_output_ratio_pct', 'size_target_status', 'skip_reason',
+  'target_size_reduction_pct', 'minimum_size_reduction_pct',
+  'max_final_output_ratio_pct', 'size_policy_version',
+  'outcome_stage', 'delivered_at', 'replacement_attestation_version',
+  'replacement_backup_retained', 'delivery_transaction_id',
+  'delivery_checkpoint_key',
   'transcode_succeeded', 'met_vmaf_target', 'met_size_target',
   'actual_size_reduction_pct', 'total_retries', 'transcode_retry_count',
   'holdout_encode_time_sec', 'holdout_vmaf_time_sec',
@@ -473,6 +478,164 @@ function _migrate(db) {
       if (!_v15JobCols[_v15JName]) db.exec('ALTER TABLE jobs ADD COLUMN ' + _v15JobAdd[_v15Ja] + ';');
     }
     db.exec('PRAGMA user_version = 15;');
+  }
+  if (v < 16) {
+    // Delivery-authoritative size labels. Historical success rows remain NULL
+    // for outcome_stage/policy provenance because a base encode completing was
+    // not proof that grain/remux/replacement also completed.
+    var _v16JobCols = {};
+    try {
+      var _v16Jti = db.prepare('PRAGMA table_info(jobs)').all();
+      for (var _v16Ji = 0; _v16Ji < _v16Jti.length; _v16Ji++) {
+        _v16JobCols[_v16Jti[_v16Ji].name] = true;
+      }
+    } catch (eV16Ti) {}
+    var _v16JobAdd = [
+      'target_size_reduction_pct REAL',
+      'minimum_size_reduction_pct REAL',
+      'max_final_output_ratio_pct REAL',
+      'size_policy_version TEXT',
+      'outcome_stage TEXT',
+      'delivered_at TEXT',
+      'replacement_attestation_version TEXT',
+      'replacement_backup_retained INTEGER'
+    ];
+    for (var _v16Ja = 0; _v16Ja < _v16JobAdd.length; _v16Ja++) {
+      var _v16JName = _v16JobAdd[_v16Ja].split(' ')[0];
+      if (!_v16JobCols[_v16JName]) {
+        db.exec('ALTER TABLE jobs ADD COLUMN ' + _v16JobAdd[_v16Ja] + ';');
+      }
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_outcome_stage ON jobs(outcome_stage);');
+    db.exec('PRAGMA user_version = 16;');
+  }
+  if (v < 17) {
+    var _v17JobCols = {};
+    try {
+      var _v17Jti = db.prepare('PRAGMA table_info(jobs)').all();
+      for (var _v17Ji = 0; _v17Ji < _v17Jti.length; _v17Ji++) {
+        _v17JobCols[_v17Jti[_v17Ji].name] = true;
+      }
+    } catch (eV17Ti) {}
+    var _v17JobAdd = [
+      'delivery_transaction_id TEXT',
+      'delivery_checkpoint_key TEXT'
+    ];
+    for (var _v17Ja = 0; _v17Ja < _v17JobAdd.length; _v17Ja++) {
+      var _v17JName = _v17JobAdd[_v17Ja].split(' ')[0];
+      if (!_v17JobCols[_v17JName]) {
+        db.exec('ALTER TABLE jobs ADD COLUMN ' + _v17JobAdd[_v17Ja] + ';');
+      }
+    }
+    var _candidateGuard =
+      "NEW.outcome_stage = 'candidate_ready' AND (" +
+      ' NEW.delivery_checkpoint_key IS NULL OR length(NEW.delivery_checkpoint_key) <> 64' +
+      " OR lower(NEW.delivery_checkpoint_key) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.delivery_transaction_id IS NOT NULL' +
+      ' OR NEW.transcode_succeeded IS NOT NULL OR NEW.met_vmaf_target IS NOT NULL' +
+      ' OR NEW.met_size_target IS NOT NULL OR NEW.final_output_size_mb IS NOT NULL' +
+      ' OR NEW.final_output_ratio_pct IS NOT NULL OR NEW.actual_size_reduction_pct IS NOT NULL' +
+      " OR NEW.size_target_status IS NOT 'pending_delivery'" +
+      " OR NEW.size_policy_version IS NOT 'delivered-minimum-reduction-v1'" +
+      ' OR NEW.target_size_reduction_pct IS NOT 30' +
+      ' OR NEW.minimum_size_reduction_pct IS NOT 20' +
+      ' OR NEW.max_final_output_ratio_pct IS NOT 80' +
+      ')';
+    var _committingGuard =
+      "NEW.outcome_stage IN ('replacement_committing','delivery_committing') AND (" +
+      ' NEW.delivery_transaction_id IS NULL OR length(NEW.delivery_transaction_id) <> 64' +
+      " OR lower(NEW.delivery_transaction_id) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.delivery_checkpoint_key IS NULL OR length(NEW.delivery_checkpoint_key) <> 64' +
+      " OR lower(NEW.delivery_checkpoint_key) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.transcode_succeeded IS NOT NULL OR NEW.met_vmaf_target IS NOT NULL' +
+      ' OR NEW.met_size_target IS NOT NULL OR NEW.final_output_size_mb IS NOT NULL' +
+      ' OR NEW.final_output_ratio_pct IS NOT NULL OR NEW.actual_size_reduction_pct IS NOT NULL' +
+      ' OR NEW.delivered_at IS NOT NULL OR NEW.replacement_attestation_version IS NOT NULL' +
+      " OR NEW.size_target_status IS NOT 'pending_delivery'" +
+      " OR NEW.size_policy_version IS NOT 'delivered-minimum-reduction-v1'" +
+      ' OR NEW.target_size_reduction_pct IS NOT 30' +
+      ' OR NEW.minimum_size_reduction_pct IS NOT 20' +
+      ' OR NEW.max_final_output_ratio_pct IS NOT 80' +
+      ')';
+    var _deliveredGuard =
+      "NEW.outcome_stage = 'delivered' AND (" +
+      ' NEW.delivery_transaction_id IS NULL OR length(NEW.delivery_transaction_id) <> 64' +
+      " OR lower(NEW.delivery_transaction_id) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.delivery_checkpoint_key IS NULL OR length(NEW.delivery_checkpoint_key) <> 64' +
+      " OR lower(NEW.delivery_checkpoint_key) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.transcode_succeeded IS NOT 1 OR NEW.met_vmaf_target IS NOT 1' +
+      ' OR NEW.met_size_target IS NOT 1' +
+      " OR NEW.size_target_status IS NOT 'met'" +
+      ' OR NEW.final_output_size_mb IS NULL OR NEW.final_output_size_mb <= 0' +
+      ' OR NEW.final_output_size_mb > 1.7976931348623157e308' +
+      ' OR NEW.final_output_ratio_pct IS NULL OR NEW.final_output_ratio_pct <= 0' +
+      ' OR NEW.final_output_ratio_pct > 80' +
+      ' OR NEW.actual_size_reduction_pct IS NULL' +
+      ' OR abs((100 - NEW.final_output_ratio_pct) - NEW.actual_size_reduction_pct) > 0.000000001' +
+      " OR NEW.size_policy_version IS NOT 'delivered-minimum-reduction-v1'" +
+      ' OR NEW.target_size_reduction_pct IS NOT 30' +
+      ' OR NEW.minimum_size_reduction_pct IS NOT 20' +
+      ' OR NEW.max_final_output_ratio_pct IS NOT 80' +
+      " OR NEW.delivered_at IS NULL OR NEW.delivered_at = ''" +
+      " OR NEW.replacement_attestation_version IS NULL OR NEW.replacement_attestation_version = ''" +
+      ' OR (NEW.replacement_backup_retained IS NOT 0' +
+      ' AND NEW.replacement_backup_retained IS NOT 1)' +
+      ' OR NEW.skip_reason IS NOT NULL' +
+      ')';
+    db.exec('CREATE TRIGGER IF NOT EXISTS trg_jobs_candidate_ready_insert_guard ' +
+      'BEFORE INSERT ON jobs WHEN ' + _candidateGuard +
+      " BEGIN SELECT RAISE(ABORT, 'invalid candidate-ready delivery state'); END;");
+    db.exec('CREATE TRIGGER IF NOT EXISTS trg_jobs_candidate_ready_update_guard ' +
+      'BEFORE UPDATE ON jobs WHEN ' + _candidateGuard +
+      " BEGIN SELECT RAISE(ABORT, 'invalid candidate-ready delivery state'); END;");
+    db.exec('CREATE TRIGGER IF NOT EXISTS trg_jobs_delivery_committing_insert_guard ' +
+      'BEFORE INSERT ON jobs WHEN ' + _committingGuard +
+      " BEGIN SELECT RAISE(ABORT, 'invalid committing delivery state'); END;");
+    db.exec('CREATE TRIGGER IF NOT EXISTS trg_jobs_delivery_committing_update_guard ' +
+      'BEFORE UPDATE ON jobs WHEN ' + _committingGuard +
+      " BEGIN SELECT RAISE(ABORT, 'invalid committing delivery state'); END;");
+    db.exec('CREATE TRIGGER IF NOT EXISTS trg_jobs_delivered_insert_guard ' +
+      'BEFORE INSERT ON jobs WHEN ' + _deliveredGuard +
+      " BEGIN SELECT RAISE(ABORT, 'invalid delivered state'); END;");
+    db.exec('CREATE TRIGGER IF NOT EXISTS trg_jobs_delivered_update_guard ' +
+      'BEFORE UPDATE ON jobs WHEN ' + _deliveredGuard +
+      " BEGIN SELECT RAISE(ABORT, 'invalid delivered state'); END;");
+    db.exec(
+      "CREATE TRIGGER IF NOT EXISTS trg_jobs_delivery_stage_transition_guard " +
+      'BEFORE UPDATE OF outcome_stage ON jobs WHEN ' +
+      "(OLD.outcome_stage = 'candidate_ready' AND (NEW.outcome_stage IS NULL OR NEW.outcome_stage NOT IN " +
+      "('candidate_ready','replacement_committing','keep_original','technical_failure'))) OR " +
+      "(OLD.outcome_stage = 'replacement_committing' AND (NEW.outcome_stage IS NULL OR NEW.outcome_stage NOT IN " +
+      "('replacement_committing','delivery_committing','keep_original','technical_failure'))) OR " +
+      "(OLD.outcome_stage = 'delivery_committing' AND (NEW.outcome_stage IS NULL OR NEW.outcome_stage NOT IN " +
+      "('delivery_committing','delivered'))) OR " +
+      "(OLD.outcome_stage = 'delivered' AND NEW.outcome_stage IS NOT 'delivered') " +
+      "BEGIN SELECT RAISE(ABORT, 'invalid delivery stage transition'); END;"
+    );
+    db.exec(
+      "CREATE TRIGGER IF NOT EXISTS trg_jobs_delivered_immutable " +
+      'BEFORE UPDATE ON jobs WHEN OLD.outcome_stage = \'delivered\' AND (' +
+      ' NEW.outcome_stage IS NOT OLD.outcome_stage' +
+      ' OR NEW.delivery_transaction_id IS NOT OLD.delivery_transaction_id' +
+      ' OR NEW.delivery_checkpoint_key IS NOT OLD.delivery_checkpoint_key' +
+      ' OR NEW.transcode_succeeded IS NOT OLD.transcode_succeeded' +
+      ' OR NEW.met_vmaf_target IS NOT OLD.met_vmaf_target' +
+      ' OR NEW.met_size_target IS NOT OLD.met_size_target' +
+      ' OR NEW.final_output_size_mb IS NOT OLD.final_output_size_mb' +
+      ' OR NEW.final_output_ratio_pct IS NOT OLD.final_output_ratio_pct' +
+      ' OR NEW.actual_size_reduction_pct IS NOT OLD.actual_size_reduction_pct' +
+      ' OR NEW.size_target_status IS NOT OLD.size_target_status' +
+      ' OR NEW.target_size_reduction_pct IS NOT OLD.target_size_reduction_pct' +
+      ' OR NEW.minimum_size_reduction_pct IS NOT OLD.minimum_size_reduction_pct' +
+      ' OR NEW.max_final_output_ratio_pct IS NOT OLD.max_final_output_ratio_pct' +
+      ' OR NEW.size_policy_version IS NOT OLD.size_policy_version' +
+      ' OR NEW.delivered_at IS NOT OLD.delivered_at' +
+      ' OR NEW.replacement_attestation_version IS NOT OLD.replacement_attestation_version' +
+      ' OR NEW.replacement_backup_retained IS NOT OLD.replacement_backup_retained' +
+      ' OR NEW.skip_reason IS NOT OLD.skip_reason' +
+      ") BEGIN SELECT RAISE(ABORT, 'delivered outcome is immutable'); END;"
+    );
+    db.exec('PRAGMA user_version = 17;');
   }
 }
 

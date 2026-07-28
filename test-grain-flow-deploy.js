@@ -58,9 +58,19 @@ function readFlow(databasePath) {
   }
 }
 
-function startApi({ pauses = ['manual'], nodes = {}, onPauseRead = null } = {}) {
+function startApi({
+  pauses = ['manual'],
+  nodes = {},
+  onPauseRead = null,
+  expectedApiKey = '',
+} = {}) {
   let pauseRead = 0;
   const server = http.createServer((request, response) => {
+    assert.strictEqual(
+      String(request.headers['x-api-key'] || ''),
+      expectedApiKey,
+      'deployment request did not preserve the private API-key header'
+    );
     const finish = (status, value) => {
       response.writeHead(status, { 'content-type': 'application/json' });
       response.end(JSON.stringify(value));
@@ -218,13 +228,17 @@ async function main() {
     'transactional mismatch did not roll the Flow row back');
 
   const successFixture = createFixture('success');
+  const testApiKey = ['tapi', 'test', 'deploy', 'key', '123'].join('_');
   await withApi({
     nodes: { node1: { workers: { idle1: { workerType: 'transcodegpu', idle: true } } } },
+    expectedApiKey: testApiKey,
   }, async (apiBase) => {
-    const deployed = await runDeploy(successFixture, apiBase);
+    const deployed = await runDeploy(successFixture, apiBase, { TDARR_API_KEY: testApiKey });
     assert.strictEqual(deployed.status, 0, deployed.stderr || deployed.stdout);
-    assert.match(deployed.stdout,
-      /PASS deployment preflight: queues paused, all workers idle, and GPU pipeline lock absent/);
+    assert.match(
+      deployed.stdout,
+      /PASS deployment preflight: queues paused, workers idle, production CLI processes absent, and GPU pipeline lock absent/
+    );
     assert.match(deployed.stdout, /PASS deployed active grain Flow/);
   });
 

@@ -66,6 +66,9 @@ function inputDefault(name) {
 assert.strictEqual(inputDefault('mode'), 'disabled');
 assert.strictEqual(inputDefault('sourcePathRegex'), '');
 assert.strictEqual(inputDefault('reviewDir'), '/grain-pilot-review');
+assert.strictEqual(inputDefault('preserveProductionReview'), 'false');
+assert.match(grainPlugin.details().inputs.find((item) =>
+    item.name === 'preserveProductionReview').tooltip, /Explicit opt-in/);
 assert.strictEqual(inputDefault('maxOutputSizeRatioPct'), '101');
 assert.match(grainPlugin.details().inputs.find((item) =>
     item.name === 'maxOutputSizeRatioPct').tooltip, /Warn/);

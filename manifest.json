@@ -1,12 +1,12 @@
 {
-  "schema": "tdarr-vmaf-av1-manifest/v3",
-  "generatedAtUtc": "2026-07-27T04:16:44Z",
+  "schema": "tdarr-vmaf-av1-manifest/v4",
+  "generatedAtUtc": "2026-07-28T02:19:10Z",
   "source": {
-    "type": "redacted live-flow export plus parity-verified host plugin payloads",
+    "type": "tracked redacted flow plus checkout-parity-verified deployment payloads",
     "flowId": "YR5PZ1QaD",
     "flowName": "VMAF Parameter Optimization + stream reorder",
-    "flowNodes": 34,
-    "flowEdges": 53
+    "flowNodes": 36,
+    "flowEdges": 58
   },
   "privacy": {
     "rawTdarrDatabaseIncluded": false,
@@ -20,8 +20,8 @@
       "category": "filter",
       "version": "1.0.0",
       "path": "plugins/filter/checkFileAge/1.0.0/index.js",
-      "sha256": "e0e4177ce7a5422ffcb6eb005cd0e3e7891a1fbde624c8ae8b9f2eb99d21b7d1",
-      "activeInLiveFlow": true,
+      "sha256": "59d4be2bb8ace271e1cf1754b34b0704edd01edc1f059f17a045d65c78c8091b",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -29,8 +29,8 @@
       "category": "tools",
       "version": "1.0.0",
       "path": "plugins/tools/unmonitorRadarrOrSonarr/1.0.0/index.js",
-      "sha256": "656a609b6c74cc14445599d0602a01da64a2dd27c7a9b30239a13a315a02ed13",
-      "activeInLiveFlow": true,
+      "sha256": "2bcc6c84b034648c14eb9dcd35fa59226a6685b712d36cf5615edb3f2a4d7ef7",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -38,8 +38,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/acquireGpuPipelineLock/1.0.0/index.js",
-      "sha256": "85d60b928c16825a7bd748625e0071da66d5aa93f01f7dedda2784970ef8f20d",
-      "activeInLiveFlow": true,
+      "sha256": "4b343a83af17f34231c66ed941ddc1fdf78acff37841c7590e9938264e978473",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -47,8 +47,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/analyzeFilmGrain/1.0.0/index.js",
-      "sha256": "2c4406c4a3ae8f50006eef48237b4e533ed4a3c01babe836f90ba1cabfbfcc29",
-      "activeInLiveFlow": true,
+      "sha256": "c814b81afe073b57fa580606521cf99e2d37d5b7fbda26e97674d5106e65608e",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -56,8 +56,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/calculateVMAF/1.0.0/index.js",
-      "sha256": "8f41bb18d67ce59b3a9a56df5dddaca4d5902839016c6e6fa748a0359180ae6a",
-      "activeInLiveFlow": true,
+      "sha256": "1fffbe2b598e592738fa32ba135bbc80a5852131c45f57a0122d23b203550e40",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -65,8 +65,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/checkCQBracket/1.0.0/index.js",
-      "sha256": "83aa37a9a4bbfeb17847b025e044e855c13d1ba73154b5e232651bc52a956816",
-      "activeInLiveFlow": true,
+      "sha256": "078dac83810a3a05992c11961037f720ce65f1346733cee0868918b7fa61a644",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -75,7 +75,7 @@
       "version": "1.0.0",
       "path": "plugins/vmaf/checkCQRangeRetry/1.0.0/index.js",
       "sha256": "b8c6907327beab8d3f5950446c5cc4c36486bbe35ba9316784dcd31cb106610e",
-      "activeInLiveFlow": true,
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -83,8 +83,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/checkFileLimits/1.0.0/index.js",
-      "sha256": "8e4128f5d4ad5a0a69d1f01de87d70eee1b65e707a9fea65ffbcbc1faf5e29a4",
-      "activeInLiveFlow": false,
+      "sha256": "a5cc696aca07ca3d5abb95a17d7df9ba257b8ec06490141027f2863f45c26e1d",
+      "activeInTrackedFlow": false,
       "pinnedAtContainerStart": false
     },
     {
@@ -92,8 +92,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/checkHdrContent/1.0.0/index.js",
-      "sha256": "96db7ce56bc9c4eb9098c47ff8da4a34f012868904155bf07871754b411600b3",
-      "activeInLiveFlow": true,
+      "sha256": "7bd71b4f39920b53bbbaed31a844e9b3cd00f4d4a58ad966b65b0611c0bac49a",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -101,8 +101,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/checkVideoCodec/1.0.0/index.js",
-      "sha256": "71e21c9e7fe3f9474c77e13b88374e8caeea26a31aca46fd799ce9b65fdcd70b",
-      "activeInLiveFlow": false,
+      "sha256": "062c41fa305a48cf1b782a1ec059f1dc12f3701cf66aea24bc816772a521e809",
+      "activeInTrackedFlow": false,
       "pinnedAtContainerStart": false
     },
     {
@@ -110,8 +110,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/cleanupTempFiles/1.0.0/index.js",
-      "sha256": "97147796cd0bd2550beb90a5af0213f8a7fffb3f5b3f5187c15e9dea31caa29f",
-      "activeInLiveFlow": true,
+      "sha256": "8baad50ee49dad444c24c0c7601e94ef8bff758410384af87c6b023a504c5fae",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -119,8 +119,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/detectGPUEncoder/1.0.0/index.js",
-      "sha256": "20a85e30f1d7118d15e4d468139b2c78a215568847431c5943cbdec612c2381a",
-      "activeInLiveFlow": true,
+      "sha256": "045ec505874027e92bc219a7bb10aa48104db17f645a0374a70b2015b42ea133",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -128,8 +128,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/detectSceneComplexity/1.0.0/index.js",
-      "sha256": "6b51681229a04d00763939336555d18d876259579a62457435d1e56c317c3f61",
-      "activeInLiveFlow": false,
+      "sha256": "f37b969a07ae45b193bdd6fe90a7fc7ac5a0b287138a880bd7c987d53adca039",
+      "activeInTrackedFlow": false,
       "pinnedAtContainerStart": false
     },
     {
@@ -137,8 +137,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/exportVMAFResults/1.0.0/index.js",
-      "sha256": "5dd6f980320e425520252b0d19a742674137f5a4212cb4e7bc745de5de326c55",
-      "activeInLiveFlow": true,
+      "sha256": "4824a0e96eeb00b7ca791c71b08f3e66ffea6f5fc655b6e0c6fd22107c9a1c6a",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -146,8 +146,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/extractVideoSamples/1.0.0/index.js",
-      "sha256": "8247d081183b40ad9b9c7e78d5a040f6f32a2c44931a33b5f4b7fd6c354ded87",
-      "activeInLiveFlow": true,
+      "sha256": "468df7b2cc5efce2d3f7686a6c9d08b8babbd815b50ac72fc9eaf0abe0b3249e",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -155,8 +155,17 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/fetchMediaMetadata/1.0.0/index.js",
-      "sha256": "cdfcd85ff923ce8d667a6c11c1abe7da259e255883903d5d270bd8e50ce5af47",
-      "activeInLiveFlow": true,
+      "sha256": "8fc5efb25241a32a782ae22296d5e2ba236f428cf002e3712c0ea853a8d8dcbc",
+      "activeInTrackedFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "finalizeDeliveredOutcome",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/finalizeDeliveredOutcome/1.0.0/index.js",
+      "sha256": "d362ec96cfc8f2b9d37f84b43acc0857507361b875cd6e5356bae792c6b894cb",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -164,8 +173,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/learnCQRange/1.0.0/index.js",
-      "sha256": "05542b95b7e6e0d18ec3b243460365d928a7b5efaa93e067282fc233209969f1",
-      "activeInLiveFlow": true,
+      "sha256": "ca9b506aaf7358f220e5f9440e6877458bf006b3aa0f7625f970af62195826fd",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -173,8 +182,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/learnCQRanges/1.0.0/index.js",
-      "sha256": "102a3d8a1be4f8e3a95d22085ff56ec01b7b017a33e57d12e3dc3d4d529e7b34",
-      "activeInLiveFlow": false,
+      "sha256": "b95f54992700f27069c56b2fe6f22432e7bc00ab16970f63ae0676dac454c5a8",
+      "activeInTrackedFlow": false,
       "pinnedAtContainerStart": false
     },
     {
@@ -182,8 +191,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/monitorTranscodeRetry/1.0.0/index.js",
-      "sha256": "71199c698eb929cdee60872396151e29e27340c50d7a0f9a578502538c97a7ca",
-      "activeInLiveFlow": true,
+      "sha256": "c33bf277bd8b71da9b525db6735c593669c5671206d7f7bb49448af1be6366b2",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -191,8 +200,17 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/releaseGpuPipelineLock/1.0.0/index.js",
-      "sha256": "fa057d6e6fe87cb8bc8e50f3fc4c574ef3bd90cfd4bd8c4a55d72c0922752614",
-      "activeInLiveFlow": true,
+      "sha256": "c5ffeb1f58270a227d582d51c67529dfec94de187c52f15fbd04acbcc8d276b1",
+      "activeInTrackedFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "replaceOriginalFileAttested",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/replaceOriginalFileAttested/1.0.0/index.js",
+      "sha256": "b162d8350e894af96e3c12887b80e1235ebec8285935c52fcc26e07f40e131c1",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -200,8 +218,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/selectBestParameters/1.0.0/index.js",
-      "sha256": "6468a1ad89574ddcd441fad879bd17de27338145cde8d21895e4da1858f54976",
-      "activeInLiveFlow": true,
+      "sha256": "24af5d59e1641becb19f08a9bde8d3fde16da8931a34c1287956b208cbe3c015",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -209,8 +227,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/synthesizeFilmGrain/1.0.0/index.js",
-      "sha256": "df1b5823f84d159acd5debb1ce11edb3fc2057d9a69b76823d1acc6eae3bfcd8",
-      "activeInLiveFlow": true,
+      "sha256": "986210efc38af27781fc7ce2712c01f79d5757fb752e05d70e4b02137938bf2d",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -218,8 +236,17 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/testEncodingParameters/1.0.0/index.js",
-      "sha256": "1b3bba77b6b426671a2b0c68c06e74faa862fdfec94951b30ca03c868e25077e",
-      "activeInLiveFlow": true,
+      "sha256": "0d2b6485748340e3b781b5e51c3b18ff5a869d22be941fdd6003dee4fc97d853",
+      "activeInTrackedFlow": true,
+      "pinnedAtContainerStart": true
+    },
+    {
+      "name": "validateDeliveryCandidate",
+      "category": "vmaf",
+      "version": "1.0.0",
+      "path": "plugins/vmaf/validateDeliveryCandidate/1.0.0/index.js",
+      "sha256": "060409ca1184d7375b8a3253fd05d3e7527508833c9865141396400b8dcee0e0",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     },
     {
@@ -227,8 +254,8 @@
       "category": "vmaf",
       "version": "1.0.0",
       "path": "plugins/vmaf/vmafOptimizedTranscode/1.0.0/index.js",
-      "sha256": "405b1c81f5a75adf50af0bfe8103b020adb8c2f7fce94948bf0eafa22102428b",
-      "activeInLiveFlow": true,
+      "sha256": "43cb3a84d4d54c98a8660c7a73697703b4019b25197099470a107bbdbbabbf5d",
+      "activeInTrackedFlow": true,
       "pinnedAtContainerStart": true
     }
   ],
@@ -244,6 +271,21 @@
       "sha256": "91e1913a26bccc70faa11d38b425fe3403b8f1c8faec2a9924e173979ce2ff8e"
     },
     {
+      "name": "deliveryFinalization.js",
+      "path": "plugins/vmaf/_lib/deliveryFinalization.js",
+      "sha256": "fd9dce69579ab57027afd45d2a5e90e8f575ef33e2a8ee4e5dbc5d7ef99d7fba"
+    },
+    {
+      "name": "deliveryPolicy.js",
+      "path": "plugins/vmaf/_lib/deliveryPolicy.js",
+      "sha256": "33c9d09d06d3040834c52b4a88433db3de84184b718cc4274b6c965dedd89a0e"
+    },
+    {
+      "name": "deliveryTransaction.js",
+      "path": "plugins/vmaf/_lib/deliveryTransaction.js",
+      "sha256": "43ecc11ac673082315204a34de1a66761062fae328aeb704fae61d57260df5c8"
+    },
+    {
       "name": "emptyBandShadow.js",
       "path": "plugins/vmaf/_lib/emptyBandShadow.js",
       "sha256": "d25cece7536f2fdbdb22c9d757666c20a9413c6c87221d5feccc0fa6f4157df8"
@@ -256,12 +298,12 @@
     {
       "name": "gpuPipelineLock.js",
       "path": "plugins/vmaf/_lib/gpuPipelineLock.js",
-      "sha256": "d022c030bb0f168f8b001a3ac8a606937a71aa12f94d6bbe55c47360633d36dd"
+      "sha256": "8c9b4410eb9a702c42818157419e2a1946a5a6973f87ab4b0cf5244e50ade8ed"
     },
     {
       "name": "grainAnalysisArtifact.js",
       "path": "plugins/vmaf/_lib/grainAnalysisArtifact.js",
-      "sha256": "ed9895a83e1f55d0175e1b2b6bcb560229f34c1df70de036e2eb3f5d03bb3f0b"
+      "sha256": "7952544e6516bc6dfde77afc2a59e3d9e71b099ab48343d8a88773efb49c605c"
     },
     {
       "name": "grainVmafContract.js",
@@ -286,7 +328,12 @@
     {
       "name": "postEncodeCheckpoint.js",
       "path": "plugins/vmaf/_lib/postEncodeCheckpoint.js",
-      "sha256": "a3cecd3970fdb293180baeac353e14252a54d493d09683266e068de06383d7e0"
+      "sha256": "5dbf5059fa6900cdbccd1ac15ba4658ecae566aedf4a56fa99588abaa55f26e2"
+    },
+    {
+      "name": "postReplaceAttestation.js",
+      "path": "plugins/vmaf/_lib/postReplaceAttestation.js",
+      "sha256": "bb4f9edb7f4472208ef184aff48ea2157122212fe984f4866309d2c270d3092a"
     },
     {
       "name": "preFgsCambi.js",
@@ -311,12 +358,12 @@
     {
       "name": "vmafdb.js",
       "path": "plugins/vmaf/_lib/vmafdb.js",
-      "sha256": "e975e58c7b2238ed40f99224877f9870e00903a52864d911fb2f00e307ed24ce"
+      "sha256": "df84a11c00b36a5bad8ccece600c1bc0473a3e21f20442f77d4221cebbb8ef28"
     },
     {
       "name": "vmafMetricContract.js",
       "path": "plugins/vmaf/_lib/vmafMetricContract.js",
-      "sha256": "6dcd3cc0505e564309ae3166f7868f4fb359c7db98dac75dac8648e1d296a632"
+      "sha256": "ee09d8cbf94bf32273569ad489075e1171c0e884b9da990645285dde2fb65a5c"
     },
     {
       "name": "vmafpredict.js",
@@ -326,7 +373,7 @@
     {
       "name": "vmafV1Cpu.js",
       "path": "plugins/vmaf/_lib/vmafV1Cpu.js",
-      "sha256": "cff853f84b1debcb70a1c14a40c276aa25a30315d8c1d38788187b46da99fc11"
+      "sha256": "df8b7e7c5ad38988067a1cab8ac1c7f424af150911da8c83a3614066d729f0bc"
     }
   ],
   "supportAssets": {
@@ -345,7 +392,7 @@
       {
         "name": "vmafV1Cpu.test.js",
         "path": "plugins/vmaf/_lib/vmafV1Cpu.test.js",
-        "sha256": "4dcc7a2f64689596abec478ba056c4852838d27d642a31dc571fc54c3185e042"
+        "sha256": "65e946227338cfbcf24f2acb83dbfd7f8ffe80865f134114e57000418f49f188"
       }
     ],
     "maintenance": [

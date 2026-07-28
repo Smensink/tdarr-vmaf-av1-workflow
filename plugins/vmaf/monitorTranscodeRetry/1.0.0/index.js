@@ -1,7 +1,83 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.plugin = exports.details = void 0;
+var fs = require('fs');
+var path = require('path');
+var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
 var CONSERVATIVE_CQ_SUBSTITUTION_CONTRACT_ID = 'vmaf-conservative-postencode-cq-substitution-v1';
+
+function pathIdentity(filePath) {
+    var resolved = path.resolve(String(filePath || ''));
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function strictChildOf(root, candidate) {
+    var relative = path.relative(root, candidate);
+    return relative !== '' && relative !== '..' &&
+        !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+}
+
+function canonicalRetryWorkRoot(workDir) {
+    var requested = String(workDir || '').trim();
+    if (!requested || !path.isAbsolute(requested)) {
+        throw new Error('retry cleanup requires an absolute args.workDir');
+    }
+    var resolved = path.resolve(requested);
+    if (resolved === path.parse(resolved).root) {
+        throw new Error('retry cleanup refuses a filesystem root');
+    }
+    var stat = fs.lstatSync(resolved);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error('retry cleanup work root is not a real directory: ' + resolved);
+    }
+    var canonical = path.resolve(fs.realpathSync(resolved));
+    if (pathIdentity(canonical) !== pathIdentity(resolved)) {
+        throw new Error('retry cleanup work root contains a symlinked path component');
+    }
+    return canonical;
+}
+
+function removePartialOutputForRetry(args, outputFile) {
+    if (!outputFile) return { removed: false, absent: true };
+    var root = canonicalRetryWorkRoot(args && args.workDir);
+    var resolved = path.resolve(String(outputFile));
+    if (!strictChildOf(root, resolved)) {
+        throw new Error('partial transcode output is outside the canonical job work root: ' + resolved);
+    }
+    var protectedPaths = [
+        args && args.inputFileObj && (args.inputFileObj._id || args.inputFileObj.file),
+        args && args.originalLibraryFile &&
+            (args.originalLibraryFile._id || args.originalLibraryFile.file),
+        args && args.variables && args.variables.vmafOriginalFile,
+    ].filter(Boolean);
+    var protectedIdentities = new Set();
+    protectedPaths.forEach(function (protectedPath) {
+        var lexical = path.resolve(String(protectedPath));
+        protectedIdentities.add(pathIdentity(lexical));
+        try { protectedIdentities.add(pathIdentity(fs.realpathSync(lexical))); } catch (_) {}
+    });
+    if (protectedIdentities.has(pathIdentity(resolved))) {
+        throw new Error('partial transcode output aliases a protected source: ' + resolved);
+    }
+    if (!fs.existsSync(resolved)) return { removed: false, absent: true, path: resolved };
+    var stat = fs.lstatSync(resolved);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error('partial transcode output is not a non-symlink regular file: ' + resolved);
+    }
+    var canonical = path.resolve(fs.realpathSync(resolved));
+    if (pathIdentity(canonical) !== pathIdentity(resolved) ||
+        !strictChildOf(root, canonical)) {
+        throw new Error('partial transcode output contains a symlinked component or escaped the job root');
+    }
+    if (protectedIdentities.has(pathIdentity(canonical))) {
+        throw new Error('partial transcode output resolves to a protected source: ' + resolved);
+    }
+    fs.unlinkSync(resolved);
+    if (fs.existsSync(resolved)) {
+        throw new Error('partial transcode output still exists after unlink: ' + resolved);
+    }
+    return { removed: true, absent: false, path: resolved };
+}
 
 function canonicalValue(value) {
     if (Array.isArray(value)) return value.map(canonicalValue);
@@ -207,7 +283,6 @@ var plugin = function (args) {
     var feasibility = require('../../_lib/feasibility.js');
     args.inputs = lib.loadDefaultValues(args.inputs, details);
 
-    var fs = require('fs');
     var maxRetries = Number(args.inputs.maxRetries) || 3;
 
     // ENHANCEMENT FIX #14: Input validation
@@ -257,13 +332,16 @@ var plugin = function (args) {
         || transcodeStatus === 'running';
     var conservativeCqSubstitution = null;
 
-    function recordJobOutcome(fields) {
+    function recordJobOutcome(fields, requireDurableReadback) {
         try {
             var vmafdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
             var _odb = vmafdb.openDb();
             var _canonicalId = String(args.variables.vmafCanonicalJobId || '');
             // Compatibility for a job already in flight when the canonical-id variable was
             // deployed: locate the source-backed row by the shared start-time prefix.
+            if (!_canonicalId && requireDurableReadback === true) {
+                throw new Error('candidate-ready delivery requires the exact canonical VMAF job id');
+            }
             if (!_canonicalId && args.variables.vmafJobStartTime) {
                 var _prefix = String(args.variables.vmafJobStartTime) + '-%';
                 var _existing = _odb.prepare(
@@ -274,14 +352,74 @@ var plugin = function (args) {
             }
             if (!_canonicalId) {
                 var _ofp = String((args.inputFileObj && (args.inputFileObj._id || args.inputFileObj.file)) || '');
-                if (!_ofp) return false;
+                if (!_ofp) {
+                    if (requireDurableReadback === true) {
+                        throw new Error('candidate-ready outcome has no canonical source identity');
+                    }
+                    return false;
+                }
                 _canonicalId = vmafdb.makeJobId(_ofp, args.variables.vmafJobStartTime || '');
             }
             fields.job_id = _canonicalId;
             args.variables.vmafCanonicalJobId = _canonicalId;
-            vmafdb.upsertJob(_odb, fields);
-            return true;
+            var _attempts = requireDurableReadback === true ? 3 : 1;
+            var _retryDelays = [100, 250];
+            for (var _attempt = 1; _attempt <= _attempts; _attempt++) {
+                try {
+                    vmafdb.upsertJob(_odb, fields);
+                    if (requireDurableReadback === true) {
+                        var _columns = Object.keys(fields).filter(function (column) {
+                            return column !== 'job_id' && fields[column] !== undefined;
+                        });
+                        var _persisted = _odb.prepare(
+                            'SELECT ' + _columns.join(', ') + ' FROM jobs WHERE job_id = ?'
+                        ).get(_canonicalId);
+                        if (!_persisted) {
+                            throw new Error('candidate-ready DB read-back found no canonical job row');
+                        }
+                        for (var _columnIndex = 0; _columnIndex < _columns.length; _columnIndex++) {
+                            var _column = _columns[_columnIndex];
+                            var _expected = fields[_column];
+                            var _actual = _persisted[_column];
+                            var _matches = _expected === null
+                                ? _actual === null
+                                : (typeof _expected === 'number'
+                                    ? Number.isFinite(Number(_actual)) &&
+                                        Number(_actual) === _expected
+                                    : String(_actual) === String(_expected));
+                            if (!_matches) {
+                                throw new Error('candidate-ready DB read-back mismatch for ' + _column);
+                            }
+                        }
+                    }
+                    return true;
+                } catch (_writeError) {
+                    var _writeText = String((_writeError && _writeError.code) || '') + ' ' +
+                        String((_writeError && _writeError.message) || _writeError);
+                    var _transient = /SQLITE_BUSY|SQLITE_LOCKED|database is (?:busy|locked)/i
+                        .test(_writeText);
+                    if (!_transient || _attempt >= _attempts) throw _writeError;
+                    args.jobLog('Candidate-ready DB write was transiently busy; retrying attempt ' +
+                        (_attempt + 1) + '/' + _attempts + '.');
+                    if (typeof SharedArrayBuffer === 'function' &&
+                        typeof Atomics === 'object' && typeof Atomics.wait === 'function') {
+                        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0,
+                            _retryDelays[_attempt - 1]);
+                    }
+                }
+            }
+            throw new Error('candidate-ready DB write exhausted its bounded retries');
         } catch (eRec) {
+            if (requireDurableReadback === true) {
+                try {
+                    args.jobLog('FATAL: Candidate-ready outcome was not durably recorded: ' +
+                        eRec.message + '. Replacement is blocked.');
+                } catch (eRecRequiredLog) {}
+                var durabilityError = new Error(
+                    'candidate-ready DB durability failed: ' + eRec.message);
+                durabilityError.code = 'TDARR_VMAF_CANDIDATE_READY_DURABILITY_FATAL';
+                throw durabilityError;
+            }
             try { args.jobLog('Job outcome record skipped (non-fatal): ' + eRec.message); } catch (eRec2) {}
             return false;
         }
@@ -446,25 +584,70 @@ var plugin = function (args) {
             args.variables.liveSizeCompare.clearReason = reason;
         }
         args.jobLog('Finalized transcode outcome before leaving monitor: ' + reason);
-        // Single authoritative terminal-outcome write. Selection/learning plugins only store
-        // decision facts; every success, keep-original, and technical terminal path ends here.
+        // A technically complete base encode is still pre-delivery: grain,
+        // reorder/remux, exact delivered-size validation, and replacement remain.
+        // Only keep-original/technical paths are terminal here. Successful
+        // candidates are finalized by the post-replacement delivery authority.
+        var sizePolicy = deliveryPolicy.resolve(args.variables);
         if (outcome === 'success') {
+            var pendingJobId = String(args.variables.vmafCanonicalJobId || '').trim();
+            var pendingCheckpoint = args.variables.vmafPostEncodeCheckpoint;
+            var pendingCheckpointKey = pendingCheckpoint &&
+                String(pendingCheckpoint.checkpoint_key || '');
+            if (!pendingJobId || !/^[0-9a-f]{64}$/.test(pendingCheckpointKey)) {
+                var pendingIdentityError = new Error(
+                    'candidate-ready delivery requires exact canonical job and checkpoint identities');
+                pendingIdentityError.code = 'TDARR_VMAF_CANDIDATE_READY_DURABILITY_FATAL';
+                throw pendingIdentityError;
+            }
             var finalRatio = Number(args.variables.vmafFinalOutputRatioPct);
-            var sizeThreshold = Number((liveSizeCompare && liveSizeCompare.thresholdPerc) || args.variables.vmafMaxOutputRatioPct);
-            var successFields = {
-                transcode_succeeded: 1,
-                met_vmaf_target: 1,
-                final_output_size_mb: isFinite(Number(args.variables.vmafFinalOutputSizeMB)) ? Number(args.variables.vmafFinalOutputSizeMB) : null,
-                final_output_ratio_pct: isFinite(finalRatio) ? finalRatio : null,
-                actual_size_reduction_pct: isFinite(finalRatio) ? (100 - finalRatio) : null,
-                met_size_target: isFinite(finalRatio) && isFinite(sizeThreshold) ? (finalRatio <= sizeThreshold ? 1 : 0) : null,
-                size_target_status: isFinite(finalRatio) && isFinite(sizeThreshold) ? (finalRatio <= sizeThreshold ? 'met' : 'failed') : 'unknown',
-                skip_reason: null
+            var candidateSizeMb = Number(args.variables.vmafFinalOutputSizeMB);
+            var pendingFields = {
+                transcode_succeeded: null,
+                met_vmaf_target: null,
+                final_output_size_mb: null,
+                final_output_ratio_pct: null,
+                actual_size_reduction_pct: null,
+                met_size_target: null,
+                size_target_status: 'pending_delivery',
+                target_size_reduction_pct: sizePolicy.targetReductionPct,
+                minimum_size_reduction_pct: sizePolicy.minimumReductionPct,
+                max_final_output_ratio_pct: sizePolicy.maxFinalOutputRatioPct,
+                size_policy_version: sizePolicy.version,
+                outcome_stage: 'candidate_ready',
+                delivered_at: null,
+                replacement_attestation_version: null,
+                replacement_backup_retained: null,
+                delivery_transaction_id: null,
+                delivery_checkpoint_key: pendingCheckpointKey,
+                skip_reason: null,
             };
             if (conservativeCqSubstitution) {
-                successFields = Object.assign(successFields, conservativeCqSubstitution.fields);
+                pendingFields = Object.assign(pendingFields, conservativeCqSubstitution.fields);
             }
-            var dbRecorded = recordJobOutcome(successFields);
+            var dbRecorded = recordJobOutcome(pendingFields, true);
+            args.variables.vmafCandidateOutputRatioPct =
+                isFinite(finalRatio) ? finalRatio : null;
+            args.variables.vmafCandidateOutputSizeMB =
+                isFinite(candidateSizeMb) ? candidateSizeMb : null;
+            args.variables.vmafDeliveryOutcomePending = {
+                schema: 'vmaf-delivery-outcome-pending/v1',
+                version: 1,
+                status: 'candidate_ready',
+                recorded_at: new Date().toISOString(),
+                database_recorded: true,
+                job_id: pendingJobId,
+                checkpoint_key: pendingCheckpointKey,
+                source_path: String(args.variables.vmafOriginalFile ||
+                    args.originalLibraryFile && args.originalLibraryFile._id ||
+                    args.inputFileObj && (args.inputFileObj._id || args.inputFileObj.file) || ''),
+                size_policy_version: sizePolicy.version,
+                target_size_reduction_pct: sizePolicy.targetReductionPct,
+                minimum_size_reduction_pct: sizePolicy.minimumReductionPct,
+                max_final_output_ratio_pct: sizePolicy.maxFinalOutputRatioPct,
+                candidate_output_ratio_pct: args.variables.vmafCandidateOutputRatioPct,
+                candidate_output_size_mb: args.variables.vmafCandidateOutputSizeMB,
+            };
             if (conservativeCqSubstitution) {
                 args.variables.vmafPostEncodeCqSubstitutionDbOutcome = {
                     schema: 'vmaf_postencode_cq_substitution_db_outcome_v1',
@@ -490,12 +673,27 @@ var plugin = function (args) {
         } else {
             recordJobOutcome({
                 transcode_succeeded: 0,
-                met_vmaf_target: 0,
+                met_vmaf_target: null,
+                met_size_target: null,
+                final_output_size_mb: null,
+                final_output_ratio_pct: null,
+                actual_size_reduction_pct: null,
+                size_target_status: 'not_delivered',
+                target_size_reduction_pct: sizePolicy.targetReductionPct,
+                minimum_size_reduction_pct: sizePolicy.minimumReductionPct,
+                max_final_output_ratio_pct: sizePolicy.maxFinalOutputRatioPct,
+                size_policy_version: sizePolicy.version,
+                outcome_stage: technicalFailure ? 'technical_failure' : 'keep_original',
+                delivered_at: null,
+                replacement_attestation_version: null,
+                replacement_backup_retained: null,
                 skip_reason: skipReason || (wasCancelled ? 'live_size_guard_exceeded' : 'transcode_gave_up')
             });
         }
-        recordSizeFailureShadowOutcome(outcome, skipReason);
-        recordEmptyBandShadow(outcome, skipReason);
+        if (outcome !== 'success') {
+            recordSizeFailureShadowOutcome(outcome, skipReason);
+            recordEmptyBandShadow(outcome, skipReason);
+        }
     }
 
     if (explicitSuccess && args.variables.vmafPostEncodeCqSubstitution != null) {
@@ -807,12 +1005,10 @@ var plugin = function (args) {
 
             // Clear transcode output file if it exists (partial transcode)
             var outputFile = args.variables.vmafTranscodeOutputPath;
-            if (outputFile && fs.existsSync(outputFile)) {
-                try {
-                    fs.unlinkSync(outputFile);
-                    args.jobLog('Cleared partial transcode output: ' + outputFile);
-                } catch (err) {
-                    args.jobLog('⚠ Could not delete partial output: ' + err.message);
+            if (outputFile) {
+                var retryCleanup = removePartialOutputForRetry(args, outputFile);
+                if (retryCleanup.removed) {
+                    args.jobLog('Cleared contained partial transcode output: ' + retryCleanup.path);
                 }
             }
 
@@ -1019,12 +1215,10 @@ var plugin = function (args) {
 
         // Clear transcode output file if it exists
         var outputFile = args.variables.vmafTranscodeOutputPath;
-        if (outputFile && fs.existsSync(outputFile)) {
-            try {
-                fs.unlinkSync(outputFile);
-                args.jobLog('Cleared partial transcode output: ' + outputFile);
-            } catch (err) {
-                args.jobLog('⚠ Could not delete partial output: ' + err.message);
+        if (outputFile) {
+            var sweepCleanup = removePartialOutputForRetry(args, outputFile);
+            if (sweepCleanup.removed) {
+                args.jobLog('Cleared contained partial transcode output: ' + sweepCleanup.path);
             }
         }
 
@@ -1092,4 +1286,6 @@ exports.plugin = plugin;
 exports._test = {
     measurementParameterContractSha256: measurementParameterContractSha256,
     resolveConservativeCqSubstitution: resolveConservativeCqSubstitution,
+    canonicalRetryWorkRoot: canonicalRetryWorkRoot,
+    removePartialOutputForRetry: removePartialOutputForRetry,
 };

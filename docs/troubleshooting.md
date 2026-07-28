@@ -18,20 +18,24 @@ docker top tdarr
 docker logs --tail 500 tdarr
 ```
 
-Likely causes in this deployment:
+Causes observed in the historical audited deployment:
 
 - two CPU-v1 scorers per job;
 - eight threads per scorer through `maxParallelVmaf`;
 - multiple simultaneous flow jobs;
 - two decoder processes per scorer;
-- a deep recurring GPU health check;
+- the then-recurring deep GPU health check;
 - redundant library scanning.
 
-Remediation after drain:
+The live mounted healthcheck and the checked-in r3 healthcheck now use only a
+cheap TCP liveness probe. Deep toolchain qualification remains an explicit
+manual operation for a drained window. The checked-in remediation also sets
+one CPU-v1 task per job, two threads per score, and a host-wide one-slot wrapper
+semaphore. After deployment:
 
-- add a host-wide CPU scoring semaphore;
+- confirm `VMAF_V1_MAX_PARALLEL=1` and writable lease storage;
 - reserve 2–4 logical CPUs for the control plane;
-- split `cpuV1ThreadsPerScore` from GPU concurrency;
+- confirm `cpuV1ThreadsPerScore=2` independently of `maxParallelVmaf`;
 - use the cheap health check from the example compose;
 - configure the internal node to contact `127.0.0.1:8266`;
 - use one primary library discovery method plus staggered reconciliation.
@@ -44,14 +48,27 @@ The parity init hook is fail-closed. Compare:
 - mounted `configs/flow_YR5PZ1QaD_CANONICAL.json`;
 - server and internal-node plugin catalogs;
 - `custom-cont-init.d` payload;
-- the 19 runtime helpers.
+- the 23 runtime helpers.
 
 The optional private size-shadow model is not part of startup parity; verify
 its checksum separately if it is installed.
 
-The deployment audited on 2026-07-27 had a live 34/53 graph while the mounted
-host canonical still had 35/54. Reconcile during a drained window; do not
-disable parity to force startup.
+If source and persistent-server plugin hashes are current but many
+internal-node files revert after the node reconnects, inspect the cached
+plugin-download boundary before copying files repeatedly. The bundled node
+normally downloads `nodePlugins.Zip` after custom init. The r3 hook prevents
+that late replacement only after it has seeded and patched the complete node
+catalog, using the exact `/app/Tdarr_Node/assets/app/plugins/.git`
+development-preservation sentinel. A missing/wrong sentinel, a sentinel armed
+before the complete seed, or a non-directory at that path blocks qualification.
+Keep the node paused and all worker limits at zero until the sentinel and
+source/server/node parity are proven.
+
+Pre-r3 forensic evidence recorded a live 34/53 graph while the mounted host
+canonical still had 35/54. That dated mismatch was reconciled. The final
+tracked r3 snapshots are identical at 36 nodes and 58 edges; a live deployment
+must match them exactly during a drained parity check. Do not disable parity to
+force startup.
 
 ## CPU VMAF-v1 geometry failure
 
@@ -63,17 +80,20 @@ If CPU scoring reports unsupported coded/display dimensions or SAR/DAR:
 - route the source to the qualified GPU metric path until an exact CPU contract
   exists.
 
-Common unsupported cases include 720p, 1440p, SD, DCI/cropped, portrait, and
-missing/N/A aspect ratios.
+Common unsupported cases include 1280x720, 2560x1440, SD, portrait, DCI-width
+rasters, non-family crops, missing/N/A ratios, and SAR/DAR that do not exactly
+reproduce the coded display ratio. The calculation plugin records
+`vmafCpuV1GeometryRejected` and stays on GPU-v0 instead of activating CPU-v1.
 
 ## GPU lock appears stuck
 
 Inspect the lock directory, token, owner metadata, heartbeat, and live process
 tree read-only. Do not delete it just because its age exceeded a threshold.
 
-The current helper can break a same-file live lock without proving the owner
-dead and treats any lock older than eight hours as stale. A valid long encode
-can exceed that assumption. Manual recovery should require:
+The repaired helper confines the lock to the fixed production root, publishes
+generation-owned lease state, checks owner-job/PID liveness, and never treats
+age alone as authority to steal a same-file live lock. A valid long encode can
+run beyond an arbitrary age threshold. Manual recovery still requires:
 
 - exact lock root;
 - owner job and generation;
@@ -82,6 +102,36 @@ can exceed that assumption. Manual recovery should require:
 - a retained forensic copy of lock metadata.
 
 Never allow a flow input to point the lock at an arbitrary directory.
+Never remove the lock merely to satisfy a deployment or trial preflight. An
+API worker can appear idle while its coordinator or producer still owns the
+lock; inspect `/proc` and let the workload finish.
+
+An owner with `ownerId: grain-toolchain-runtime-selftests` and
+`automaticStaleBreakDisabled: true` is a deliberate non-stealable maintenance
+lease. The self-test runner uses it because a hard-killed supervisor can leave
+`runuser`, a regression shell, FFmpeg, grav1synth, NVEncC, or one of their
+descendants alive. Production acquisition will wait rather than infer safety
+from a dead supervisor, an old heartbeat, or lock age.
+
+For that owner, manual recovery is permitted only after all of the following
+are recorded and independently verified:
+
+1. Global admission and every node are paused, all workers are drained, and no
+   new work can enter.
+2. The fixed lock root, `owner.json`, `heartbeat.json`, owner token, and lease
+   generation are copied to private forensic storage.
+3. The recorded supervisor PID/start time is no longer live and a `/proc`
+   process-tree and command-line inspection finds no matching self-test,
+   `runuser`, regression shell, FFmpeg, grav1synth, NVEncC, coordinator, CUDA,
+   or CUVID process. Read failures are not proof of absence.
+4. GPU use is independently idle and the heartbeat is stale.
+5. The lock helper’s normal `release()` is invoked against the fixed root with
+   the exact recorded token and `expectedGeneration`; `force` remains false.
+   The release result must report `released: true`.
+
+Do not recursively delete the directory, use a force release, or resume nodes
+after an unconfirmed release. A failed release leaves the lease authoritative
+until the evidence and ownership mismatch are reviewed.
 
 ## `/temp/vmaf-v1-score.*` cache warnings
 
@@ -104,22 +154,27 @@ Do not replace the source. Retain:
 - ffprobe JSON;
 - tool versions/hashes.
 
-Run bounded full-title decode and stream/colour/duration comparison. The active
-direct synthesis path does not currently perform the required full-title
-decode after rewriting, so a successful plugin return is insufficient proof.
+Inspect `grainSynthesisDecodeValidationMode` and the validation report. A
+replacement-eligible direct output must record
+`full_title_decode_validation_performed: true` and an exhaustive GPU or
+software decode. A decode failure removes the candidate and routes the
+untouched original through the fail-closed fallback.
 
 ## HDR source was retagged incorrectly
 
 Capture original transfer, primaries, matrix, bit depth, Dolby Vision profile,
-and static HDR metadata. Ambiguous BT.2020 with unknown transfer should preserve
-source signalling or stop for review; it should not be forcibly labeled PQ.
+and static HDR metadata. Ambiguous high-bit-depth BT.2020 now routes to output 3
+with reason `bt2020_high_bit_depth_unknown_transfer`; verify that the graph
+keeps the original. Correct the source metadata before retrying rather than
+forcing PQ.
 
 ## Learning or CSV disagreement
 
-Treat SQLite terminal outcome as authority. `learnCQRange` writes before the
-final transcode and its CSV success label is premature. CSV and EMA files have
-unlocked concurrent writes. Preserve them for diagnosis, but do not use them
-to overwrite SQLite.
+Treat SQLite terminal outcome as authority. `learnCQRange` runs before the
+final transcode and now leaves its compatibility `transcode_succeeded` field
+blank. Shared CSV/EMA writes are retired. Optional diagnostics are exclusive
+per-job files beneath `<configured-path>.d`; do not merge them back into
+SQLite as terminal outcomes.
 
 Validate privately:
 
@@ -143,9 +198,28 @@ Do not prune during active jobs. First:
 4. identify active DB/WAL and rollback dependencies;
 5. delete only in a maintenance window.
 
+## Arr unmonitor was skipped
+
+Output 2 is the safe result when Arr identity or mutation verification is not
+exact. Check the job log for:
+
+- disagreement between `vmafOriginalFile` and the Tdarr library path;
+- no Arr file record matching the source path, or more than one match;
+- a Sonarr filename without one unambiguous season/episode identity;
+- duplicate episode records or multiple episode-file IDs for one source;
+- a post-update readback that changed identity or did not report
+  `monitored=false`.
+
+The plugin accepts exact paths or mapped-root paths sharing at least the parent
+directory and filename. Correct the Arr root/path mapping or library metadata;
+do not weaken the match or retry the mutation against a guessed parse result.
+Keep the configured Arr host allowlisted and use HTTPS when it crosses a trust
+boundary.
+
 ## Security
 
 The example binds ports to loopback and enables auth. If remote access is
 required, use a trusted reverse proxy/VPN and TLS. Integration plugins should
-only contact allowlisted hosts. Media names must be treated as untrusted until
-the shell-command construction findings in the audit are fixed.
+only contact allowlisted hosts. The repaired media-path subprocesses use
+literal argv with `shell:false`; verify the live plugin catalogs match the
+audited source before treating that protection as deployed.

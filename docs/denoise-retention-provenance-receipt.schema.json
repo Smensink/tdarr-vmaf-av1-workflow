@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/tdarr-vmaf-av1/denoise-retention-provenance-receipt.schema.json",
+  "title": "Private denoise-retention provenance receipt",
+  "description": "Per-case retained-original evidence only. Runtime executable identities and reviewed symbolic-link chains belong to the denoise-retention trial input, not this receipt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "kind",
+    "case_id",
+    "source_sha256",
+    "source_size_bytes",
+    "cq",
+    "nvenc_quality_profile",
+    "retained_original",
+    "job_decision",
+    "profile_evidence",
+    "reviewed_evidence_artifacts"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "kind": {
+      "const": "tdarr-denoise-retention-provenance-v1"
+    },
+    "case_id": {
+      "$ref": "#/$defs/safeId"
+    },
+    "source_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "source_size_bytes": {
+      "$ref": "#/$defs/positiveSafeInteger"
+    },
+    "cq": {
+      "type": "integer",
+      "minimum": 16,
+      "maximum": 51
+    },
+    "nvenc_quality_profile": {
+      "enum": [
+        "enhanced",
+        "baseline"
+      ]
+    },
+    "retained_original": {
+      "const": true
+    },
+    "job_decision": {
+      "const": "no_feasible_parameters"
+    },
+    "profile_evidence": {
+      "enum": [
+        "explicit-enhanced",
+        "explicit-baseline"
+      ]
+    },
+    "reviewed_evidence_artifacts": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/evidenceArtifact"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "nvenc_quality_profile": {
+            "const": "enhanced"
+          }
+        },
+        "required": [
+          "nvenc_quality_profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "profile_evidence": {
+            "const": "explicit-enhanced"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "profile_evidence": {
+            "const": "explicit-baseline"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "safeId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "positiveSafeInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "evidenceArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/safeId"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/positiveSafeInteger"
+        }
+      }
+    }
+  }
+}

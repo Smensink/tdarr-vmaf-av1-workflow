@@ -13,6 +13,14 @@ const selectPath = path.join(vmafRoot, 'selectBestParameters', '1.0.0', 'index.j
 const selector = require(selectPath);
 const contracts = require(path.join(vmafRoot, '_lib', 'vmafMetricContract.js'));
 const cpu = require(path.join(vmafRoot, '_lib', 'vmafV1Cpu.js'));
+const threadInput = selector.details().inputs.find((entry) =>
+  entry.name === 'cpuV1ThreadsPerScore');
+assert(threadInput);
+assert.strictEqual(threadInput.defaultValue, '2');
+assert.strictEqual(selector._test.cpuV1ThreadsPerScore({ inputs: {} }), 2);
+assert.strictEqual(selector._test.cpuV1ThreadsPerScore({
+  inputs: { cpuV1ThreadsPerScore: 99 },
+}), 4);
 
 // Square-pixel scope crops; CPU-v1 requires explicit geometry identity and
 // never infers SAR/DAR from the raster. 1920x1040 reduces to 24:13.
@@ -48,11 +56,11 @@ assert.deepStrictEqual(scorerGeometry, {
 assert.throws(() => selector._test.cpuV1ScorerGeometryFromContract({
   ...production,
   sourceSampleAspectRatio: null,
-}), /lacks exact coded geometry/);
+}), /lacks supported, exact coded geometry/);
 assert.throws(() => selector._test.cpuV1ScorerGeometryFromContract({
   ...production,
   geometryNormalization: 'scale',
-}), /lacks exact coded geometry/);
+}), /lacks supported, exact coded geometry/);
 
 const hdr = selector._test.resolveMeasuredSweepContract({
   variables: { ...baseVariables, vmafCpuV1ProductionActive: true },
@@ -98,6 +106,7 @@ for (const token of [
   'sampleAspectRatio: scorerGeometry.sampleAspectRatio',
   'displayAspectRatio: scorerGeometry.displayAspectRatio',
   'geometryNormalization: scorerGeometry.geometryNormalization',
+  'threads: cpuV1ThreadsPerScore(args)',
 ]) assert(source.includes(token), token);
 assert(source.indexOf("holdoutMetricContract.backend === 'cpu'") <
   source.indexOf('var capabilityCache = args.variables.vmafGpuCapabilityCache'));

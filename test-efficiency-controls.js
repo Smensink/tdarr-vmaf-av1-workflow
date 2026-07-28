@@ -86,7 +86,7 @@ assert.doesNotMatch(calculateSource, /buildCpuVmafCommand|\]libvmaf=/,
   'calculation must not retain a CPU VMAF fallback command');
 assert(calculateSource.includes('Cross-contract fallback is forbidden.'));
 assert(calculateSource.includes('cross-contract fallback is disabled.'));
-assert(databaseSource.includes('var SCHEMA_VERSION = 15;'));
+assert(databaseSource.includes('var SCHEMA_VERSION = 17;'));
 assert(databaseSource.includes('reference_contract_id'));
 assert(databaseSource.includes('metric_contract_id'));
 assert(databaseSource.includes('encoder_profile_id'));

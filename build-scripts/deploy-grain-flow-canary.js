@@ -22,6 +22,7 @@ const backupRoot = process.env.GRAIN_FLOW_BACKUP_ROOT || '/app/configs/backups';
 const apiBase = (process.env.GRAIN_FLOW_API_BASE || 'http://127.0.0.1:8266/api/v2')
   .replace(/\/+$/, '');
 const apiTimeoutMs = Number(process.env.GRAIN_FLOW_API_TIMEOUT_MS || 10000);
+const apiKey = String(process.env.TDARR_API_KEY || process.env.apiKey || '');
 const gpuLockPath = process.env.GRAIN_FLOW_GPU_LOCK || '/temp/tdarr-vmaf-gpu-pipeline.lock';
 
 assert.strictEqual(process.env.ALLOW_GRAIN_FLOW_DEPLOY, '1',
@@ -32,6 +33,10 @@ assert(path.isAbsolute(gpuLockPath),
 const canonicalRaw = fs.readFileSync(canonicalPath, 'utf8');
 const canonical = JSON.parse(canonicalRaw);
 assert.strictEqual(canonical._id, flowId, 'canonical Flow ID mismatch');
+assert.strictEqual((canonical.flowPlugins || []).length, 36,
+  'canonical r3 Flow must contain exactly 36 nodes');
+assert.strictEqual((canonical.flowEdges || []).length, 58,
+  'canonical r3 Flow must contain exactly 58 edges');
 
 const analysisNode = (canonical.flowPlugins || []).find((item) => item.id === 'grainAnalysis1');
 assert(analysisNode, 'canonical grain analysis node is missing');
@@ -113,8 +118,8 @@ assert.deepStrictEqual(
 );
 assert.strictEqual(
   grainRoutes.find((edge) => String(edge.sourceHandle) === '1').target,
-  'replace1',
-  'validated active grain output must bypass every post-validation remux'
+  'deliveryValidate1',
+  'validated active grain output must pass the final delivery validator'
 );
 assert.strictEqual(
   grainRoutes.find((edge) => String(edge.sourceHandle) === '2').target,
@@ -147,6 +152,73 @@ const failureExit = (canonical.flowEdges || []).find(
 assert(failureExit && failureExit.target === grainFailureFail.id,
   'grain technical-failure cleanup must terminate in Fail Flow');
 
+const deliveryValidator = (canonical.flowPlugins || []).find(
+  (item) => item.id === 'deliveryValidate1'
+);
+assert(deliveryValidator &&
+  deliveryValidator.pluginName === 'validateDeliveryCandidate' &&
+  deliveryValidator.version === '1.0.0',
+  'canonical final delivery validator is missing');
+const deliveryValidationRoutes = (canonical.flowEdges || []).filter(
+  (edge) => edge.source === deliveryValidator.id
+);
+assert.strictEqual(
+  deliveryValidationRoutes.find(
+    (edge) => String(edge.sourceHandle) === '1'
+  ).target,
+  'replace1',
+  'accepted final delivery candidate must enter attested replacement'
+);
+assert.strictEqual(
+  deliveryValidationRoutes.find(
+    (edge) => String(edge.sourceHandle) === '2'
+  ).target,
+  'F1jkDv0qn',
+  'rejected final delivery candidate must preserve the original and clean up'
+);
+const remuxExecute = (canonical.flowPlugins || []).find(
+  (item) => item.id === 'BthcE0uii'
+);
+assert(remuxExecute && remuxExecute.pluginName === 'ffmpegCommandExecute',
+  'canonical remux execute node is missing');
+assert((canonical.flowEdges || []).some((edge) =>
+  edge.source === remuxExecute.id &&
+  String(edge.sourceHandle) === '1' &&
+  edge.target === deliveryValidator.id),
+  'remux output must pass the final delivery validator');
+
+const replacement = (canonical.flowPlugins || []).find(
+  (item) => item.id === 'replace1'
+);
+const deliveryFinalizer = (canonical.flowPlugins || []).find(
+  (item) => item.id === 'deliveryFinalize1'
+);
+assert(replacement &&
+  replacement.pluginName === 'replaceOriginalFileAttested',
+  'canonical attested replacement node is missing');
+assert(deliveryFinalizer &&
+  deliveryFinalizer.pluginName === 'finalizeDeliveredOutcome',
+  'canonical delivered-outcome finalizer is missing');
+const replacementRoutes = (canonical.flowEdges || []).filter(
+  (edge) => edge.source === replacement.id
+);
+for (const handle of ['1', '2']) {
+  assert.strictEqual(
+    replacementRoutes.find(
+      (edge) => String(edge.sourceHandle) === handle
+    ).target,
+    deliveryFinalizer.id,
+    `replacement output ${handle} must enter delivered-outcome finalization`
+  );
+}
+assert.strictEqual(
+  replacementRoutes.find(
+    (edge) => String(edge.sourceHandle) === '3'
+  ).target,
+  'F1jkDv0qn',
+  'replacement keep-original output must clean up without finalization'
+);
+
 const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
 function requestJson(relativePath, options = {}) {
@@ -154,13 +226,15 @@ function requestJson(relativePath, options = {}) {
   const transport = url.protocol === 'https:' ? https : http;
   const body = options.body === undefined ? null : JSON.stringify(options.body);
   return new Promise((resolve, reject) => {
+    const headers = body === null ? { accept: 'application/json' } : {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+    };
+    if (apiKey) headers['x-api-key'] = apiKey;
     const request = transport.request(url, {
       method: options.method || 'GET',
-      headers: body === null ? { accept: 'application/json' } : {
-        accept: 'application/json',
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body),
-      },
+      headers,
       timeout: apiTimeoutMs,
     }, (response) => {
       let raw = '';
@@ -201,8 +275,53 @@ function assertGpuLockAbsent(stage) {
   throw new Error(`refusing Flow mutation while GPU pipeline lock exists during ${stage} check: ${gpuLockPath}`);
 }
 
+function activeProductionProcesses() {
+  // Tdarr's worker snapshot can transiently say idle while a CLI child still
+  // owns the GPU lock and is encoding. Treat /proc as an independent drain
+  // authority and report only PID/tool identity so media paths are not leaked.
+  if (process.platform !== 'linux' || !fs.existsSync('/proc')) return [];
+  const active = [];
+  for (const name of fs.readdirSync('/proc')) {
+    if (!/^[1-9][0-9]*$/.test(name) || Number(name) === process.pid) continue;
+    let argv;
+    try {
+      argv = fs.readFileSync(`/proc/${name}/cmdline`)
+        .toString('utf8').split('\0').filter(Boolean);
+    } catch (_) {
+      continue;
+    }
+    if (argv.length === 0) continue;
+    const executable = path.basename(argv[0]).toLowerCase();
+    const script = argv.length > 1 ? path.basename(argv[1]).toLowerCase() : '';
+    let identity = null;
+    if (script === 'tdarr-nvencc-knn-ffmpeg.js') identity = script;
+    else if (executable === 'nvencc') identity = executable;
+    else if (executable === 'grav1synth') identity = executable;
+    else if (executable === 'vmaf-v1-score.sh' || script === 'vmaf-v1-score.sh') {
+      identity = 'vmaf-v1-score.sh';
+    } else if (executable === 'tdarr-ffmpeg' || executable === 'tdarr-ffprobe') {
+      identity = executable;
+    } else if ((executable === 'ffmpeg' || executable === 'ffprobe') &&
+        argv.slice(1).some((value) =>
+          /\/temp\/(?:tdarr-workdir|\.vmaf-postencode-checkpoints-v1|vmaf-v1-score)/i
+            .test(String(value)))) {
+      identity = executable;
+    }
+    if (identity) active.push({ pid: Number(name), identity });
+  }
+  return active.sort((left, right) => left.pid - right.pid);
+}
+
+function assertNoProductionProcesses(stage) {
+  const active = activeProductionProcesses();
+  assert.strictEqual(active.length, 0,
+    `refusing Flow mutation with live production CLI processes during ${stage} check: ` +
+    active.map((item) => `${item.pid}/${item.identity}`).join(', '));
+}
+
 async function assertDeploymentQuiescence() {
   assertGpuLockAbsent('initial');
+  assertNoProductionProcesses('initial');
   const settingsRequest = {
     data: {
       collection: 'SettingsGlobalJSONDB',
@@ -235,8 +354,9 @@ async function assertDeploymentQuiescence() {
   const settingsAfter = await requestJson('cruddb', { method: 'POST', body: settingsRequest });
   assert(pauseIsAsserted(settingsAfter),
     `pauseAllNodes changed during deployment preflight: ${JSON.stringify(settingsAfter && settingsAfter.pauseAllNodes)}`);
+  assertNoProductionProcesses('final');
   assertGpuLockAbsent('final');
-  console.log('PASS deployment preflight: queues paused, all workers idle, and GPU pipeline lock absent');
+  console.log('PASS deployment preflight: queues paused, workers idle, production CLI processes absent, and GPU pipeline lock absent');
 }
 
 async function main() {

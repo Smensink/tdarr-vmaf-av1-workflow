@@ -1,151 +1,38 @@
 #!/bin/bash
-# Test script to check if libvmaf_cuda supports 10-bit pixel formats
+# Synthetic-only test to check if libvmaf_cuda supports 10-bit pixel formats.
+# It never searches /temp or mounted media for input files.
 # Tests: yuv420p10le, p010le, yuv422p10le, yuv444p10le
 
-set -e
+set -euo pipefail
 
 echo "=== Testing 10-bit Format Support in libvmaf_cuda ==="
 echo ""
 
 # Configuration
-FFMPEG_PATH="tdarr-ffmpeg"
-CACHE_DIR="/temp/test-10bit-vmaf-$(date +%s)"
+FFMPEG_PATH="${VMAF_FFMPEG_BIN:-tdarr-ffmpeg}"
+CACHE_ROOT="${VMAF_10BIT_TEST_ROOT:-/temp}"
 MODEL_PATH="/usr/local/ffmpeg-custom/ffmpeg-7.0.2-amd64-static/model/vmaf_v0.6.1.json"
 
-# Create test directory
-mkdir -p "$CACHE_DIR"
-echo "Test directory: $CACHE_DIR"
-echo ""
+[ -d "$CACHE_ROOT" ] && [ -w "$CACHE_ROOT" ] || {
+    echo "Synthetic 10-bit test root is not a writable directory" >&2
+    exit 1
+}
+CACHE_DIR="$(mktemp -d "${CACHE_ROOT%/}/test-10bit-vmaf.XXXXXX")"
+cleanup() {
+    rm -rf -- "$CACHE_DIR"
+}
+trap cleanup EXIT
 
 # Check if FFmpeg has libvmaf_cuda
 echo "1. Checking for libvmaf_cuda support..."
-if $FFMPEG_PATH -hide_banner -filters 2>&1 | grep -q "libvmaf_cuda"; then
+FILTERS="$("$FFMPEG_PATH" -hide_banner -filters 2>&1)"
+if grep -q "libvmaf_cuda" <<<"$FILTERS"; then
     echo "   ✅ libvmaf_cuda is available"
 else
     echo "   ❌ libvmaf_cuda is NOT available"
     echo "   Cannot test 10-bit formats without libvmaf_cuda"
     exit 1
 fi
-echo ""
-
-# Look for existing test files or create minimal ones
-echo "2. Preparing test video files..."
-REFERENCE_8BIT=""
-DISTORTED_8BIT=""
-
-# Look for files in a configured media-library mount.
-TV_DIRS=("/media/library-1" "/media/library-2" "/media/tv" "/tv" "/mnt/tv")
-
-# Also check cache directory
-if [ -d "/temp" ]; then
-    # Find existing test files
-    REFERENCE_8BIT=$(find /temp -name "*sample*.mkv" -type f 2>/dev/null | head -1)
-    DISTORTED_8BIT=$(find /temp -name "test_*.mkv" -type f 2>/dev/null | head -1)
-fi
-
-# If not found, look in TV directories for any video files
-if [ -z "$REFERENCE_8BIT" ] || [ -z "$DISTORTED_8BIT" ]; then
-    for tv_dir in "${TV_DIRS[@]}"; do
-        if [ -d "$tv_dir" ]; then
-            echo "   Checking $tv_dir..."
-            # Look for any video file as reference
-            if [ -z "$REFERENCE_8BIT" ]; then
-                REFERENCE_8BIT=$(find "$tv_dir" -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.m4v" \) 2>/dev/null | head -1)
-            fi
-            # Look for a different file as distorted (or we can use same file)
-            if [ -z "$DISTORTED_8BIT" ]; then
-                DISTORTED_8BIT=$(find "$tv_dir" -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.m4v" \) 2>/dev/null | tail -1)
-            fi
-            if [ -n "$REFERENCE_8BIT" ] && [ -n "$DISTORTED_8BIT" ]; then
-                break
-            fi
-        fi
-    done
-fi
-
-# If we found one file but not two, use the same file for both (or create a second)
-if [ -n "$REFERENCE_8BIT" ] && [ -z "$DISTORTED_8BIT" ]; then
-    DISTORTED_8BIT="$REFERENCE_8BIT"
-    echo "   ⚠️  Using same file for both reference and distorted (will test format conversion)"
-fi
-
-# If not found, create minimal test files using available encoder
-if [ -z "$REFERENCE_8BIT" ] || [ -z "$DISTORTED_8BIT" ]; then
-    echo "   Creating minimal test files..."
-    REFERENCE_8BIT="$CACHE_DIR/reference_8bit.mkv"
-    DISTORTED_8BIT="$CACHE_DIR/distorted_8bit.mkv"
-
-    # Try different encoders
-    if $FFMPEG_PATH -encoders 2>&1 | grep -q "libx264"; then
-        echo "   Using libx264 for reference..."
-        $FFMPEG_PATH -f lavfi -i testsrc=duration=1:size=1920x1080:rate=30 \
-            -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p \
-            -t 1 "$REFERENCE_8BIT" -y 2>&1 | grep -v "frame=" || true
-    elif $FFMPEG_PATH -encoders 2>&1 | grep -q "h264_nvenc"; then
-        echo "   Using h264_nvenc for reference..."
-        $FFMPEG_PATH -f lavfi -i testsrc=duration=1:size=1920x1080:rate=30 \
-            -c:v h264_nvenc -preset p1 -cq 18 -pix_fmt yuv420p \
-            -t 1 "$REFERENCE_8BIT" -y 2>&1 | grep -v "frame=" || true
-    else
-        echo "   ⚠️  No suitable encoder found, using rawvideo..."
-        $FFMPEG_PATH -f lavfi -i testsrc=duration=1:size=1920x1080:rate=30 \
-            -c:v rawvideo -pix_fmt yuv420p \
-            -t 1 "$REFERENCE_8BIT" -y 2>&1 | grep -v "frame=" || true
-    fi
-
-    if $FFMPEG_PATH -encoders 2>&1 | grep -q "av1_nvenc"; then
-        echo "   Using av1_nvenc for distorted..."
-        $FFMPEG_PATH -f lavfi -i testsrc=duration=1:size=1920x1080:rate=30 \
-            -c:v av1_nvenc -preset p7 -cq 35 -pix_fmt yuv420p \
-            -t 1 "$DISTORTED_8BIT" -y 2>&1 | grep -v "frame=" || true
-    elif $FFMPEG_PATH -encoders 2>&1 | grep -q "hevc_nvenc"; then
-        echo "   Using hevc_nvenc for distorted..."
-        $FFMPEG_PATH -f lavfi -i testsrc=duration=1:size=1920x1080:rate=30 \
-            -c:v hevc_nvenc -preset p7 -cq 35 -pix_fmt yuv420p \
-            -t 1 "$DISTORTED_8BIT" -y 2>&1 | grep -v "frame=" || true
-    else
-        echo "   ⚠️  Using rawvideo for distorted..."
-        $FFMPEG_PATH -f lavfi -i testsrc2=duration=1:size=1920x1080:rate=30 \
-            -c:v rawvideo -pix_fmt yuv420p \
-            -t 1 "$DISTORTED_8BIT" -y 2>&1 | grep -v "frame=" || true
-    fi
-else
-    echo "   ✅ Using existing test files:"
-    echo "      Reference: $REFERENCE_8BIT"
-    echo "      Distorted: $DISTORTED_8BIT"
-fi
-
-echo "   Test files ready"
-echo ""
-
-# Detect codecs of input files
-echo "3. Detecting input file codecs..."
-REFERENCE_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$REFERENCE_8BIT" 2>/dev/null || echo "unknown")
-DISTORTED_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$DISTORTED_8BIT" 2>/dev/null || echo "unknown")
-echo "   Reference codec: $REFERENCE_CODEC"
-echo "   Distorted codec: $DISTORTED_CODEC"
-
-# Map codecs to CUVID decoders
-case "$REFERENCE_CODEC" in
-    h264) REFERENCE_CUVID="h264_cuvid" ;;
-    hevc|h265) REFERENCE_CUVID="hevc_cuvid" ;;
-    av1) REFERENCE_CUVID="av1_cuvid" ;;
-    vp8) REFERENCE_CUVID="vp8_cuvid" ;;
-    vp9) REFERENCE_CUVID="vp9_cuvid" ;;
-    *) REFERENCE_CUVID="" ;;
-esac
-
-case "$DISTORTED_CODEC" in
-    h264) DISTORTED_CUVID="h264_cuvid" ;;
-    hevc|h265) DISTORTED_CUVID="hevc_cuvid" ;;
-    av1) DISTORTED_CUVID="av1_cuvid" ;;
-    vp8) DISTORTED_CUVID="vp8_cuvid" ;;
-    vp9) DISTORTED_CUVID="vp9_cuvid" ;;
-    *) DISTORTED_CUVID="" ;;
-esac
-
-echo "   Reference CUVID decoder: ${REFERENCE_CUVID:-software decode}"
-echo "   Distorted CUVID decoder: ${DISTORTED_CUVID:-software decode}"
 echo ""
 
 # Formats to test
@@ -160,7 +47,7 @@ FORMATS=(
 SUPPORTED_FORMATS=()
 UNSUPPORTED_FORMATS=()
 
-echo "3. Testing each 10-bit format with libvmaf_cuda..."
+echo "2. Testing each 10-bit format with synthetic lavfi sources..."
 echo "   (Converting 8-bit source to 10-bit format in filter, then testing libvmaf_cuda acceptance)"
 echo ""
 
@@ -253,10 +140,6 @@ else
     echo ""
 fi
 
-echo "=== Detailed Logs ==="
-echo "Logs stored in: $CACHE_DIR"
-echo ""
-
 # Show error details for failed formats
 if [ ${#UNSUPPORTED_FORMATS[@]} -gt 0 ]; then
     echo "Error details for unsupported formats:"
@@ -272,4 +155,5 @@ if [ ${#UNSUPPORTED_FORMATS[@]} -gt 0 ]; then
 fi
 
 echo ""
+echo "Synthetic scratch and diagnostic logs will now be removed."
 echo "=== Test Complete ==="

@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const nvencTemporalFilter = require('./nvencTemporalFilter.js');
 const preFgsCambi = require('./preFgsCambi.js');
+const vmafV1Cpu = require('./vmafV1Cpu.js');
 
 const CONTRACT_SCHEMA_VERSION = 1;
 const MODEL_ROOT = '/usr/local/share/model';
@@ -140,24 +141,6 @@ function numberOrNull(value) {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
-function normalizedAspectRatio(value, label) {
-    const text = String(value === undefined || value === null ? '' : value).trim();
-    const match = text.match(/^(\d+):(\d+)$/);
-    if (!match || Number(match[1]) <= 0 || Number(match[2]) <= 0) {
-        throw new TypeError(label + ' must be an explicit positive N:D ratio');
-    }
-    let numerator = Number(match[1]);
-    let denominator = Number(match[2]);
-    function gcd(a, b) {
-        while (b) { const next = a % b; a = b; b = next; }
-        return a;
-    }
-    const divisor = gcd(numerator, denominator);
-    numerator /= divisor;
-    denominator /= divisor;
-    return numerator + ':' + denominator;
-}
-
 function dimensionsFromInput(input) {
     if (!input || typeof input !== 'object') {
         throw new TypeError('VMAF metric contract resolution requires video dimensions');
@@ -202,26 +185,27 @@ function cpuV1GeometryFromInput(input) {
     }
     if (!videoStream && streams.length === 1) videoStream = streams[0];
     videoStream = videoStream || {};
-    const sampleAspectRatio = normalizedAspectRatio(
-        input.sampleAspectRatio || input.sample_aspect_ratio || videoStream.sample_aspect_ratio,
-        'CPU VMAF-v1 sample aspect ratio',
-    );
-    const displayAspectRatio = normalizedAspectRatio(
-        input.displayAspectRatio || input.display_aspect_ratio || videoStream.display_aspect_ratio,
-        'CPU VMAF-v1 display aspect ratio',
-    );
+    const sampleAspectRatio =
+        input.sampleAspectRatio || input.sample_aspect_ratio || videoStream.sample_aspect_ratio;
+    const displayAspectRatio =
+        input.displayAspectRatio || input.display_aspect_ratio || videoStream.display_aspect_ratio;
     const normalization = String(
         input.geometryNormalization || input.normalizationDecision || '',
     ).trim();
-    if (normalization !== 'none') {
-        throw new TypeError('CPU VMAF-v1 geometry normalization must be explicitly none');
-    }
-    return {
+    const validated = vmafV1Cpu.validateGeometry({
         width: dimensions.width,
         height: dimensions.height,
         sampleAspectRatio: sampleAspectRatio,
         displayAspectRatio: displayAspectRatio,
-        normalization: normalization,
+        geometryNormalization: normalization,
+    });
+    return {
+        width: validated.width,
+        height: validated.height,
+        sampleAspectRatio: validated.sampleAspectRatio,
+        displayAspectRatio: validated.displayAspectRatio,
+        normalization: validated.geometryNormalization,
+        resolutionClass: validated.resolutionClass,
     };
 }
 
@@ -243,7 +227,7 @@ function resolveCpuV1Candidate(input, options) {
     }
     const frameRate = numberOrNull(input.frameRate);
     const hfr = frameRate !== null && frameRate > 30;
-    const fourK = dimensions.width >= FOUR_K_MIN_WIDTH || dimensions.height >= FOUR_K_MIN_HEIGHT;
+    const fourK = dimensions.resolutionClass === '4k';
     const model = hfr
         ? (fourK ? CPU_V1_MODELS.hfrFourK : CPU_V1_MODELS.hfrStandard)
         : (fourK ? CPU_V1_MODELS.fourK : CPU_V1_MODELS.standard);
@@ -269,6 +253,7 @@ function resolveCpuV1Candidate(input, options) {
         encoderProfileAttested: Boolean(attestedEncoderProfileId),
         productionEligible: false,
         qualificationStatus: 'source-only-candidate',
+        authorityStatus: 'candidate-not-authoritative',
         contentClass: contentClass,
         hdrValidationStatus: input.isHdr
             ? 'provisional-needs-real-content-calibration' : 'needs-real-content-calibration',
@@ -308,6 +293,7 @@ function resolveCpuV1Candidate(input, options) {
         sourceSampleAspectRatio: dimensions.sampleAspectRatio,
         sourceDisplayAspectRatio: dimensions.displayAspectRatio,
         geometryNormalization: dimensions.normalization,
+        geometryValidationStatus: 'exact-coded-sar-dar-model-family-match',
         frameRate: frameRate,
     });
 }
@@ -321,6 +307,9 @@ function resolveCpuV1Production(input, options) {
         hdrValidationStatus: input.isHdr
             ? 'provisional-hdr-explicitly-authorized-with-full-holdout'
             : 'promoted-sdr-with-full-holdout',
+        authorityStatus: input.isHdr
+            ? 'provisional-hdr-explicit-override'
+            : 'authoritative-supported-geometry',
     }));
 }
 

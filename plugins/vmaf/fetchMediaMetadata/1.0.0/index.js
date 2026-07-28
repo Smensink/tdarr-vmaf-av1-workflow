@@ -123,37 +123,64 @@ var plugin = function (args) {
         };
     }
 
-    function requestJson(url, headers, timeoutMs) {
+    var MAX_METADATA_RESPONSE_BYTES = 1024 * 1024;
+
+    function requestBody(url, headers, timeoutMs, parseJson) {
         return new Promise(function(resolve) {
             var client = url.indexOf('https://') === 0 ? https : http;
+            var settled = false;
+            function finish(value) {
+                if (settled) return;
+                settled = true;
+                resolve(value);
+            }
             var req = client.get(url, { headers: headers || {}, timeout: timeoutMs || 8000 }, function(res) {
-                var body = '';
-                res.on('data', function(chunk) { body += chunk; });
+                var status = Number(res.statusCode || 0);
+                var declaredBytes = Number((res.headers || {})['content-length']);
+                if (status < 200 || status >= 300 ||
+                    (isFinite(declaredBytes) && declaredBytes > MAX_METADATA_RESPONSE_BYTES)) {
+                    res.resume();
+                    finish(parseJson ? null : '');
+                    return;
+                }
+                var chunks = [];
+                var received = 0;
+                res.on('data', function(chunk) {
+                    if (settled) return;
+                    var buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                    received += buffer.length;
+                    if (received > MAX_METADATA_RESPONSE_BYTES) {
+                        res.destroy();
+                        finish(parseJson ? null : '');
+                        return;
+                    }
+                    chunks.push(buffer);
+                });
                 res.on('end', function() {
+                    if (settled) return;
+                    var body = Buffer.concat(chunks).toString('utf8');
+                    if (!parseJson) return finish(body);
                     try {
-                        var parsed = JSON.parse(body);
-                        resolve(parsed);
+                        finish(JSON.parse(body));
                     } catch (err) {
-                        resolve(null);
+                        finish(null);
                     }
                 });
             });
-            req.on('error', function() { resolve(null); });
-            req.on('timeout', function() { req.destroy(); resolve(null); });
+            req.on('error', function() { finish(parseJson ? null : ''); });
+            req.on('timeout', function() {
+                req.destroy();
+                finish(parseJson ? null : '');
+            });
         });
     }
 
+    function requestJson(url, headers, timeoutMs) {
+        return requestBody(url, headers, timeoutMs, true);
+    }
+
     function requestText(url, headers, timeoutMs) {
-        return new Promise(function(resolve) {
-            var client = url.indexOf('https://') === 0 ? https : http;
-            var req = client.get(url, { headers: headers || {}, timeout: timeoutMs || 8000 }, function(res) {
-                var body = '';
-                res.on('data', function(chunk) { body += chunk; });
-                res.on('end', function() { resolve(body || ''); });
-            });
-            req.on('error', function() { resolve(''); });
-            req.on('timeout', function() { req.destroy(); resolve(''); });
-        });
+        return requestBody(url, headers, timeoutMs, false);
     }
 
     var SOURCE_TYPE_PATTERNS = [
@@ -179,12 +206,13 @@ var plugin = function (args) {
     function parseFilenameMeta(filePath) {
         var base = path.basename(filePath || '', path.extname(filePath || ''));
         var sourceType = inferSourceTypeFromFilename(base);
-        var cleaned = base.replace(/[._]/g, ' ');
-        // Strip bracketed bits
-        cleaned = cleaned.replace(/[\(\[\{][^\)\]\}]*[\)\]\}]/g, ' ');
-        // Extract year if present
-        var yearMatch = cleaned.match(/(19|20)\d{2}/);
+        var separated = base.replace(/[._]/g, ' ');
+        // Extract the year before removing bracketed release metadata. Years in
+        // "(1999)" and "[2024]" were previously discarded.
+        var yearMatch = separated.match(/(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9]|$)/);
+        var cleaned = separated.replace(/[\(\[\{][^\)\]\}]*[\)\]\}]/g, ' ');
         var year = yearMatch ? parseInt(yearMatch[0], 10) : null;
+        if (yearMatch && yearMatch[1]) year = parseInt(yearMatch[1], 10);
         // Trim season/episode markers for TV shows
         var tvMatch = cleaned.match(/^(.*?)[\s.-]?s\d{2}e\d{2}/i);
         var title = tvMatch ? tvMatch[1] : cleaned;
@@ -278,15 +306,65 @@ var plugin = function (args) {
             }
         }
 
-        return best || metaArray[0];
+        // A zero-score fallback can attach metadata for a completely unrelated
+        // title. Require a strong title/year or exact-path signal.
+        return bestScore >= 4 ? best : null;
     }
 
     function extractReleaseGroup(filePath) {
         if (!filePath) return '';
         var base = path.basename(filePath, path.extname(filePath));
-        var parts = base.trim().split(/\s+/);
-        if (parts.length === 0) return '';
-        return parts[parts.length - 1];
+        var bracket = base.match(/\[([A-Za-z0-9][A-Za-z0-9._-]{1,32})\]\s*$/);
+        var dash = base.match(/-([A-Za-z0-9][A-Za-z0-9._]{1,32})\s*$/);
+        var candidate = (bracket && bracket[1]) || (dash && dash[1]) || '';
+        candidate = candidate.replace(/^[._-]+|[._-]+$/g, '');
+        var normalized = candidate.replace(/[^A-Za-z0-9]+/g, '').toLowerCase();
+        var noise = {
+            av1: 1, hevc: 1, h264: 1, h265: 1, x264: 1, x265: 1,
+            webdl: 1, webrip: 1, bluray: 1, bdrip: 1, remux: 1,
+            hdr: 1, hdr10: 1, dv: 1, uhd: 1, '2160p': 1, '1080p': 1,
+            proper: 1, repack: 1, atmos: 1, ddp: 1,
+        };
+        return normalized && /[A-Za-z]/.test(candidate) && !noise[normalized]
+            ? candidate
+            : '';
+    }
+
+    function resultYear(candidate) {
+        var raw = candidate && (candidate.year || candidate.release_date ||
+            candidate.first_air_date || candidate.firstRelease);
+        var match = String(raw || '').match(/(?:19|20)\d{2}/);
+        return match ? Number(match[0]) : null;
+    }
+
+    function selectBestSearchResult(results, filenameMetadata) {
+        if (!Array.isArray(results) || results.length === 0) return null;
+        var wantedTitle = normalizeTitle(filenameMetadata && filenameMetadata.title);
+        var wantedYear = Number(filenameMetadata && filenameMetadata.year) || null;
+        if (!wantedTitle) return null;
+        var best = null;
+        var bestScore = -Infinity;
+        for (var i = 0; i < results.length; i++) {
+            var item = results[i] || {};
+            var itemTitle = normalizeTitle(item.title || item.name ||
+                item.original_title || item.original_name || '');
+            if (!itemTitle) continue;
+            var score = 0;
+            if (itemTitle === wantedTitle) score += 7;
+            else if (itemTitle.indexOf(wantedTitle) !== -1 ||
+                wantedTitle.indexOf(itemTitle) !== -1) score += 3;
+            var itemYear = resultYear(item);
+            if (wantedYear && itemYear) {
+                if (itemYear === wantedYear) score += 4;
+                else if (Math.abs(itemYear - wantedYear) === 1) score += 1;
+                else score -= 5;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                best = item;
+            }
+        }
+        return bestScore >= 5 ? best : null;
     }
 
     function parsePlexXml(xml) {
@@ -363,10 +441,10 @@ var plugin = function (args) {
         }
         return requestJson(searchUrl, {}, 8000).then(function(searchRes) {
             if (!searchRes || !Array.isArray(searchRes.results) || searchRes.results.length === 0) return null;
-            var first = searchRes.results[0];
-            if (!first.id) return null;
-            var type = first.media_type === 'tv' ? 'tv' : 'movie';
-            var detailUrl = 'https://api.themoviedb.org/3/' + type + '/' + first.id + '?api_key=' + encodeURIComponent(tmdbApiKey);
+            var chosen = selectBestSearchResult(searchRes.results, { title: title, year: year });
+            if (!chosen || !chosen.id) return null;
+            var type = chosen.media_type === 'tv' ? 'tv' : 'movie';
+            var detailUrl = 'https://api.themoviedb.org/3/' + type + '/' + chosen.id + '?api_key=' + encodeURIComponent(tmdbApiKey);
             return requestJson(detailUrl, {}, 8000).then(function(detail) {
                 if (!detail) return null;
                 var genres = normalizeGenres((detail.genres || []).map(function(g) { return g.name; }));
@@ -392,32 +470,19 @@ var plugin = function (args) {
         if (logMetadata) {
             args.jobLog('TVDB search: ' + searchUrl);
         }
-        return new Promise(function(resolve) {
-            var https = require('https');
-            var req = https.get(searchUrl, { headers: { 'Authorization': 'Bearer ' + tvdbApiKey }, timeout: 8000 }, function(res) {
-                var body = '';
-                res.on('data', function(chunk) { body += chunk; });
-                res.on('end', function() {
-                    try {
-                        var parsed = JSON.parse(body);
-                        if (!parsed || !parsed.data || !Array.isArray(parsed.data) || parsed.data.length === 0) return resolve(null);
-                        var first = parsed.data[0];
-                        var type = (first.type === 'series') ? 'tv' : 'movie';
-                        var tvdbYear = first.year || first.firstRelease || null;
-                        return resolve({
-                            source: 'tvdb',
-                            genres: [], // TVDB v4 search doesn't return genres; could fetch detail if needed
-                            keywords: [],
-                            type: type,
-                            year: tvdbYear ? Number(tvdbYear) : (year || null)
-                        });
-                    } catch (e) {
-                        return resolve(null);
-                    }
-                });
-            });
-            req.on('error', function() { resolve(null); });
-            req.on('timeout', function() { req.destroy(); resolve(null); });
+        return requestJson(searchUrl, { 'Authorization': 'Bearer ' + tvdbApiKey }, 8000).then(function(parsed) {
+            if (!parsed || !Array.isArray(parsed.data) || parsed.data.length === 0) return null;
+            var chosen = selectBestSearchResult(parsed.data, { title: title, year: year });
+            if (!chosen) return null;
+            var type = chosen.type === 'series' ? 'tv' : 'movie';
+            var tvdbYear = resultYear(chosen);
+            return {
+                source: 'tvdb',
+                genres: [],
+                keywords: [],
+                type: type,
+                year: tvdbYear || year || null,
+            };
         });
     }
 

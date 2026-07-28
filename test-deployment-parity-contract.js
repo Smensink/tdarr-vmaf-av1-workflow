@@ -14,16 +14,56 @@ assert.strictEqual(String(encodingInputs.encodeHardAbort), 'false');
 assert.strictEqual(String(encodingInputs.encodeHardAbortK), '4');
 assert.strictEqual(String(encodingInputs.encodeHardAbortMargin), '1.5');
 assert.strictEqual(String(encodingInputs.sameTitleEmptyBandShadow), 'true');
+assert.strictEqual(String(encodingInputs.targetSizeReduction), '30',
+  'search target must bind the exact current delivery policy');
 const calculateInputs = canonical.flowPlugins.find((item) => item.pluginName === 'calculateVMAF').inputsDB;
 assert.strictEqual(String(calculateInputs.maxParallelVmaf), '8');
 assert.strictEqual(String(calculateInputs.vmafCpuV1QualificationEnabled), 'false');
 assert.strictEqual(String(calculateInputs.vmafCpuV1ProductionEnabled), 'true');
-assert.strictEqual(String(calculateInputs.vmafCpuV1ProductionAllowProvisionalHdr), 'true');
-assert.strictEqual(String(calculateInputs.maxParallelCpuV1), '2');
-assert.strictEqual(String(calculateInputs.vmafPairedCqActingEnabled), 'true');
+assert.strictEqual(String(calculateInputs.vmafCpuV1ProductionAllowProvisionalHdr), 'false',
+  'provisional HDR CPU-v1 authority must remain explicitly disabled');
+assert.strictEqual(String(calculateInputs.maxParallelCpuV1), '1');
+assert.strictEqual(String(calculateInputs.cpuV1ThreadsPerScore), '2');
+assert.strictEqual(String(calculateInputs.vmafPairedCqActingEnabled), 'false',
+  'paired-CQ acting must remain explicitly disabled while force-full is enabled');
 assert.strictEqual(String(calculateInputs.pairedCqShadow), 'true');
 assert.strictEqual(String(calculateInputs.pairedCqShadowForceFull), 'true');
 assert.strictEqual(String(calculateInputs.pairedCqShadowAnchors), '6');
+const selectInputs = canonical.flowPlugins.find((item) =>
+  item.pluginName === 'selectBestParameters').inputsDB;
+assert.strictEqual(String(selectInputs.cpuV1ThreadsPerScore), '2');
+assert.strictEqual(String(selectInputs.minSizeReduction), '20',
+  'selector minimum must bind the exact current delivery policy');
+const bracketInputs = canonical.flowPlugins.find((item) =>
+  item.pluginName === 'checkCQBracket').inputsDB;
+assert.deepStrictEqual({
+  targetVMAF: String(bracketInputs.targetVMAF),
+  expansionCQCount: String(bracketInputs.expansionCQCount),
+  highMarginVMAFHeadroom: String(bracketInputs.highMarginVMAFHeadroom),
+  highMarginVMAFHeadroom4K: String(bracketInputs.highMarginVMAFHeadroom4K),
+  highMarginExpansionCQCount4K: String(bracketInputs.highMarginExpansionCQCount4K),
+  threeStageVmaf: String(bracketInputs.threeStageVmaf),
+  intermediateVmafSubsample: String(bracketInputs.intermediateVmafSubsample),
+}, {
+  targetVMAF: '95',
+  expansionCQCount: '2',
+  highMarginVMAFHeadroom: '1.5',
+  highMarginVMAFHeadroom4K: '2',
+  highMarginExpansionCQCount4K: '4',
+  threeStageVmaf: 'false',
+  intermediateVmafSubsample: '2',
+}, 'critical CQ-bracketing policy must be explicit in the Flow');
+const retryInputs = canonical.flowPlugins.find((item) =>
+  item.pluginName === 'checkCQRangeRetry').inputsDB;
+assert.deepStrictEqual({
+  maxRetries: String(retryInputs.maxRetries),
+  vmafHeadroomThreshold: String(retryInputs.vmafHeadroomThreshold),
+  vmafBelowThresholdMargin: String(retryInputs.vmafBelowThresholdMargin),
+}, {
+  maxRetries: '4',
+  vmafHeadroomThreshold: '5',
+  vmafBelowThresholdMargin: '5',
+}, 'critical CQ retry policy must be explicit in the Flow');
 const hdrNode = canonical.flowPlugins.find((item) => item.id === 'hdr1');
 assert.ok(hdrNode, 'canonical flow omits the dynamic-HDR policy node');
 assert.strictEqual(hdrNode.inputsDB.dynamicHdrPolicy, 'profileAwareHdr10');
@@ -93,8 +133,9 @@ assert.strictEqual(
 );
 const grainRoutes = canonical.flowEdges.filter((edge) => edge.source === 'grainSynthesis1');
 assert.deepStrictEqual(grainRoutes.map((edge) => String(edge.sourceHandle)).sort(), ['1', '2', '3', '4']);
-assert.strictEqual(grainRoutes.find((edge) => String(edge.sourceHandle) === '1').target, 'replace1',
-  'validated grain output must bypass post-validation FFmpeg remuxing');
+assert.strictEqual(grainRoutes.find((edge) => String(edge.sourceHandle) === '1').target,
+  'deliveryValidate1',
+  'validated grain output must reach exact-byte delivery validation');
 assert.strictEqual(grainRoutes.find((edge) => String(edge.sourceHandle) === '2').target, 'F1jkDv0qn');
 assert.strictEqual(grainRoutes.find((edge) => String(edge.sourceHandle) === '3').target, 'A811lg3V4');
 assert.strictEqual(grainRoutes.find((edge) => String(edge.sourceHandle) === '4').target,
@@ -110,6 +151,24 @@ const raw = fs.readFileSync('configs/flow_YR5PZ1QaD_CANONICAL.json', 'utf8');
 assert.ok(!/"(plexToken|tmdbApiKey|tvdbApiKey|arr_api_key)"\s*:\s*"(?!\$\{TDARR_)/.test(raw));
 const paritySource = fs.readFileSync('build-scripts/verify-vmaf-deployment-parity.js', 'utf8');
 const initSource = fs.readFileSync('custom-cont-init.d/96-apply-vmaf-plugin-patches.sh', 'utf8');
+const promotionSource = fs.readFileSync(
+  'custom-cont-init.d/update-vmaf-flow-v1-promotion.js', 'utf8');
+for (const binding of [
+  "vmafCpuV1ProductionAllowProvisionalHdr: 'false'",
+  "vmafPairedCqActingEnabled: 'false'",
+  "pairedCqShadow: 'true'",
+  "pairedCqShadowForceFull: 'true'",
+  "targetSizeReduction: '30'",
+  "minSizeReduction: '20'",
+  "maxRetries: '4'",
+  "vmafHeadroomThreshold: '5'",
+  "vmafBelowThresholdMargin: '5'",
+]) {
+  assert.ok(promotionSource.includes(binding),
+    `flow update script omits explicit policy binding ${binding}`);
+}
+assert.ok(promotionSource.includes('checkCQRangeRetry: {'),
+  'flow update script does not target the CQ retry node');
 const canonicalLocalNames = [...new Set(canonical.flowPlugins
   .filter((item) => item.sourceRepo === 'Local')
   .map((item) => item.pluginName))];
@@ -133,10 +192,61 @@ for (const plugin of expectedPinnedVmaf) {
     `custom-cont-init.d/vmaf-plugin-patches/${plugin}/1.0.0/index.js`
   ), `host ${plugin}/1.0.0 payload is missing`);
 }
-assert.ok(initSource.includes('cp -a "$LOCAL_SERVER_ROOT/." "$LOCAL_NODE_ROOT/"'),
-  'container init does not seed the ephemeral node from the persistent local-plugin catalog');
-assert.ok(initSource.includes('chown -R abc:abc "$LOCAL_NODE_ROOT"'),
-  'container init leaves local node plugins vulnerable to the abc ZIP-refresh ownership failure');
+assert.ok(initSource.includes(
+  "SERVER_PLUGINS_ROOT='/app/server/Tdarr/Plugins'"
+), 'container init must bind the complete persistent server plugin catalog');
+assert.ok(initSource.includes('cp -a "$SERVER_PLUGINS_ROOT/." "$NODE_PLUGINS_ROOT/"'),
+  'container init does not seed the ephemeral node from the complete server catalog');
+assert.ok(initSource.includes(
+  'find "$SERVER_PLUGINS_ROOT" -type l -print -quit'
+), 'container init must reject symlinks in the persistent server plugin catalog');
+assert.ok(initSource.includes('chown -R abc:abc "$NODE_PLUGINS_ROOT"'),
+  'container init leaves the complete node catalog vulnerable to ownership failures');
+assert.ok(initSource.includes(
+  "NODE_PLUGINS_ROOT='/app/Tdarr_Node/assets/app/plugins'"
+), 'container init must bind the exact internal-node plugin root');
+assert.ok(initSource.includes(
+  'NODE_PLUGIN_PIN_SENTINEL="$NODE_PLUGINS_ROOT/.git"'
+), 'container init must use Tdarr_Node development-preservation interlock');
+assert.ok(initSource.includes('mkdir -p "$NODE_PLUGIN_PIN_SENTINEL"'),
+  'container init must arm the internal-node catalog pin');
+assert.ok(
+  initSource.includes(
+    'chown --reference="$NODE_PLUGINS_ROOT" "$NODE_PLUGIN_PIN_SENTINEL"'
+  ),
+  'internal-node catalog pin must match its parent ownership before parity runs'
+);
+assert.ok(
+  initSource.indexOf('cp -a "$SERVER_PLUGINS_ROOT/." "$NODE_PLUGINS_ROOT/"') <
+    initSource.indexOf('mkdir -p "$NODE_PLUGIN_PIN_SENTINEL"'),
+  'node download interlock must not precede the full catalog seed'
+);
+assert.ok(
+  initSource.indexOf("apply_shared_lib_file 'vmafV1Cpu.js'") <
+    initSource.indexOf('mkdir -p "$NODE_PLUGIN_PIN_SENTINEL"'),
+  'node download interlock must not precede the last pinned helper'
+);
+assert.ok(paritySource.includes(
+  "const nodePluginsRoot = '/app/Tdarr_Node/assets/app/plugins'"
+), 'deployment parity must bind the exact internal-node plugin root');
+assert.ok(paritySource.includes(
+  "const serverPluginsRoot = '/app/server/Tdarr/Plugins'"
+), 'deployment parity must bind the complete persistent server plugin catalog');
+assert.ok(paritySource.includes('catalogSnapshot') &&
+  paritySource.includes('server/internal-node plugin catalog file sets differ') &&
+  paritySource.includes('server/internal-node plugin catalog hash mismatch:'),
+'deployment parity must compare the complete server and internal-node catalogs');
+for (const helper of ['cliUtils.js', 'hardwareUtils.js', 'hardwareUtils.test.js']) {
+  assert.ok(paritySource.includes(
+    `'FlowPlugins/FlowHelpers/1.0.0/${helper}'`
+  ), `deployment parity omits required Tdarr helper ${helper}`);
+}
+assert.ok(paritySource.includes(
+  'const nodePluginPinSentinel = `${nodePluginsRoot}/.git`'
+), 'deployment parity must require the exact post-init download interlock');
+assert.ok(paritySource.includes(
+  "mismatches.push('internal-node plugin pin sentinel is missing')"
+), 'deployment parity must fail closed when the interlock is absent');
 assert.ok(paritySource.includes('canonicalLocalPlugins') && paritySource.includes('findPlugin'),
   'deployment parity does not validate every canonical Local plugin in the server and node catalogs');
 assert.ok(paritySource.includes("process.env.TDARR_FLOW_PARITY_BOOTSTRAP === '1'") &&
@@ -155,7 +265,10 @@ assert.ok(initSource.includes("apply_filter_patch_file 'checkFileAge/1.0.0'"),
   'container init does not deploy filter/checkFileAge/1.0.0');
 for (const helper of ['feasibility.js', 'gpuPipelineLock.js', 'sizeFailureShadow.js', 'vmafdb.js',
   'vmafpredict.js', 'referenceContractBridge.js', 'pairedCqShadow.js', 'emptyBandShadow.js', 'rejectionReasons.js',
-  'grainAnalysisArtifact.js', 'canonicalDenoise.js', 'nvencTemporalFilter.js', 'nvenccKnn.js', 'grainVmafContract.js', 'vmafMetricContract.js',
+  'grainAnalysisArtifact.js', 'postEncodeCheckpoint.js', 'postReplaceAttestation.js',
+  'deliveryPolicy.js', 'deliveryFinalization.js', 'deliveryTransaction.js',
+  'canonicalDenoise.js', 'nvencTemporalFilter.js', 'nvenccKnn.js',
+  'grainVmafContract.js', 'vmafMetricContract.js',
   'currentContractMeasurementHistory.js', 'preFgsCambi.js', 'vmafV1Cpu.js']) {
   assert.ok(paritySource.includes(`'${helper}'`), `deployment parity omits ${helper}`);
   assert.ok(initSource.includes(`apply_shared_lib_file '${helper}'`),
@@ -163,6 +276,22 @@ for (const helper of ['feasibility.js', 'gpuPipelineLock.js', 'sizeFailureShadow
   assert.ok(fs.existsSync(`custom-cont-init.d/vmaf-plugin-patches/_lib/${helper}`),
     `host ${helper} payload is missing`);
 }
+assert.strictEqual(
+  fs.readFileSync('plugins/vmaf/_lib/vmafV1Cpu.js', 'utf8'),
+  fs.readFileSync('custom-cont-init.d/vmaf-plugin-patches/_lib/vmafV1Cpu.js', 'utf8'),
+  'CPU-v1 helper source and deployment mirror differ'
+);
+assert.strictEqual(
+  fs.readFileSync('plugins/vmaf/_lib/vmafV1Cpu.test.js', 'utf8'),
+  fs.readFileSync('custom-cont-init.d/vmaf-plugin-patches/_lib/vmafV1Cpu.test.js', 'utf8'),
+  'CPU-v1 helper tests and deployment mirror differ'
+);
+assert.strictEqual(
+  fs.readFileSync('plugins/vmaf/calculateVMAF/1.0.0/index.js', 'utf8'),
+  fs.readFileSync(
+    'custom-cont-init.d/vmaf-plugin-patches/calculateVMAF/1.0.0/index.js', 'utf8'),
+  'calculateVMAF source and deployment mirror differ'
+);
 const gitignore = fs.readFileSync('.gitignore', 'utf8');
 assert.ok(gitignore.includes('plugins/vmaf/_lib/size_failure_shadow_hgb.json') &&
   gitignore.includes('custom-cont-init.d/vmaf-plugin-patches/_lib/size_failure_shadow_hgb.json'),
@@ -194,4 +323,10 @@ assert.ok(deploySource.includes("db.exec('BEGIN IMMEDIATE')"),
   'live Flow deploy helper lacks a write transaction');
 assert.ok(deploySource.includes('pre-grain-active-${stamp}.json'),
   'live Flow deploy helper lacks a pre-deployment backup');
+assert.ok(deploySource.includes("'/temp/tdarr-vmaf-gpu-pipeline.lock'"),
+  'live Flow deploy helper does not pin the production GPU lock');
+assert.ok(deploySource.includes('activeProductionProcesses') &&
+  deploySource.includes('/proc/${name}/cmdline') &&
+  deploySource.includes('tdarr-nvencc-knn-ffmpeg.js'),
+  'live Flow deploy helper trusts worker-idle state without an independent process drain check');
 console.log('PASS canonical flow definition contract');

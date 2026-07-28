@@ -38,6 +38,7 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.plugin = exports.details = void 0;
 var cliUtils_1 = require("../../../../FlowHelpers/1.0.0/cliUtils");
+var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
 var nvencTemporalFilter = require('../../_lib/nvencTemporalFilter.js');
 var canonicalDenoise = require('../../_lib/canonicalDenoise.js');
 var nvenccKnn = require('../../_lib/nvenccKnn.js');
@@ -52,6 +53,133 @@ var POSTENCODE_EXHAUSTIVE_VALIDATOR = 'ffprobe-demux-plus-full-decode-v1';
 var POSTENCODE_SAMPLE_SECONDS = 1;
 var POSTENCODE_SAMPLE_TIMEOUT_MS = 90000;
 var POSTENCODE_EXHAUSTIVE_TIMEOUT_MS = 14400000;
+var FINAL_TRANSCODE_WATCHDOG_MIN_SECONDS = 12 * 60 * 60;
+var FINAL_TRANSCODE_WATCHDOG_MAX_SECONDS = 72 * 60 * 60;
+var FINAL_TRANSCODE_WATCHDOG_FALLBACK_SECONDS = 24 * 60 * 60;
+
+function medianPositive(values) {
+    var sorted = (values || []).map(Number).filter(function (value) {
+        return isFinite(value) && value > 0;
+    }).sort(function (left, right) { return left - right; });
+    if (!sorted.length) return null;
+    var middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2
+        ? sorted[middle]
+        : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function finalTranscodeWatchdogPolicy(sourceDurationSeconds, variables, selectedParameterSetId) {
+    variables = variables || {};
+    var duration = Number(sourceDurationSeconds);
+    if (!isFinite(duration) || duration <= 0) duration = null;
+    var sampleDuration = Number(variables.vmafSegmentDuration);
+    if (!isFinite(sampleDuration) || sampleDuration <= 0) sampleDuration = null;
+    var selectedId = String(selectedParameterSetId || '').trim();
+    var matchingTimes = (Array.isArray(variables.vmafTestResults)
+        ? variables.vmafTestResults : []).filter(function (result) {
+        if (!result || !selectedId || String(result.parameterSetId || '') !== selectedId) return false;
+        return isFinite(Number(result.encodingTimeSeconds)) && Number(result.encodingTimeSeconds) > 0;
+    }).map(function (result) { return Number(result.encodingTimeSeconds); });
+    var medianSampleEncodeSeconds = medianPositive(matchingTimes);
+    var projectedSeconds = duration && sampleDuration && medianSampleEncodeSeconds
+        ? duration * (medianSampleEncodeSeconds / sampleDuration)
+        : null;
+    var requestedSeconds;
+    var basis;
+    if (projectedSeconds) {
+        // Sample encodes are short and can under-represent decoder setup,
+        // difficult scenes, muxing, and shared-GPU contention. Four projected
+        // runtimes plus two hours of fixed slack keeps the watchdog a true
+        // liveness backstop rather than a normal scheduling deadline.
+        requestedSeconds = projectedSeconds * 4 + (2 * 60 * 60);
+        basis = 'selected-parameter-sample-throughput';
+    } else if (duration) {
+        // With no usable timing evidence, allow an encode as slow as 1/12
+        // realtime plus two hours. This is deliberately conservative.
+        requestedSeconds = duration * 12 + (2 * 60 * 60);
+        basis = 'source-duration-conservative-fallback';
+    } else {
+        requestedSeconds = FINAL_TRANSCODE_WATCHDOG_FALLBACK_SECONDS;
+        basis = 'missing-duration-fallback';
+    }
+    var timeoutSeconds = Math.round(Math.min(
+        FINAL_TRANSCODE_WATCHDOG_MAX_SECONDS,
+        Math.max(FINAL_TRANSCODE_WATCHDOG_MIN_SECONDS, requestedSeconds)));
+    return {
+        schema: 1,
+        policy: 'sample-informed-absolute-liveness-cap-v1',
+        basis: basis,
+        timeoutSeconds: timeoutSeconds,
+        timeoutMs: timeoutSeconds * 1000,
+        sourceDurationSeconds: duration,
+        selectedParameterSetId: selectedId || null,
+        sampleDurationSeconds: sampleDuration,
+        matchingSampleCount: matchingTimes.length,
+        medianSampleEncodeSeconds: medianSampleEncodeSeconds,
+        projectedFullEncodeSeconds: projectedSeconds,
+        minimumSeconds: FINAL_TRANSCODE_WATCHDOG_MIN_SECONDS,
+        maximumSeconds: FINAL_TRANSCODE_WATCHDOG_MAX_SECONDS,
+    };
+}
+
+function evaluateFinalOutputSizeGate(outputBytes, sourceBytes, configuredMaxRatioPct) {
+    var policy = deliveryPolicy.requireCurrentPolicy({
+        version: deliveryPolicy.POLICY_VERSION,
+        targetReductionPct: deliveryPolicy.DEFAULT_TARGET_REDUCTION_PCT,
+        minimumReductionPct: deliveryPolicy.DEFAULT_MINIMUM_REDUCTION_PCT,
+        maxFinalOutputRatioPct: Number(configuredMaxRatioPct),
+    });
+    return deliveryPolicy.evaluateBytes(outputBytes, sourceBytes, policy);
+}
+
+function retireRejectedPostEncodeCheckpoint(variables, checkpointModule, jobLog, now) {
+    variables = variables || {};
+    var record = variables.vmafPostEncodeCheckpoint;
+    var log = typeof jobLog === 'function' ? jobLog : function () {};
+    var timestamp = typeof now === 'function' ? now() : new Date().toISOString();
+    if (!record) {
+        variables.vmafPostEncodeCheckpointRetired = false;
+        variables.vmafPostEncodeCheckpointStatus = 'size_rejected_checkpoint_record_missing';
+        variables.vmafPostEncodeCheckpointRetirementWarning =
+            'size-rejected output had no authenticated checkpoint record to retire';
+        log('WARNING: ' + variables.vmafPostEncodeCheckpointRetirementWarning +
+            '; preserving the original and any recoverable artifact.');
+        return { retired: false, retained: true, reason: 'checkpoint_record_missing' };
+    }
+    try {
+        checkpointModule.retire(record);
+        variables.vmafRejectedPostEncodeCheckpointAudit = {
+            schema: 1,
+            reason: 'post_encode_size_rejected',
+            checkpoint_key: record.checkpoint_key,
+            encode_contract_sha256: record.encode_contract_sha256,
+            reused: record.reused === true,
+            retired_at: timestamp,
+        };
+        variables.vmafPostEncodeCheckpointRetired = true;
+        variables.vmafPostEncodeCheckpointStatus = 'retired_size_rejected';
+        delete variables.vmafPostEncodeCheckpointRetirementWarning;
+        delete variables.vmafPostEncodeCheckpoint;
+        delete variables.vmafPostEncodeCheckpointPath;
+        delete variables.vmafPostEncodeCheckpointManifestPath;
+        log('Retired exact authenticated checkpoint rejected by the post-encode size gate: ' +
+            record.checkpoint_key);
+        return { retired: true, retained: false, checkpointKey: record.checkpoint_key };
+    } catch (error) {
+        variables.vmafPostEncodeCheckpointRetired = false;
+        variables.vmafPostEncodeCheckpointStatus = 'retirement_failed_size_rejected';
+        variables.vmafPostEncodeCheckpointRetirementWarning =
+            'could not retire size-rejected checkpoint: ' + error.message;
+        log('WARNING: ' + variables.vmafPostEncodeCheckpointRetirementWarning +
+            '; preserving the original and retaining the authenticated artifact for cleanup.');
+        return {
+            retired: false,
+            retained: true,
+            checkpointKey: record.checkpoint_key,
+            reason: error.message,
+        };
+    }
+}
 
 function resolveExecutablePath(value, description) {
     var fs = require('fs');
@@ -849,6 +977,8 @@ function resolveExecutableIdentity(executable) {
 function buildPostEncodeContract(executable, argv, sourcePath, outputPath, pipelineTools) {
     var source = String(sourcePath);
     var output = String(outputPath);
+    var producerLog = pipelineTools && pipelineTools.producerLog
+        ? String(pipelineTools.producerLog) : null;
     var contract = {
         schema: pipelineTools ? 2 : 1,
         executable: String(executable),
@@ -857,6 +987,7 @@ function buildPostEncodeContract(executable, argv, sourcePath, outputPath, pipel
             var value = String(item);
             if (value === source) return '<SOURCE>';
             if (value === output) return '<OUTPUT>';
+            if (producerLog && value === producerLog) return '<PRODUCER_LOG>';
             return value;
         }),
     };
@@ -976,6 +1107,41 @@ function runDecodeValidation(ffmpegPath, filePath, offsetSeconds, durationSecond
     return { backend: 'software', stderr: String(softwareResult.stderr || '') };
 }
 
+function packetCountFromPrimaryVideo(probe) {
+    var streams = probe && Array.isArray(probe.streams) ? probe.streams : [];
+    var primary = streams.filter(function (stream) {
+        return stream && stream.codec_type === 'video' && !isAttachedPictureStream(stream);
+    })[0];
+    var count = Number(primary && primary.nb_read_packets);
+    return Number.isSafeInteger(count) && count > 0 ? count : null;
+}
+
+function measuredSourcePacketCount(ffprobePath, sourcePath, sourceProbe) {
+    var embeddedCount = packetCountFromPrimaryVideo(sourceProbe);
+    if (embeddedCount !== null) return embeddedCount;
+    if (!sourcePath) {
+        throw new Error('source packet coverage requires the original source path');
+    }
+    var spawnSync = require('child_process').spawnSync;
+    var result = spawnSync(String(ffprobePath || 'ffprobe'), [
+        '-v', 'error', '-count_packets', '-show_streams', '-of', 'json', String(sourcePath)
+    ], { encoding: 'utf8', timeout: 3600000, maxBuffer: 32 * 1024 * 1024 });
+    if (result.error) {
+        throw new Error('source packet-count validation failed: ' + result.error.message);
+    }
+    var parsed;
+    try { parsed = JSON.parse(result.stdout || '{}'); }
+    catch (error) {
+        throw new Error('source packet-count ffprobe returned invalid JSON: ' + error.message);
+    }
+    var measuredCount = packetCountFromPrimaryVideo(parsed);
+    if (result.status !== 0 || measuredCount === null) {
+        throw new Error('source packet-count validation did not produce a complete primary-video count' +
+            (String(result.stderr || '').trim() ? ': ' + String(result.stderr || '').trim() : ''));
+    }
+    return measuredCount;
+}
+
 function validatePostEncodeMedia(ffprobePath, ffmpegPath, filePath, sourceProbe, expectedGeometry, requireVideoOnly, validationOptions) {
     var fs = require('fs');
     var spawnSync = require('child_process').spawnSync;
@@ -1055,14 +1221,22 @@ function validatePostEncodeMedia(ffprobePath, ffmpegPath, filePath, sourceProbe,
                 Math.abs(sourceDuration - outputDuration).toFixed(3) + ' seconds');
         }
     }
-    var frameRate = parseFrameRate(primary.avg_frame_rate) || parseFrameRate(primary.r_frame_rate);
-    if (frameRate && outputDuration > 0) {
-        var expectedPackets = frameRate * outputDuration;
-        var packetTolerance = Math.max(2, Math.ceil(frameRate * 2));
-        if (expectedPackets >= 100 && packetCount + packetTolerance < expectedPackets) {
-            throw postEncodeCheckpoint.confirmedInvalidError(
-                'post-encode AV1 packet coverage is incomplete');
-        }
+    // Container duration multiplied by nominal frame rate is not a measured
+    // frame count. Sparse, VFR, or damaged-but-decodable Matroska sources can
+    // legitimately carry fewer packets (and stale NUMBER_OF_FRAMES tags).
+    // Compare two demuxed packet counts instead; inability to authenticate the
+    // source count is retryable and must not condemn a completed candidate.
+    var sourcePacketCount = measuredSourcePacketCount(
+        ffprobePath, validationOptions.sourcePath, sourceProbe);
+    var sourceFrameRate = parseFrameRate(
+        (sourceProbe && sourceProbe.streams && sourceProbe.streams[0] &&
+            (sourceProbe.streams[0].avg_frame_rate || sourceProbe.streams[0].r_frame_rate)) ||
+        primary.avg_frame_rate || primary.r_frame_rate);
+    var packetTolerance = Math.max(2, Math.ceil((sourceFrameRate || 24) * 2));
+    if (sourcePacketCount >= 100 && packetCount + packetTolerance < sourcePacketCount) {
+        throw postEncodeCheckpoint.confirmedInvalidError(
+            'post-encode AV1 packet coverage is incomplete: source=' +
+            sourcePacketCount + ', output=' + packetCount + ', tolerance=' + packetTolerance);
     }
     var decodeBackends = [];
     var decodeOffsets = [];
@@ -1094,6 +1268,9 @@ function validatePostEncodeMedia(ffprobePath, ffmpegPath, filePath, sourceProbe,
             pix_fmt: String(primary.pix_fmt || ''),
             avg_frame_rate: String(primary.avg_frame_rate || ''),
             packet_count: packetCount,
+            source_packet_count: sourcePacketCount,
+            packet_count_delta: packetCount - sourcePacketCount,
+            packet_tolerance: packetTolerance,
         },
         full_primary_video_decode: validationMode === 'exhaustive',
         decode_policy: validationMode === 'exhaustive'
@@ -1443,6 +1620,7 @@ function buildProtectedPostEncodePlan(options) {
             pipelineTools = {
                 producer: nvenccPath,
                 consumer: coordinatorFfmpegPath,
+                producerLog: producerLog,
                 pipeline: nvenccKnn.contractDescriptor(coordinatorOptions),
             };
         } else {
@@ -1458,6 +1636,7 @@ function buildProtectedPostEncodePlan(options) {
             options.ffprobePath, options.ffmpegPath, candidatePath, options.inputProbeData,
             expectedOutputGeometry, options.useMatroskaAncillaryBypass, {
                 mode: options.postEncodeValidationMode,
+                sourcePath: options.originalFile,
             });
     };
     var sourceFingerprint = grainArtifact.sampledSourceFingerprint(options.originalFile);
@@ -2038,17 +2217,22 @@ var plugin = async function (args) {
 
                     _a.trys.push([0, 2, , 3]);
 
-                    // WATCHDOG: hard wall-clock cap on the FINAL transcode so a pathologically slow encode
-                    // (e.g. NVDEC decode-fallback to CPU software decode -> a few fps -> 10+ hours) can't run
-                    // forever holding the GPU pipeline lock and blocking the queue. Cap = 2x the source
-                    // runtime, clamped to 30min..4h. On expiry Node SIGKILLs ffmpeg -> non-zero exit ->
-                    // failure path (outputNumber 2) -> the flow's Release GPU Pipeline Lock node frees the
-                    // lock and the job fails cleanly + re-queues, instead of wedging the whole node.
+                    // The final transcode watchdog is an absolute liveness
+                    // backstop, not a performance SLA. Prefer measured timing
+                    // from this title's selected sample set; otherwise allow a
+                    // deliberately slow 1/12-realtime encode. The 12h..72h
+                    // bounds avoid killing healthy long/slow titles while
+                    // still guaranteeing eventual release of a wedged job.
                     var _srcDur = parseFloat(args.inputFileObj && args.inputFileObj.ffProbeData
                         && args.inputFileObj.ffProbeData.format && args.inputFileObj.ffProbeData.format.duration) || 0;
-                    var _capMs = Math.round(Math.min(14400, Math.max(1800, _srcDur * 2.0)) * 1000);
-                    args.jobLog('Transcode watchdog: hard timeout ' + Math.round(_capMs / 60000) + ' min'
-                        + ' (source ' + Math.round(_srcDur) + 's x2, clamped 30min-4h) -> SIGKILL if exceeded');
+                    var _watchdog = finalTranscodeWatchdogPolicy(
+                        _srcDur, args.variables, bestParams && bestParams.id);
+                    var _capMs = _watchdog.timeoutMs;
+                    args.variables.vmafFinalTranscodeWatchdog = _watchdog;
+                    args.jobLog('Transcode watchdog: absolute liveness cap ' +
+                        (_watchdog.timeoutSeconds / 3600).toFixed(1) + 'h (' +
+                        _watchdog.basis + ', selected samples=' +
+                        _watchdog.matchingSampleCount + ', bounded 12h-72h) -> SIGKILL only if exceeded');
 
                     cli = postEncodePlan.reused ? {
                         runCli: function () { return Promise.resolve({ cliExitCode: 0, checkpointReused: true }); }
@@ -2124,9 +2308,8 @@ var plugin = async function (args) {
                     }
                     args.jobLog('Transcode completed successfully: ' + outputPath);
 
-                    // Record exact final size after muxing. Size is an efficiency/quality advisory,
-                    // never a technical failure: the user prefers the closest complete output over
-                    // throwing away a healthy title encode or retrying at another CQ.
+                    // Record exact final size after muxing and enforce the
+                    // original-preserving efficiency boundary before success.
                     try {
                         var fs = require('fs');
                         var outBytes = fs.statSync(outputPath).size;
@@ -2140,7 +2323,11 @@ var plugin = async function (args) {
                             var _fszMb = Number(args.inputFileObj && args.inputFileObj.file_size) || 0;
                             inBytes = _fszMb > 1024 * 1024 ? _fszMb : _fszMb * 1024 * 1024;
                         }
-                        var finalRatio = inBytes > 0 ? (outBytes / inBytes) * 100 : 0;
+                        var resolvedDeliveryPolicy = deliveryPolicy.resolve(args.variables);
+                        var finalSizeGate = evaluateFinalOutputSizeGate(
+                            outBytes, inBytes, resolvedDeliveryPolicy.maxFinalOutputRatioPct);
+                        var finalRatio = finalSizeGate.ratioPct;
+                        var _maxFinalRatio = finalSizeGate.capPct;
                         args.variables.vmafFinalOutputSizeMB = outBytes / (1024 * 1024);
                         args.variables.vmafFinalOutputRatioPct = finalRatio;
                         args.jobLog('Final output ratio after VMAF transcode: ' + finalRatio.toFixed(2) + '% of source');
@@ -2157,11 +2344,9 @@ var plugin = async function (args) {
                         // fails open when the projection is null (projections are only computed
                         // for candidates that were not already rejected), and film-grain
                         // synthesis measures its own input rather than the original source. An
-                        // output at or above the cap has no size benefit, so re-encoding is
-                        // all-cost-no-benefit and the source must be kept.
-                        var _maxFinalRatio = Number(args.variables.vmafMaxFinalOutputRatioPct);
-                        if (!isFinite(_maxFinalRatio) || _maxFinalRatio <= 0) _maxFinalRatio = 100;
-                        if (finalRatio >= _maxFinalRatio) {
+                        // output above the delivered cap misses the minimum reduction,
+                        // so the source must be kept. Equality is accepted.
+                        if (finalSizeGate.rejected) {
                             args.jobLog('ERROR: Final output is ' + finalRatio.toFixed(2)
                                 + '% of source (cap ' + _maxFinalRatio.toFixed(2)
                                 + '%); refusing the encode and preserving the original.');
@@ -2181,7 +2366,8 @@ var plugin = async function (args) {
                             args.variables.vmafFinalOutputSizeRejected = true;
                             args.variables.vmafTranscodeSucceeded = false;
                             args.variables.vmafTranscodeStatus = 'size_failed';
-                            args.variables.vmafTranscodeFailureReason = 'final_output_not_smaller_than_source';
+                            args.variables.vmafTranscodeFailureReason =
+                                'final_output_exceeds_minimum_reduction_cap';
                             args.variables.vmafTranscodeCompletedAt = new Date().toISOString();
                             args.variables.liveSizeCompare = args.variables.liveSizeCompare || {};
                             args.variables.liveSizeCompare.enabled = false;
@@ -2190,6 +2376,8 @@ var plugin = async function (args) {
                             args.variables.liveSizeCompare.advisoryOnly = false;
                             args.variables.liveSizeCompare.finalOutputRatioPct = finalRatio;
                             args.variables.liveSizeCompare.finalOutputSizeMB = outBytes / (1024 * 1024);
+                            retireRejectedPostEncodeCheckpoint(
+                                args.variables, postEncodeCheckpoint, args.jobLog);
                             return [2 /*return*/, {
                                 outputFileObj: args.inputFileObj,
                                 outputNumber: 2,
@@ -2304,6 +2492,9 @@ exports.recovery = {
     importRetainedCheckpoint: postEncodeCheckpoint.importRetained,
 };
 exports._test = {
+    finalTranscodeWatchdogPolicy: finalTranscodeWatchdogPolicy,
+    evaluateFinalOutputSizeGate: evaluateFinalOutputSizeGate,
+    retireRejectedPostEncodeCheckpoint: retireRejectedPostEncodeCheckpoint,
     parseHdrMasterDisplay: parseHdrMasterDisplay,
     parseHdrMaxCll: parseHdrMaxCll,
     buildHdrMkvProperties: buildHdrMkvProperties,
@@ -2336,6 +2527,7 @@ exports._test = {
     decodeValidationArgs: decodeValidationArgs,
     runDecodeValidation: runDecodeValidation,
     validatePostEncodeMedia: validatePostEncodeMedia,
+    measuredSourcePacketCount: measuredSourcePacketCount,
     postEncodeRoutineValidator: POSTENCODE_ROUTINE_VALIDATOR,
     postEncodeExhaustiveValidator: POSTENCODE_EXHAUSTIVE_VALIDATOR,
     importRetainedCheckpoint: postEncodeCheckpoint.importRetained,

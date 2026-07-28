@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const artifactLib = require('../../_lib/grainAnalysisArtifact.js');
 const nvenccKnn = require('../../_lib/nvenccKnn.js');
+const gpuPipelineLock = require('../../_lib/gpuPipelineLock.js');
 
 const details = () => ({
     name: 'Analyze Film Grain',
@@ -223,6 +224,69 @@ function sourcePathFromArgs(args) {
     );
 }
 
+async function withAnalysisGpuLease(
+    args, sourcePath, operation, lockOverride) {
+    if (typeof operation !== 'function') {
+        throw new Error('grain analysis GPU lease requires an operation');
+    }
+    const lock = lockOverride || gpuPipelineLock;
+    const lockDir = lock.resolveLockDir(
+        process.env.TDARR_GPU_PIPELINE_LOCK_DIR ||
+        '/temp/tdarr-vmaf-gpu-pipeline.lock');
+    const existing = args.variables &&
+        args.variables.vmafGpuPipelineLockAcquired === true &&
+        args.variables.vmafGpuPipelineLock;
+    const result = await lock.acquire({
+        lockDir,
+        owner: {
+            ownerId: `grain-analysis-${artifactLib.stableId(sourcePath)}`,
+            workerName: process.env.Tdarr_Node_Name ||
+                process.env.TDARR_NODE_NAME ||
+                process.env.nodeID ||
+                process.env.NODE_ID ||
+                process.env.HOSTNAME ||
+                'unknown-worker',
+            stage: 'grain-analysis-knn',
+            plugin: 'analyzeFilmGrain',
+        },
+        waitPollSeconds: 5,
+        waitLogSeconds: 60,
+        maxWaitSeconds: 43200,
+        staleHeartbeatSeconds: 7200,
+        maxLockAgeSeconds: 28800,
+        initializationGraceSeconds: 30,
+        heartbeatIntervalSeconds: 30,
+        existingToken: existing && existing.token || null,
+        log: (message) => args.jobLog(message),
+    });
+    const reentrant = result.reentrant === true;
+    let operationError = null;
+    try {
+        return await operation();
+    } catch (error) {
+        operationError = error;
+        throw error;
+    } finally {
+        if (!reentrant) {
+            const released = lock.release(
+                lockDir,
+                result.owner && result.owner.token,
+                {
+                    expectedGeneration:
+                        result.owner && result.owner.leaseGeneration,
+                },
+            );
+            if (!released || released.released !== true) {
+                const releaseError = new Error(
+                    'grain analysis GPU lease release failed: ' +
+                    String(released && released.reason || 'unknown reason'));
+                if (operationError) releaseError.cause = operationError;
+                throw releaseError;
+            }
+        }
+    }
+}
+
 function clearPublishedVariables(variables) {
     for (const key of artifactLib.ANALYSIS_UNAVAILABLE_FORBIDDEN_VARIABLES) delete variables[key];
 }
@@ -292,7 +356,7 @@ async function plugin(args) {
     clearPublishedVariables(args.variables);
 
     const mode = String(args.inputs.mode || 'active');
-    const sourcePath = sourcePathFromArgs(args);
+    let sourcePath = sourcePathFromArgs(args);
     args.jobLog(`=== Analyze Film Grain (${mode}) ===`);
     if (mode === 'disabled') {
         args.jobLog('Film-grain analysis is disabled; continuing normal VMAF processing.');
@@ -315,13 +379,16 @@ async function plugin(args) {
         return makeAnalysisUnavailableResult(args, 'source_path_allowlist_required');
     }
     try {
-        if (!artifactLib.ensurePathAllowed(sourcePath, regexText, args.inputs.sourcePathRegexFlags)) {
+        const canonicalSourcePath = artifactLib.resolveAllowlistedSourcePath(
+            sourcePath, regexText, args.inputs.sourcePathRegexFlags);
+        if (!canonicalSourcePath) {
             args.jobLog(`Original path is outside the mounted film-grain source scope: ${sourcePath}`);
             return makeResult(args, 2, 'ineligible', 'source_path_not_allowlisted');
         }
+        sourcePath = canonicalSourcePath;
     } catch (error) {
         return makeAnalysisUnavailableResult(args,
-            `invalid_source_path_regex: ${boundedAnalysisDiagnostic(error)}`);
+            `invalid_or_unsafe_source_scope: ${boundedAnalysisDiagnostic(error)}`);
     }
 
     const sourceProbe = args.inputFileObj && args.inputFileObj.ffProbeData;
@@ -394,10 +461,14 @@ async function plugin(args) {
             args.jobLog(`Dynamic HDR accepted provisionally from Check HDR Content: ${eligibility.dynamicEvidence.conversion}.`);
         }
         if (args.updateWorker) args.updateWorker({ CLIType: pythonPath, preset: pipelineArgs.join(' ') });
-        const pipelineResult = await runProcess(pythonPath, pipelineArgs, {
-            timeoutMs,
-            maxOutputBytes: 16 * 1024 * 1024,
-        });
+        const pipelineResult = await withAnalysisGpuLease(
+            args,
+            sourcePath,
+            () => runProcess(pythonPath, pipelineArgs, {
+                timeoutMs,
+                maxOutputBytes: 16 * 1024 * 1024,
+            }),
+        );
         if (pipelineResult.timedOut) throw new Error('grain analysis pipeline timed out');
         // Python writes progress to stdout and the decisive fail-closed reason
         // to stderr. Preserve stderr priority even when progress was emitted.
@@ -504,6 +575,7 @@ exports._test = {
     sourcePathFromArgs,
     clearPublishedVariables,
     boundedAnalysisDiagnostic,
+    withAnalysisGpuLease,
     ANALYSIS_DIAGNOSTIC_MAX_CHARS,
     makeAnalysisUnavailableResult,
     buildPipelineArgsForContract: buildFitPipelineArgs,

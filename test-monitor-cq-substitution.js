@@ -51,6 +51,12 @@ function makeVariables() {
           monitor._test.measurementParameterContractSha256(parameterSet),
       },
     },
+    vmafPostEncodeCheckpoint: {
+      checkpoint_key: 'a'.repeat(64),
+    },
+    vmafOriginalFile: 'C:/media/source.mkv',
+    vmafFinalOutputRatioPct: 75,
+    vmafFinalOutputSizeMB: 900,
   };
 }
 
@@ -109,6 +115,16 @@ assert.strictEqual(
 const Module = require('module');
 const originalLoad = Module._load;
 const upserts = [];
+let persistedJob = null;
+const dbMock = {
+  prepare() {
+    return {
+      get() {
+        return persistedJob && { ...persistedJob };
+      },
+    };
+  },
+};
 Module._load = function mockMonitorDependencies(request, parent, isMain) {
   if (request === '../../../../../methods/lib') {
     return () => ({
@@ -120,10 +136,11 @@ Module._load = function mockMonitorDependencies(request, parent, isMain) {
   if (request === '/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js') {
     return {
       openDb() {
-        return {};
+        return dbMock;
       },
       upsertJob(db, fields) {
         upserts.push({ ...fields });
+        persistedJob = { ...(persistedJob || {}), ...fields };
       },
       makeJobId() {
         return 'unexpected-derived-job-id';
@@ -158,18 +175,20 @@ try {
   assert.strictEqual(upserts[0].selected_vmaf_min, 95.339997);
   assert.strictEqual(upserts[0].selected_cambi, 1.75);
   assert.strictEqual(upserts[0].selected_size_mb, 1.266494);
+  assert.strictEqual(upserts[0].transcode_succeeded, null);
+  assert.strictEqual(upserts[0].outcome_stage, 'candidate_ready');
+  assert.strictEqual(upserts[0].size_target_status, 'pending_delivery');
+  assert.strictEqual(upserts[0].max_final_output_ratio_pct, 80);
   assert.strictEqual(variables.vmafPostEncodeCqSubstitution.requested_cq, 37.2);
-  assert.strictEqual(variables.vmafSizeFailureShadowOutcomeRecorded, true);
-  assert.strictEqual(variables.vmafSizeFailureShadowOutcomeExcluded, true);
-  assert.strictEqual(
-    variables.vmafSizeFailureShadowOutcome.action,
-    'excluded_no_requested_cq_to_physical_output_label_join'
-  );
+  assert.strictEqual(variables.vmafSizeFailureShadowOutcomeRecorded, undefined,
+    'pre-delivery candidate success must not publish a terminal shadow label');
+  assert.strictEqual(variables.vmafDeliveryOutcomePending.status, 'candidate_ready');
   assert.strictEqual(variables.vmafPostEncodeCqSubstitutionDbOutcome.recorded, true);
   assert.ok(logs.some((line) => line.includes(
     'using conservative retained checkpoint substitution'
   )));
-  assert.ok(logs.some((line) => line.includes('Size-failure shadow outcome excluded')));
+  assert.ok(!logs.some((line) => line.includes('Size-failure shadow outcome excluded')),
+    'shadow outcome must wait for delivered-file finalization');
   assert.ok(!logs.some((line) => line.includes('no retries needed')));
 } finally {
   Module._load = originalLoad;

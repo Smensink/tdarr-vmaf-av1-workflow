@@ -26,6 +26,16 @@ const MAX_MANIFEST_BYTES = 1024 * 1024;
 const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 const CONFIRMED_INVALID = 'confirmed_invalid';
 const RETRYABLE_VALIDATION = 'retryable_validation';
+const RETIREMENT_INVENTORY_SCHEMA =
+    'vmaf-postencode-retirement-inventory/v1';
+const RETIREMENT_INVENTORY_VERSION = 1;
+const RETIREMENT_FIXED_SIDE_FILES = Object.freeze([
+    'manifest.pending.json',
+    CANDIDATE_MANIFEST_NAME,
+    CANDIDATE_PENDING_MANIFEST_NAME,
+]);
+const RETIREMENT_QUARANTINE_SUFFIX =
+    /\.invalid-\d+-\d+-[0-9a-f]{12}$/;
 
 function checkpointError(message, disposition, cause) {
     const error = new Error(String(message));
@@ -286,7 +296,8 @@ function assertNvenccPipelineEncodeContract(contract) {
         'post-encode NVEncC coordinator argv');
     if (nvenccPath !== pipeline.nvencc_path || sourceToken !== '<SOURCE>' ||
         Number(outputDepth) !== Number(pipeline.output_depth) ||
-        !String(producerLog || '').trim() ||
+        producerLog !== '<PRODUCER_LOG>' ||
+        argv.filter((value) => value === '<PRODUCER_LOG>').length !== 1 ||
         !consumerArgv.includes('<OUTPUT>')) {
         throw new Error('post-encode checkpoint NVEncC coordinator argv is not bound to its pipeline');
     }
@@ -298,6 +309,8 @@ function assertNvenccPipelineEncodeContract(contract) {
 
     const syntheticSource = path.resolve(
         path.parse(process.cwd()).root, 'postencode-contract-source-token.mkv');
+    const syntheticProducerLog = path.resolve(
+        path.parse(process.cwd()).root, 'postencode-contract-producer-token.log');
     const expectedProducerArgv = nvenccKnn.buildProducerArgs({
         sourcePath: syntheticSource,
         outputDepth: Number(pipeline.output_depth),
@@ -310,10 +323,14 @@ function assertNvenccPipelineEncodeContract(contract) {
         nvenccPath: pipeline.nvencc_path,
         sourcePath: syntheticSource,
         outputDepth: Number(pipeline.output_depth),
-        producerLog,
+        producerLog: syntheticProducerLog,
         ffmpegPath,
         ffmpegArgs: consumerArgv,
-    }).map((value) => value === syntheticSource ? '<SOURCE>' : String(value));
+    }).map((value) => {
+        if (value === syntheticSource) return '<SOURCE>';
+        if (value === syntheticProducerLog) return '<PRODUCER_LOG>';
+        return String(value);
+    });
     if (canonicalJson(argv) !== canonicalJson(expectedCoordinatorArgv)) {
         throw new Error('post-encode checkpoint NVEncC coordinator argv mismatch');
     }
@@ -1288,10 +1305,14 @@ function materialize(plan, destination, allowedRoot) {
     return target;
 }
 
-function retire(record) {
+function retirementLocation(record) {
     if (!record || record.schema !== SCHEMA || record.contract_id !== CONTRACT_ID ||
         !/^[0-9a-f]{64}$/.test(String(record.checkpoint_key || ''))) {
-        throw new Error('refusing to retire an invalid post-encode checkpoint record');
+        throw new Error('invalid post-encode checkpoint record');
+    }
+    if (!path.isAbsolute(String(record.manifest_path || '')) ||
+        !path.isAbsolute(String(record.artifact_path || ''))) {
+        throw new Error('checkpoint record paths must be absolute');
     }
     const manifestPath = path.resolve(String(record.manifest_path || ''));
     const artifactPath = path.resolve(String(record.artifact_path || ''));
@@ -1302,26 +1323,55 @@ function retire(record) {
     if (path.basename(manifestPath) !== MANIFEST_NAME || path.dirname(artifactPath) !== entryDir ||
         path.basename(entryDir) !== key || path.basename(bucketDir) !== key.slice(0, 2) ||
         root === path.parse(root).root || !pathWithin(root, entryDir)) {
-        throw new Error('refusing to retire a checkpoint outside its keyed protected entry');
+        throw new Error('checkpoint record is outside its keyed protected entry');
     }
-    const manifest = readManifest(manifestPath);
-    if (manifest.schema !== SCHEMA || manifest.contract_id !== CONTRACT_ID ||
-        manifest.checkpoint_key !== key || !manifest.artifact ||
-        path.basename(artifactPath) !== manifest.artifact.relative_path) {
-        throw new Error('refusing to retire a checkpoint with mismatched committed identity');
+    const entryStat = fs.lstatSync(entryDir);
+    if (!entryStat.isDirectory() || entryStat.isSymbolicLink() ||
+        path.resolve(fs.realpathSync(entryDir)) !== entryDir) {
+        throw new Error(
+            'checkpoint record entry is not a canonical real directory');
     }
     const explicitReuseRequiredRoot = String(record.reuse_required_root || '');
     const reuseRequiredRoot = explicitReuseRequiredRoot
         ? path.resolve(explicitReuseRequiredRoot)
         : path.join(root, REUSE_REQUIRED_DIRECTORY);
     if (!reuseRequiredRoot || reuseRequiredRoot === path.parse(reuseRequiredRoot).root) {
-        throw new Error('refusing to retire a checkpoint with an unsafe reuse-required root');
+        throw new Error('checkpoint record has an unsafe reuse-required root');
+    }
+    return {
+        key,
+        manifestPath,
+        artifactPath,
+        entryDir,
+        bucketDir,
+        root,
+        reuseRequiredRoot,
+        requireInitializedReuseRequiredRoot:
+            Boolean(explicitReuseRequiredRoot),
+    };
+}
+
+function authenticateRecord(record) {
+    const located = retirementLocation(record);
+    const key = located.key;
+    const manifestPath = located.manifestPath;
+    const artifactPath = located.artifactPath;
+    const entryDir = located.entryDir;
+    const bucketDir = located.bucketDir;
+    const root = located.root;
+    const reuseRequiredRoot = located.reuseRequiredRoot;
+    const manifest = readManifest(manifestPath);
+    if (manifest.schema !== SCHEMA || manifest.contract_id !== CONTRACT_ID ||
+        manifest.checkpoint_key !== key || !manifest.artifact ||
+        path.basename(artifactPath) !== manifest.artifact.relative_path) {
+        throw new Error('checkpoint record has mismatched committed identity');
     }
     const retirementPlan = {
         schema: SCHEMA,
         checkpointRoot: root,
         reuseRequiredRoot,
-        requireInitializedReuseRequiredRoot: Boolean(explicitReuseRequiredRoot),
+        requireInitializedReuseRequiredRoot:
+            located.requireInitializedReuseRequiredRoot,
         checkpointKey: key,
         sourceFingerprint: manifest.source_fingerprint,
         encodeContractSha256: manifest.encode_contract_sha256,
@@ -1330,64 +1380,401 @@ function retire(record) {
     if (reuseMarker.required &&
         (Number(reuseMarker.marker.artifact.size_bytes) !== Number(manifest.artifact.size_bytes) ||
         reuseMarker.marker.artifact.sha256_full !== manifest.artifact.sha256_full)) {
-        throw new Error('refusing to retire a checkpoint whose reuse-required marker protects different bytes');
+        throw new Error('checkpoint reuse-required marker protects different bytes');
     }
-    fs.unlinkSync(manifestPath);
-    fs.unlinkSync(artifactPath);
-    try { fs.unlinkSync(path.join(entryDir, 'manifest.pending.json')); } catch (error) {
-        if (!error || error.code !== 'ENOENT') throw error;
+    const artifactStat = regularFileStat(artifactPath, 'checkpoint retirement artifact');
+    if (artifactStat.size !== Number(manifest.artifact.size_bytes) ||
+        sha256FileSync(artifactPath) !== manifest.artifact.sha256_full) {
+        throw new Error('checkpoint bytes do not match the committed manifest');
     }
-    try { fs.unlinkSync(path.join(entryDir, CANDIDATE_MANIFEST_NAME)); } catch (error) {
-        if (!error || error.code !== 'ENOENT') throw error;
+    return {
+        key,
+        manifestPath,
+        artifactPath,
+        entryDir,
+        bucketDir,
+        root,
+        manifest,
+        reuseRequiredRoot,
+        retirementPlan,
+        reuseMarker,
+        artifact: {
+            size_bytes: artifactStat.size,
+            sha256_full: manifest.artifact.sha256_full,
+        },
+    };
+}
+
+function retirementFileProof(root, filePath, relativeName, description) {
+    if (!relativeName || path.isAbsolute(relativeName) ||
+        path.normalize(relativeName) !== relativeName ||
+        relativeName === '..' ||
+        relativeName.startsWith(`..${path.sep}`)) {
+        throw new Error(`${description} relative name is unsafe`);
     }
-    try { fs.unlinkSync(path.join(entryDir, CANDIDATE_PENDING_MANIFEST_NAME)); } catch (error) {
-        if (!error || error.code !== 'ENOENT') throw error;
+    const resolved = path.resolve(root, relativeName);
+    if (!pathWithin(root, resolved)) {
+        throw new Error(`${description} escaped its protected root`);
     }
-    // Confirmed-invalid generations are moved aside for diagnosis while a retry
-    // is still in progress. Once the authenticated replacement has succeeded,
-    // retire only those exact helper-generated quarantine files so multi-GB stale
-    // title encodes cannot accumulate indefinitely. Unrelated/lookalike files,
-    // directories, and symlinks remain untouched.
-    const quarantineSuffix = /\.invalid-\d+-\d+-[0-9a-f]{12}$/;
-    for (const name of fs.readdirSync(entryDir)) {
-        if (path.basename(name) !== name || !quarantineSuffix.test(name)) continue;
-        const quarantinedPath = path.resolve(entryDir, name);
-        if (!pathWithin(entryDir, quarantinedPath)) continue;
-        const quarantineStat = fs.lstatSync(quarantinedPath);
-        if (quarantineStat.isFile() && !quarantineStat.isSymbolicLink()) {
-            fs.unlinkSync(quarantinedPath);
+    const stat = regularFileStat(resolved, description);
+    if (path.resolve(fs.realpathSync(resolved)) !== resolved) {
+        throw new Error(`${description} contains a symlinked path component`);
+    }
+    return {
+        relative_name: relativeName,
+        size_bytes: stat.size,
+        sha256_full: sha256FileSync(resolved),
+    };
+}
+
+function retirementInventory(authenticated) {
+    if (!authenticated || !authenticated.manifest ||
+        !authenticated.reuseMarker) {
+        throw new Error(
+            'checkpoint retirement inventory requires authenticated bytes');
+    }
+    const sideFiles = [];
+    const fixed = new Set(RETIREMENT_FIXED_SIDE_FILES);
+    for (const name of fs.readdirSync(authenticated.entryDir).sort()) {
+        if (path.basename(name) !== name ||
+            (!fixed.has(name) && !RETIREMENT_QUARANTINE_SUFFIX.test(name))) {
+            continue;
+        }
+        sideFiles.push(retirementFileProof(
+            authenticated.entryDir,
+            path.join(authenticated.entryDir, name),
+            name,
+            `checkpoint retirement side file ${name}`));
+    }
+    let reuseMarker = null;
+    if (authenticated.reuseMarker.required) {
+        const markerLocation = authenticated.reuseMarker.location;
+        const relativeName = path.relative(
+            markerLocation.markerRoot, markerLocation.markerPath);
+        reuseMarker = Object.assign({
+            marker_root: markerLocation.markerRoot,
+        }, retirementFileProof(
+            markerLocation.markerRoot,
+            markerLocation.markerPath,
+            relativeName,
+            'checkpoint retirement reuse marker'));
+    }
+    const inventory = {
+        schema: RETIREMENT_INVENTORY_SCHEMA,
+        version: RETIREMENT_INVENTORY_VERSION,
+        checkpoint_key: authenticated.key,
+        artifact: retirementFileProof(
+            authenticated.entryDir,
+            authenticated.artifactPath,
+            path.basename(authenticated.artifactPath),
+            'checkpoint retirement artifact'),
+        manifest: retirementFileProof(
+            authenticated.entryDir,
+            authenticated.manifestPath,
+            MANIFEST_NAME,
+            'checkpoint retirement manifest'),
+        side_files: sideFiles,
+        reuse_marker: reuseMarker,
+    };
+    validateRetirementInventory(
+        authenticated, inventory, { requireAllFiles: true });
+    return inventory;
+}
+
+function assertRetirementProof(proof, label) {
+    if (!exactObjectFields(proof,
+        ['relative_name', 'size_bytes', 'sha256_full'], [])) {
+        throw new Error(`${label} has unsupported fields`);
+    }
+    const relativeName = String(proof.relative_name || '');
+    if (!relativeName || path.isAbsolute(relativeName) ||
+        path.normalize(relativeName) !== relativeName ||
+        relativeName === '..' ||
+        relativeName.startsWith(`..${path.sep}`) ||
+        !Number.isSafeInteger(Number(proof.size_bytes)) ||
+        Number(proof.size_bytes) <= 0 ||
+        !/^[0-9a-f]{64}$/.test(String(proof.sha256_full || ''))) {
+        throw new Error(`${label} identity is invalid`);
+    }
+    return proof;
+}
+
+function inspectRetirementProof(root, proof, label, requirePresent) {
+    const normalizedProof = proof && proof.marker_root !== undefined ? {
+        relative_name: proof.relative_name,
+        size_bytes: proof.size_bytes,
+        sha256_full: proof.sha256_full,
+    } : proof;
+    assertRetirementProof(normalizedProof, label);
+    const filePath = path.resolve(root, proof.relative_name);
+    if (!pathWithin(root, filePath)) {
+        throw new Error(`${label} escaped its protected root`);
+    }
+    let stat;
+    try {
+        stat = fs.lstatSync(filePath, { bigint: true });
+    } catch (error) {
+        if (error && error.code === 'ENOENT' && !requirePresent) {
+            return { exists: false, path: filePath };
+        }
+        throw error;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() ||
+        Number(stat.size) !== Number(proof.size_bytes) ||
+        path.resolve(fs.realpathSync(filePath)) !== filePath ||
+        sha256FileSync(filePath) !== proof.sha256_full) {
+        throw new Error(`${label} differs from its retirement inventory`);
+    }
+    return {
+        exists: true,
+        path: filePath,
+        dev: String(stat.dev),
+        ino: String(stat.ino),
+    };
+}
+
+function validateRetirementInventory(authenticatedOrLocation, inventory,
+    options) {
+    const locationValue = authenticatedOrLocation &&
+        authenticatedOrLocation.entryDir
+        ? authenticatedOrLocation
+        : retirementLocation(authenticatedOrLocation);
+    if (!exactObjectFields(inventory, [
+        'schema', 'version', 'checkpoint_key', 'artifact', 'manifest',
+        'side_files', 'reuse_marker',
+    ], []) ||
+        inventory.schema !== RETIREMENT_INVENTORY_SCHEMA ||
+        inventory.version !== RETIREMENT_INVENTORY_VERSION ||
+        inventory.checkpoint_key !== locationValue.key ||
+        !Array.isArray(inventory.side_files)) {
+        throw new Error('checkpoint retirement inventory schema is invalid');
+    }
+    assertRetirementProof(inventory.artifact,
+        'checkpoint retirement artifact proof');
+    assertRetirementProof(inventory.manifest,
+        'checkpoint retirement manifest proof');
+    if (inventory.artifact.relative_name !==
+            path.basename(locationValue.artifactPath) ||
+        inventory.manifest.relative_name !== MANIFEST_NAME) {
+        throw new Error(
+            'checkpoint retirement fixed artifact/manifest names differ');
+    }
+    const sideNames = new Set();
+    const fixed = new Set(RETIREMENT_FIXED_SIDE_FILES);
+    for (const proof of inventory.side_files) {
+        assertRetirementProof(proof,
+            'checkpoint retirement side-file proof');
+        const name = proof.relative_name;
+        if (path.basename(name) !== name ||
+            (!fixed.has(name) && !RETIREMENT_QUARANTINE_SUFFIX.test(name)) ||
+            sideNames.has(name)) {
+            throw new Error(
+                'checkpoint retirement side-file inventory is unsafe');
+        }
+        sideNames.add(name);
+    }
+    for (const name of fs.readdirSync(locationValue.entryDir)) {
+        if ((fixed.has(name) || RETIREMENT_QUARANTINE_SUFFIX.test(name)) &&
+            !sideNames.has(name)) {
+            throw new Error(
+                `unenumerated checkpoint retirement side file appeared: ${name}`);
         }
     }
-    fsyncDirectory(entryDir);
-    if (reuseMarker.required) {
-        fs.unlinkSync(reuseMarker.location.markerPath);
-        fsyncDirectory(reuseMarker.location.bucketDir);
-        let removedMarkerBucket = false;
+    if (inventory.reuse_marker !== null) {
+        if (!exactObjectFields(inventory.reuse_marker, [
+            'marker_root', 'relative_name', 'size_bytes', 'sha256_full',
+        ], []) ||
+            path.resolve(String(inventory.reuse_marker.marker_root || '')) !==
+                path.resolve(locationValue.reuseRequiredRoot)) {
+            throw new Error(
+                'checkpoint retirement reuse-marker root is invalid');
+        }
+        assertRetirementProof({
+            relative_name: inventory.reuse_marker.relative_name,
+            size_bytes: inventory.reuse_marker.size_bytes,
+            sha256_full: inventory.reuse_marker.sha256_full,
+        }, 'checkpoint retirement reuse-marker proof');
+    }
+    const requireAll = options && options.requireAllFiles === true;
+    inspectRetirementProof(
+        locationValue.entryDir, inventory.artifact,
+        'checkpoint retirement artifact', requireAll);
+    inspectRetirementProof(
+        locationValue.entryDir, inventory.manifest,
+        'checkpoint retirement manifest', requireAll);
+    for (const proof of inventory.side_files) {
+        inspectRetirementProof(
+            locationValue.entryDir, proof,
+            `checkpoint retirement side file ${proof.relative_name}`,
+            requireAll);
+    }
+    if (inventory.reuse_marker !== null) {
+        inspectRetirementProof(
+            inventory.reuse_marker.marker_root,
+            inventory.reuse_marker,
+            'checkpoint retirement reuse marker', requireAll);
+    }
+    return locationValue;
+}
+
+function retireInventory(record, inventory, options) {
+    const located = retirementLocation(record);
+    validateRetirementInventory(located, inventory);
+    const callback = options && options.afterFile;
+    const removeProof = (root, proof, kind) => {
+        const inspected = inspectRetirementProof(
+            root, proof, `checkpoint retirement ${kind}`, false);
+        if (!inspected.exists) return false;
+        const current = fs.lstatSync(inspected.path, { bigint: true });
+        if (!current.isFile() || current.isSymbolicLink() ||
+            String(current.dev) !== inspected.dev ||
+            String(current.ino) !== inspected.ino) {
+            throw new Error(
+                `checkpoint retirement ${kind} identity changed before unlink`);
+        }
+        fs.unlinkSync(inspected.path);
+        fsyncDirectory(path.dirname(inspected.path));
+        if (typeof callback === 'function') {
+            callback(kind, proof.relative_name);
+        }
+        return true;
+    };
+    const removed = [];
+    if (removeProof(located.entryDir, inventory.artifact, 'artifact')) {
+        removed.push(inventory.artifact.relative_name);
+    }
+    if (removeProof(located.entryDir, inventory.manifest, 'manifest')) {
+        removed.push(inventory.manifest.relative_name);
+    }
+    for (const proof of inventory.side_files) {
+        if (removeProof(located.entryDir, proof, 'side_file')) {
+            removed.push(proof.relative_name);
+        }
+    }
+    if (inventory.reuse_marker !== null &&
+        removeProof(
+            inventory.reuse_marker.marker_root,
+            inventory.reuse_marker, 'reuse_marker')) {
+        removed.push(inventory.reuse_marker.relative_name);
+        const markerBucket = path.dirname(path.resolve(
+            inventory.reuse_marker.marker_root,
+            inventory.reuse_marker.relative_name));
         try {
-            fs.rmdirSync(reuseMarker.location.bucketDir);
-            removedMarkerBucket = true;
+            fs.rmdirSync(markerBucket);
+            fsyncDirectory(inventory.reuse_marker.marker_root);
         } catch (error) {
-            if (!error || (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST')) throw error;
+            if (!error ||
+                (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST')) {
+                throw error;
+            }
         }
-        if (removedMarkerBucket) fsyncDirectory(reuseMarker.location.markerRoot);
     }
-    let removedEntry = false;
+    validateRetirementInventory(located, inventory);
+    return {
+        retired: true,
+        checkpointKey: located.key,
+        removed,
+        entryRetained: true,
+    };
+}
+
+function retire(record, inventory, options) {
+    if (inventory) {
+        return retireInventory(record, inventory, options);
+    }
+    const authenticated = authenticateRecord(record);
+    const boundaryNames = [
+        'delivery-transaction-v1.json',
+        'delivery-retirement-v1.json',
+    ];
+    const boundaryLockPath = path.join(
+        authenticated.entryDir, 'delivery-transaction-v1.lock');
+    const lockHandle = fs.openSync(boundaryLockPath, 'wx', 0o600);
+    let lockIdentity;
+    let operationError = null;
+    let result;
     try {
-        fs.rmdirSync(entryDir);
-        removedEntry = true;
+        fs.writeFileSync(lockHandle, `${JSON.stringify({
+            schema: 'vmaf-delivery-transaction-lock/v1',
+            pid: process.pid,
+            token: crypto.randomBytes(16).toString('hex'),
+            created_at: new Date().toISOString(),
+        }, null, 2)}\n`, 'utf8');
+        fs.fsyncSync(lockHandle);
+        fs.closeSync(lockHandle);
+        const lockStat =
+            fs.lstatSync(boundaryLockPath, { bigint: true });
+        lockIdentity = {
+            dev: String(lockStat.dev),
+            ino: String(lockStat.ino),
+        };
+        fsyncDirectory(authenticated.entryDir);
+        for (const boundaryName of boundaryNames) {
+            if (fs.existsSync(path.join(
+                authenticated.entryDir, boundaryName))) {
+                throw new Error(
+                    'checkpoint has entered the delivery transaction boundary; ' +
+                    'a permanent retirement tombstone is required');
+            }
+        }
+        const preDeliveryInventory =
+            retirementInventory(authenticated);
+        result = retireInventory(
+            record, preDeliveryInventory, options);
     } catch (error) {
-        if (!error || (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST')) throw error;
+        operationError = error;
+        throw error;
+    } finally {
+        if (lockIdentity) {
+            try {
+                const lockStat =
+                    fs.lstatSync(boundaryLockPath, { bigint: true });
+                if (!lockStat.isFile() || lockStat.isSymbolicLink() ||
+                    String(lockStat.dev) !== lockIdentity.dev ||
+                    String(lockStat.ino) !== lockIdentity.ino) {
+                    throw new Error(
+                        'pre-delivery retirement lock identity changed');
+                }
+                fs.unlinkSync(boundaryLockPath);
+                fsyncDirectory(authenticated.entryDir);
+            } catch (releaseError) {
+                if (!operationError) throw releaseError;
+                operationError.lockReleaseError = releaseError;
+            }
+        } else {
+            try { fs.closeSync(lockHandle); } catch (_) {}
+        }
     }
-    if (removedEntry) fsyncDirectory(bucketDir);
-    let removedBucket = false;
+    // The encode stage may discard a size-rejected checkpoint before a
+    // delivery transaction exists. Keep this compatibility path narrowly
+    // pre-delivery; once a journal exists only tombstone-authorized retirement
+    // above is permitted.
     try {
-        fs.rmdirSync(bucketDir);
-        removedBucket = true;
+        fs.rmdirSync(authenticated.entryDir);
+        fsyncDirectory(authenticated.bucketDir);
     } catch (error) {
-        if (!error || (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST')) throw error;
+        if (!error ||
+            (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST')) {
+            throw error;
+        }
     }
-    if (removedBucket) fsyncDirectory(root);
-    return { retired: true, checkpointKey: key };
+    try {
+        fs.rmdirSync(authenticated.bucketDir);
+        fsyncDirectory(authenticated.root);
+    } catch (error) {
+        if (!error ||
+            (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST' &&
+                error.code !== 'ENOENT')) {
+            throw error;
+        }
+    }
+    if (fs.existsSync(authenticated.entryDir) &&
+        fs.readdirSync(authenticated.entryDir).some((name) =>
+            boundaryNames.includes(name))) {
+        throw new Error(
+            'delivery authority appeared during pre-delivery retirement');
+    }
+    return result;
 }
 
 module.exports = {
@@ -1425,5 +1812,12 @@ module.exports = {
     importRetained,
     abandon,
     materialize,
+    retirementLocation,
+    authenticateRecord,
+    RETIREMENT_INVENTORY_SCHEMA,
+    RETIREMENT_INVENTORY_VERSION,
+    retirementInventory,
+    validateRetirementInventory,
+    retireInventory,
     retire,
 };

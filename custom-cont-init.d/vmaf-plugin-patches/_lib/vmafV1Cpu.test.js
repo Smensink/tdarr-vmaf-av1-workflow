@@ -13,6 +13,7 @@ const {
   buildMetricIdentity,
   parseOutput,
   selectModel,
+  validateGeometry,
 } = require('./vmafV1Cpu');
 
 function baseOptions(overrides = {}) {
@@ -42,15 +43,22 @@ function baseOptions(overrides = {}) {
 
 function makeOutput(command, overrides = {}) {
   const candidateAlias = command.model.cambiAlias;
+  const vmafAlias = command.model.vmafAlias;
+  const distortedAlias = command.metricIdentity.contentClass === 'hdr-pq-provisional'
+    ? 'cambi_ceot_pq' : 'cambi';
   const frames = overrides.frames || Array.from(
     { length: command.expectedMeasuredFrames },
     (_, index) => ({
       frameNum: index * command.metricIdentity.subsample,
       metrics: {
         [candidateAlias]: 3 + index,
-        vmaf: 95 + index,
+        [vmafAlias]: 95 + index,
         ...(command.fullReferenceCambi
-          ? { cambi_source: 1 + index, cambi_full_reference: 2 + index }
+          ? {
+            [distortedAlias]: 30 + index,
+            cambi_source: 1 + index,
+            cambi_full_reference: 2 + index,
+          }
           : {}),
       },
     }),
@@ -67,7 +75,7 @@ function makeOutput(command, overrides = {}) {
         mean: 4,
         harmonic_mean: 3.829787,
       },
-      vmaf: {
+      [vmafAlias]: {
         min: 95,
         max: 97,
         mean: 96,
@@ -75,6 +83,12 @@ function makeOutput(command, overrides = {}) {
       },
       ...(command.fullReferenceCambi
         ? {
+          [distortedAlias]: {
+            min: 30,
+            max: 32,
+            mean: 31,
+            harmonic_mean: 30.97848716169327,
+          },
           cambi_source: { min: 1, max: 3, mean: 2, harmonic_mean: 1.636364 },
           cambi_full_reference: { min: 2, max: 4, mean: 3, harmonic_mean: 2.769231 },
         }
@@ -122,7 +136,7 @@ test('builds native 10-bit raw argv and immutable execution metadata', () => {
     '--height', '1080',
     '--pixel_format', '420',
     '--bitdepth', '10',
-    '--model', 'version=vmaf_v1.0.16_3d0h',
+    '--model', 'version=vmaf_v1.0.16_3d0h:name=vmaf_v1.0.16_3d0h',
     '--output', '/work/result.json',
     '--json',
     '--subsample', '2',
@@ -188,6 +202,15 @@ test('requires explicit opt-in and labels HDR as provisional, not SDR-validated'
   assert.equal(command.metricIdentity.contentClass, 'hdr-pq-provisional');
   assert.match(command.args[command.args.indexOf('--model') + 1],
     /cambi\.cambi_eotf=pq/);
+  const parsed = parseOutput(makeOutput(command), command);
+  assert.equal(parsed.aliases.cambiDistorted, 'cambi_ceot_pq');
+  assert.equal(parsed.cambiDistorted, 30.97848716169327);
+  const wrongStandalone = makeOutput(command);
+  wrongStandalone.pooled_metrics.cambi =
+    wrongStandalone.pooled_metrics.cambi_ceot_pq;
+  delete wrongStandalone.pooled_metrics.cambi_ceot_pq;
+  assert.throws(() => parseOutput(wrongStandalone, command),
+    /unexpected full-reference distorted CAMBI metric aliases.*expected cambi_ceot_pq/);
 });
 
 test('metric identity is deterministic, complete, immutable, and contract-sensitive', () => {
@@ -232,7 +255,7 @@ test('metric identity is deterministic, complete, immutable, and contract-sensit
   }), /backend/);
 });
 
-test('parses model-qualified CAMBI plus source/full-reference aliases', () => {
+test('parses model-qualified CAMBI plus exact distorted/source/full-reference aliases', () => {
   const command = buildCommand(baseOptions());
   const parsed = parseOutput(JSON.stringify(makeOutput(command)), command);
 
@@ -240,13 +263,17 @@ test('parses model-qualified CAMBI plus source/full-reference aliases', () => {
   assert.equal(parsed.expectedFrameCount, 3);
   assert.equal(parsed.vmaf, 95.993055);
   assert.equal(parsed.cambi, 3.829787);
+  assert.equal(parsed.cambiDistorted, 30.97848716169327);
   assert.equal(parsed.cambiSource, 1.636364);
   assert.equal(parsed.cambiFullReference, 2.769231);
+  assert.equal(parsed.aliases.vmaf, command.model.vmafAlias);
   assert.equal(parsed.aliases.cambi, command.model.cambiAlias);
+  assert.equal(parsed.aliases.cambiDistorted, 'cambi');
   assert.deepEqual(parsed.frames[0], {
     frameNum: 0,
     vmaf: 95,
     cambi: 3,
+    cambiDistorted: 30,
     cambiSource: 1,
     cambiFullReference: 2,
   });
@@ -255,25 +282,110 @@ test('parses model-qualified CAMBI plus source/full-reference aliases', () => {
   assert.ok(Object.isFrozen(parsed.frames));
 });
 
-test('accepts plain CAMBI and emitted full_ref/source alias variants', () => {
+test('requires the exact VMAF and CAMBI metric aliases from the pinned contract', () => {
   const command = buildCommand(baseOptions());
-  const output = makeOutput(command);
-  const oldAlias = command.model.cambiAlias;
-  const rename = (metrics) => {
-    metrics.cambi = metrics[oldAlias];
-    delete metrics[oldAlias];
-    metrics.cambi_source_hrs_1080 = metrics.cambi_source;
-    delete metrics.cambi_source;
-    metrics.cambi_full_reference_hrs_1080 = metrics.cambi_full_reference;
-    delete metrics.cambi_full_reference;
-  };
-  output.frames.forEach((frame) => rename(frame.metrics));
-  rename(output.pooled_metrics);
 
-  const parsed = parseOutput(output, command);
-  assert.equal(parsed.aliases.cambi, 'cambi');
-  assert.equal(parsed.aliases.cambiSource, 'cambi_source_hrs_1080');
-  assert.equal(parsed.aliases.cambiFullReference, 'cambi_full_reference_hrs_1080');
+  const renameCandidate = (output, alias) => {
+    for (const frame of output.frames) {
+      frame.metrics[alias] = frame.metrics[command.model.cambiAlias];
+      delete frame.metrics[command.model.cambiAlias];
+    }
+    output.pooled_metrics[alias] = output.pooled_metrics[command.model.cambiAlias];
+    delete output.pooled_metrics[command.model.cambiAlias];
+  };
+
+  const unexpectedQualified = makeOutput(command);
+  renameCandidate(unexpectedQualified, 'cambi_other_model');
+  assert.throws(() => parseOutput(unexpectedQualified, command),
+    /unexpected candidate CAMBI metric aliases.*expected cambi_hrs_1080_cmxv_17_vlt_0\.06/);
+
+  const unexpectedBare = makeOutput(command);
+  renameCandidate(unexpectedBare, 'cambi');
+  assert.throws(() => parseOutput(unexpectedBare, command),
+    /unexpected candidate CAMBI metric aliases.*expected cambi_hrs_1080_cmxv_17_vlt_0\.06/);
+
+  const missingFullReferenceDistorted = makeOutput(command);
+  delete missingFullReferenceDistorted.pooled_metrics.cambi;
+  assert.throws(() => parseOutput(missingFullReferenceDistorted, command),
+    /missing exact full-reference distorted CAMBI metric cambi/);
+
+  const missingFrameFullReferenceDistorted = makeOutput(command);
+  delete missingFrameFullReferenceDistorted.frames[0].metrics.cambi;
+  assert.throws(() => parseOutput(missingFrameFullReferenceDistorted, command),
+    /frame 0 metrics is missing exact full-reference distorted CAMBI metric cambi/);
+
+  const unexpectedSource = makeOutput(command);
+  for (const frame of unexpectedSource.frames) {
+    frame.metrics.cambi_source_hrs_1080 = frame.metrics.cambi_source;
+    delete frame.metrics.cambi_source;
+  }
+  unexpectedSource.pooled_metrics.cambi_source_hrs_1080 =
+    unexpectedSource.pooled_metrics.cambi_source;
+  delete unexpectedSource.pooled_metrics.cambi_source;
+  assert.throws(() => parseOutput(unexpectedSource, command),
+    /unexpected source CAMBI metric aliases.*expected cambi_source/);
+
+  const unexpectedFullReference = makeOutput(command);
+  for (const frame of unexpectedFullReference.frames) {
+    frame.metrics.cambi_full_reference_hrs_1080 =
+      frame.metrics.cambi_full_reference;
+    delete frame.metrics.cambi_full_reference;
+  }
+  unexpectedFullReference.pooled_metrics.cambi_full_reference_hrs_1080 =
+    unexpectedFullReference.pooled_metrics.cambi_full_reference;
+  delete unexpectedFullReference.pooled_metrics.cambi_full_reference;
+  assert.throws(() => parseOutput(unexpectedFullReference, command),
+    /unexpected full-reference CAMBI metric aliases.*expected cambi_full_reference/);
+
+  const unexpectedBareVmaf = makeOutput(command);
+  for (const frame of unexpectedBareVmaf.frames) {
+    frame.metrics.vmaf = frame.metrics[command.model.vmafAlias];
+    delete frame.metrics[command.model.vmafAlias];
+  }
+  unexpectedBareVmaf.pooled_metrics.vmaf =
+    unexpectedBareVmaf.pooled_metrics[command.model.vmafAlias];
+  delete unexpectedBareVmaf.pooled_metrics[command.model.vmafAlias];
+  assert.throws(() => parseOutput(unexpectedBareVmaf, command),
+    /unexpected VMAF metric aliases.*expected vmaf_v1\.0\.16_3d0h/);
+
+  const unexpectedQualifiedVmaf = makeOutput(command);
+  for (const frame of unexpectedQualifiedVmaf.frames) {
+    frame.metrics.vmaf_other_model = frame.metrics[command.model.vmafAlias];
+    delete frame.metrics[command.model.vmafAlias];
+  }
+  unexpectedQualifiedVmaf.pooled_metrics.vmaf_other_model =
+    unexpectedQualifiedVmaf.pooled_metrics[command.model.vmafAlias];
+  delete unexpectedQualifiedVmaf.pooled_metrics[command.model.vmafAlias];
+  assert.throws(() => parseOutput(unexpectedQualifiedVmaf, command),
+    /unexpected VMAF metric aliases.*expected vmaf_v1\.0\.16_3d0h/);
+
+  const duplicateVmaf = makeOutput(command);
+  duplicateVmaf.frames[0].metrics.vmaf = 99;
+  duplicateVmaf.pooled_metrics.vmaf = { harmonic_mean: 99 };
+  assert.throws(() => parseOutput(duplicateVmaf, command),
+    /unexpected VMAF metric aliases/);
+
+  const frameOnlyWrongVmaf = makeOutput(command);
+  frameOnlyWrongVmaf.frames[0].metrics.vmaf_other_model =
+    frameOnlyWrongVmaf.frames[0].metrics[command.model.vmafAlias];
+  delete frameOnlyWrongVmaf.frames[0].metrics[command.model.vmafAlias];
+  assert.throws(() => parseOutput(frameOnlyWrongVmaf, command),
+    /frame 0 metrics has unexpected VMAF metric aliases/);
+
+  const noFullReferenceCommand = buildCommand(baseOptions({
+    fullReferenceCambi: false,
+  }));
+  const noFullReferenceOutput = makeOutput(noFullReferenceCommand);
+  assert.equal(parseOutput(noFullReferenceOutput, noFullReferenceCommand).cambi, 3.829787);
+  const unexpectedFullReferenceDistorted = makeOutput(noFullReferenceCommand);
+  unexpectedFullReferenceDistorted.frames[0].metrics.cambi = 30;
+  unexpectedFullReferenceDistorted.pooled_metrics.cambi = { harmonic_mean: 30 };
+  assert.throws(() => parseOutput(unexpectedFullReferenceDistorted, noFullReferenceCommand),
+    /unexpected full-reference distorted CAMBI metric aliases.*expected none/);
+  noFullReferenceOutput.frames[0].metrics.cambi_source = 1;
+  noFullReferenceOutput.pooled_metrics.cambi_source = { harmonic_mean: 1 };
+  assert.throws(() => parseOutput(noFullReferenceOutput, noFullReferenceCommand),
+    /unexpected source CAMBI metric aliases.*expected none/);
 });
 
 test('permits 4K 3H scores through 110 but enforces each model range', () => {
@@ -283,13 +395,13 @@ test('permits 4K 3H scores through 110 but enforces each model range', () => {
     modelProfile: '4k-3h',
   }));
   const output4k = makeOutput(command4k);
-  output4k.frames[0].metrics.vmaf = 105;
-  output4k.pooled_metrics.vmaf.harmonic_mean = 105;
+  output4k.frames[0].metrics[command4k.model.vmafAlias] = 105;
+  output4k.pooled_metrics[command4k.model.vmafAlias].harmonic_mean = 105;
   assert.equal(parseOutput(output4k, command4k).vmaf, 105);
 
   const command1080 = buildCommand(baseOptions());
   const output1080 = makeOutput(command1080);
-  output1080.frames[0].metrics.vmaf = 105;
+  output1080.frames[0].metrics[command1080.model.vmafAlias] = 105;
   assert.throws(() => parseOutput(output1080, command1080), /VMAF.*range/);
 });
 
@@ -299,14 +411,17 @@ test('enforces separate model-qualified and full-reference CAMBI domains', () =>
   const command = buildCommand(baseOptions());
   const hoppers = makeOutput(command);
   hoppers.frames[0].metrics[command.model.cambiAlias] = 16.558754;
+  hoppers.frames[0].metrics.cambi = 900;
   hoppers.frames[0].metrics.cambi_source = 17.3577;
   hoppers.frames[0].metrics.cambi_full_reference = 900;
   hoppers.pooled_metrics[command.model.cambiAlias].max = 16.558754;
+  hoppers.pooled_metrics.cambi.max = 900;
   hoppers.pooled_metrics.cambi_source.max = 17.3577;
   hoppers.pooled_metrics.cambi_source.harmonic_mean = 12.28406199166666;
   hoppers.pooled_metrics.cambi_full_reference.max = 900;
   const parsed = parseOutput(hoppers, command);
   assert.equal(parsed.frames[0].cambi, 16.558754);
+  assert.equal(parsed.frames[0].cambiDistorted, 900);
   assert.equal(parsed.frames[0].cambiSource, 17.3577);
   assert.equal(parsed.frames[0].cambiFullReference, 900);
   assert.equal(parsed.cambiSource, 12.28406199166666);
@@ -316,14 +431,22 @@ test('enforces separate model-qualified and full-reference CAMBI domains', () =>
   assert.throws(() => parseOutput(candidateOverflow, command),
     /CAMBI frame 0 score .*17\.000001.*\[0, 17\]/);
 
+  const distortedOverflow = makeOutput(command);
+  distortedOverflow.frames[0].metrics.cambi = 1000.000001;
+  assert.throws(() => parseOutput(distortedOverflow, command),
+    /full-reference distorted CAMBI frame 0 score \(cambi\).*1000\.000001.*\[0, 1000\]/);
+
   const sourceOverflow = makeOutput(command);
   sourceOverflow.frames[0].metrics.cambi_source = 1000.000001;
   assert.throws(() => parseOutput(sourceOverflow, command),
     /source CAMBI frame 0 score \(cambi_source\).*1000\.000001.*\[0, 1000\]/);
 
   const exactFiniteCeiling = makeOutput(command);
+  exactFiniteCeiling.frames[0].metrics.cambi = 1000;
+  exactFiniteCeiling.pooled_metrics.cambi.max = 1000;
   exactFiniteCeiling.frames[0].metrics.cambi_source = 1000;
   exactFiniteCeiling.pooled_metrics.cambi_source.max = 1000;
+  assert.equal(parseOutput(exactFiniteCeiling, command).frames[0].cambiDistorted, 1000);
   assert.equal(parseOutput(exactFiniteCeiling, command).frames[0].cambiSource, 1000);
 });
 
@@ -337,19 +460,19 @@ test('parser fails closed on malformed JSON, frame mismatch, gaps, ambiguity, an
   wrongIndex.frames[1].frameNum = 1;
   assert.throws(() => parseOutput(wrongIndex, command), /frameNum/);
 
-  const ambiguous = makeOutput(command);
-  ambiguous.frames[0].metrics.cambi_other_model = 2;
-  ambiguous.pooled_metrics.cambi_other_model = { harmonic_mean: 2 };
-  assert.equal(parseOutput(ambiguous, command).aliases.cambi, command.model.cambiAlias,
-    'an exact contract alias wins over an additional bare/qualified feature');
-  for (const frame of ambiguous.frames) delete frame.metrics[command.model.cambiAlias];
-  delete ambiguous.pooled_metrics[command.model.cambiAlias];
-  ambiguous.frames.forEach((frame) => { frame.metrics.cambi = 2; });
-  ambiguous.pooled_metrics.cambi = { harmonic_mean: 2 };
-  assert.throws(() => parseOutput(ambiguous, command), /ambiguous CAMBI/);
+  const unexpectedExtra = makeOutput(command);
+  unexpectedExtra.frames[0].metrics.cambi_other_model = 2;
+  unexpectedExtra.pooled_metrics.cambi_other_model = { harmonic_mean: 2 };
+  assert.throws(() => parseOutput(unexpectedExtra, command),
+    /unexpected candidate CAMBI metric aliases/);
+
+  const frameOnlyUnexpected = makeOutput(command);
+  frameOnlyUnexpected.frames[0].metrics.cambi_other_model = 2;
+  assert.throws(() => parseOutput(frameOnlyUnexpected, command),
+    /frame 0 metrics has unexpected candidate CAMBI metric aliases/);
 
   const nonFinite = makeOutput(command);
-  nonFinite.pooled_metrics.vmaf.harmonic_mean = Number.NaN;
+  nonFinite.pooled_metrics[command.model.vmafAlias].harmonic_mean = Number.NaN;
   assert.throws(() => parseOutput(nonFinite, command), /finite/);
 
   const missingSource = makeOutput(command);
@@ -362,6 +485,10 @@ test('parser rejects metadata that is not produced by this pinned helper', () =>
   assert.throws(() => parseOutput(makeOutput(command), {
     ...command,
     revision: 'different',
+  }), /command metadata/);
+  assert.throws(() => parseOutput(makeOutput(command), {
+    ...command,
+    model: { ...command.model, vmafAlias: 'vmaf' },
   }), /command metadata/);
 });
 
@@ -458,15 +585,79 @@ test('coded geometry, SAR/DAR and normalization are explicit and identity-bound'
 
   // Coded geometry must be a positive integer raster.
   for (const bad of [undefined, null, 0, -1080, 1080.5, '1080']) {
-    assert.throws(() => buildMetricIdentity({ ...geometry, codedWidth: bad }), /codedWidth/,
+    assert.throws(() => buildMetricIdentity({ ...geometry, codedWidth: bad }), /coded dimensions/,
       `codedWidth=${String(bad)} must fail closed`);
-    assert.throws(() => buildMetricIdentity({ ...geometry, codedHeight: bad }), /codedHeight/,
+    assert.throws(() => buildMetricIdentity({ ...geometry, codedHeight: bad }), /coded dimensions/,
       `codedHeight=${String(bad)} must fail closed`);
   }
 
-  // Geometry is contract-sensitive: a different raster is a different identity.
-  assert.notEqual(identity.id, buildMetricIdentity({ ...geometry, codedWidth: 1920 }).id);
-  assert.notEqual(identity.id, buildMetricIdentity({ ...geometry, codedHeight: 1082 }).id);
-  assert.notEqual(identity.id, buildMetricIdentity({ ...geometry, sampleAspectRatio: '1:1' }).id);
-  assert.notEqual(identity.id, buildMetricIdentity({ ...geometry, displayAspectRatio: '4:3' }).id);
+  // Individually changing the raster or either aspect ratio makes the identity
+  // internally inconsistent and must fail before it can become authoritative.
+  assert.throws(() => buildMetricIdentity({ ...geometry, codedWidth: 1920 }),
+    /inconsistent/);
+  assert.throws(() => buildMetricIdentity({ ...geometry, codedHeight: 1082 }),
+    /does not support|inconsistent/);
+  assert.throws(() => buildMetricIdentity({ ...geometry, sampleAspectRatio: '1:1' }),
+    /inconsistent/);
+  assert.throws(() => buildMetricIdentity({ ...geometry, displayAspectRatio: '4:3' }),
+    /inconsistent/);
+
+  const squareFourThree = buildMetricIdentity({
+    ...geometry,
+    sampleAspectRatio: '1:1',
+    displayAspectRatio: '4:3',
+  });
+  assert.notEqual(identity.id, squareFourThree.id,
+    'two distinct but internally valid SAR/DAR identities remain distinguishable');
+});
+
+test('geometry authority accepts only model-family rasters with exact SAR/DAR', () => {
+  const accepted = [
+    [1920, 1080, '1:1', '16:9', '1080p'],
+    [1920, 800, '1:1', '12:5', '1080p'],
+    [1440, 1080, '4:3', '16:9', '1080p'],
+    [3840, 1604, '1:1', '960:401', '4k'],
+    [2880, 2160, '4:3', '16:9', '4k'],
+  ];
+  for (const [width, height, sar, dar, resolutionClass] of accepted) {
+    const geometry = validateGeometry({
+      width,
+      height,
+      sampleAspectRatio: sar,
+      displayAspectRatio: dar,
+      geometryNormalization: 'none',
+    });
+    assert.equal(geometry.resolutionClass, resolutionClass);
+  }
+
+  for (const [width, height] of [
+    [1280, 720], // 720p
+    [2560, 1440], // 1440p
+    [720, 480], // SD
+    [1080, 1920], // portrait
+    [4096, 2160], // DCI 4K
+  ]) {
+    assert.throws(() => validateGeometry({
+      width,
+      height,
+      sampleAspectRatio: '1:1',
+      displayAspectRatio: `${width}:${height}`,
+      geometryNormalization: 'none',
+    }), (error) => error.code === 'VMAF_V1_GEOMETRY_UNSUPPORTED');
+  }
+
+  assert.throws(() => validateGeometry({
+    width: 1920,
+    height: 800,
+    sampleAspectRatio: '1:1',
+    displayAspectRatio: '16:9',
+    geometryNormalization: 'none',
+  }), (error) => error.code === 'VMAF_V1_GEOMETRY_ASPECT_MISMATCH');
+  assert.throws(() => validateGeometry({
+    width: 1440,
+    height: 1080,
+    sampleAspectRatio: '1:1',
+    displayAspectRatio: '16:9',
+    geometryNormalization: 'none',
+  }), (error) => error.code === 'VMAF_V1_GEOMETRY_ASPECT_MISMATCH');
 });

@@ -13,12 +13,25 @@ const desired = {
   calculateVMAF: {
     vmafCpuV1QualificationEnabled: 'false',
     vmafCpuV1ProductionEnabled: 'true',
-    vmafCpuV1ProductionAllowProvisionalHdr: 'true',
-    maxParallelCpuV1: '2',
-    vmafPairedCqActingEnabled: 'true',
+    vmafCpuV1ProductionAllowProvisionalHdr: 'false',
+    maxParallelCpuV1: '1',
+    cpuV1ThreadsPerScore: '2',
+    vmafPairedCqActingEnabled: 'false',
     pairedCqShadow: 'true',
     pairedCqShadowForceFull: 'true',
     pairedCqShadowAnchors: '6',
+  },
+  testEncodingParameters: {
+    targetSizeReduction: '30',
+  },
+  selectBestParameters: {
+    cpuV1ThreadsPerScore: '2',
+    minSizeReduction: '20',
+  },
+  checkCQRangeRetry: {
+    maxRetries: '4',
+    vmafHeadroomThreshold: '5',
+    vmafBelowThresholdMargin: '5',
   },
 };
 
@@ -41,11 +54,11 @@ for (const [pluginName, inputs] of Object.entries(desired)) {
 }
 
 if (!apply) {
-  console.log(changes.length ? `Dry run:\n${changes.join('\n')}` : 'Dry run: CPU-v1 promotion controls already current');
+  console.log(changes.length ? `Dry run:\n${changes.join('\n')}` : 'Dry run: flow policy controls already current');
   process.exit(0);
 }
 if (!changes.length) {
-  console.log('Live CPU-v1 promotion controls already current');
+  console.log('Live flow policy controls already current');
   process.exit(0);
 }
 if (!fs.existsSync(backupPath)) db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
@@ -71,4 +84,5 @@ for (const [pluginName, inputs] of Object.entries(desired)) {
 }
 console.log(`Updated live flow ${flowId}:\n${changes.join('\n')}`);
 console.log(`Backup: ${backupPath}`);
-console.log('Paired-CQ is armed but force-full remains a hard interlock until exact schema-v4 evidence clears review.');
+console.log('CPU-v1 remains enabled for SDR; provisional HDR is explicitly disabled and retains GPU-v0.');
+console.log('Paired-CQ shadow remains force-full; acting is explicitly disabled until a separately reviewed promotion removes the interlock.');

@@ -27,11 +27,13 @@ assert.strictEqual(sdr1080.inferenceAuthorityContractId, 'paired-cq-vmaf-v1-camb
 const promotedSdr1080 = metric.resolveCpuV1Production({ ...GEO, width: 1920, height: 1080, isHdr: false, frameRate: 24, });
 assert.strictEqual(promotedSdr1080.productionEligible, true);
 assert.strictEqual(promotedSdr1080.qualificationStatus, 'promoted-production-authority');
+assert.strictEqual(promotedSdr1080.authorityStatus, 'authoritative-supported-geometry');
 assert.strictEqual(promotedSdr1080.metricContractId, sdr1080.metricContractId,
   'promotion must not relabel the calibrated metric identity');
 const promotedHdr1080 = metric.resolveCpuV1Production({ ...GEO, width: 1920, height: 1080, isHdr: true, frameRate: 24, });
 assert.strictEqual(promotedHdr1080.hdrValidationStatus,
   'provisional-hdr-explicitly-authorized-with-full-holdout');
+assert.strictEqual(promotedHdr1080.authorityStatus, 'provisional-hdr-explicit-override');
 
 const hdr1080 = metric.resolveCpuV1Candidate({ ...GEO, width: 1920, height: 1080, isHdr: true, frameRate: 24 });
 assert.strictEqual(hdr1080.contentClass, 'hdr-pq');
@@ -49,6 +51,30 @@ assert(hfr4k.metricContractId.includes('hfr'));
 
 assert.throws(() => metric.resolveCpuV1Candidate({ ...GEO, width: 1920, height: 1080 }), /explicit isHdr/);
 assert.throws(() => metric.resolveCpuV1Candidate({ ...GEO, width: 1920, height: 1080, isHdr: false, scoringBitDepth: 8 }), /native 10-bit/);
+for (const [width, height] of [
+  [1280, 720],
+  [2560, 1440],
+  [720, 480],
+  [1080, 1920],
+  [4096, 2160],
+]) {
+  assert.throws(() => metric.resolveCpuV1Production({
+    width,
+    height,
+    sampleAspectRatio: '1:1',
+    displayAspectRatio: `${width}:${height}`,
+    geometryNormalization: 'none',
+    isHdr: false,
+  }), (error) => error.code === 'VMAF_V1_GEOMETRY_UNSUPPORTED');
+}
+assert.throws(() => metric.resolveCpuV1Production({
+  width: 1920,
+  height: 800,
+  sampleAspectRatio: '1:1',
+  displayAspectRatio: '16:9',
+  geometryNormalization: 'none',
+  isHdr: false,
+}), (error) => error.code === 'VMAF_V1_GEOMETRY_ASPECT_MISMATCH');
 
 const production = metric.resolveProduction({ width: 1920, height: 1080 });
 assert.strictEqual(production.backend, 'cuda');

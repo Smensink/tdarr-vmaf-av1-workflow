@@ -3,6 +3,36 @@
 const assert = require('assert');
 const Module = require('module');
 
+const outcomeRows = new Map();
+let failRequiredOutcomeWrite = false;
+const fakeOutcomeDb = {
+  prepare(sql) {
+    return {
+      get(value) {
+        if (sql.includes('WHERE job_id = ?')) {
+          const row = outcomeRows.get(value);
+          return row ? { ...row } : undefined;
+        }
+        return undefined;
+      },
+    };
+  },
+};
+const fakeVmafDb = {
+  openDb() { return fakeOutcomeDb; },
+  makeJobId(filePath, startTime) { return `${startTime || 'fixture'}-${filePath}`; },
+  upsertJob(db, fields) {
+    assert.strictEqual(db, fakeOutcomeDb);
+    if (failRequiredOutcomeWrite && fields.outcome_stage === 'candidate_ready') {
+      throw new Error('injected candidate-ready write failure');
+    }
+    outcomeRows.set(fields.job_id, {
+      ...(outcomeRows.get(fields.job_id) || {}),
+      ...fields,
+    });
+  },
+};
+
 const originalLoad = Module._load;
 Module._load = function mockTdarrRuntime(request, parent, isMain) {
   if (request === '../../../../FlowHelpers/1.0.0/cliUtils') {
@@ -10,6 +40,9 @@ Module._load = function mockTdarrRuntime(request, parent, isMain) {
   }
   if (request === '../../../../../methods/lib') {
     return () => ({ loadDefaultValues(inputs) { return inputs || {}; } });
+  }
+  if (request === '/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js') {
+    return fakeVmafDb;
   }
   return originalLoad.call(this, request, parent, isMain);
 };
@@ -51,10 +84,35 @@ async function main() {
     vmafTranscodeStatus: 'success',
     vmafTranscodeSucceeded: true,
     vmafBestParameters: { quality: 30 },
+    vmafCanonicalJobId: 'job-success',
+    vmafOriginalFile: 'C:/media/test.mkv',
+    vmafPostEncodeCheckpoint: { checkpoint_key: 'a'.repeat(64) },
   });
   const successResult = monitorPlugin(successArgs);
   assert.strictEqual(successResult.outputNumber, 2, 'only explicit success may reach downstream replacement');
   assert.ok(successArgs._logs.some((line) => line.includes('Transcode completed successfully')));
+  assert.strictEqual(successArgs.variables.vmafDeliveryOutcomePending.database_recorded, true);
+  assert.strictEqual(successArgs.variables.vmafDeliveryOutcomePending.job_id, 'job-success');
+  assert.strictEqual(
+    successArgs.variables.vmafDeliveryOutcomePending.checkpoint_key,
+    'a'.repeat(64)
+  );
+
+  failRequiredOutcomeWrite = true;
+  const failedDurabilityArgs = makeArgs({
+    vmafTranscodeStatus: 'success',
+    vmafTranscodeSucceeded: true,
+    vmafBestParameters: { quality: 30 },
+    vmafCanonicalJobId: 'job-db-failure',
+    vmafOriginalFile: 'C:/media/test.mkv',
+    vmafPostEncodeCheckpoint: { checkpoint_key: 'b'.repeat(64) },
+  });
+  assert.throws(
+    () => monitorPlugin(failedDurabilityArgs),
+    (error) => error.code === 'TDARR_VMAF_CANDIDATE_READY_DURABILITY_FATAL',
+    'candidate-ready DB failure must block destructive downstream routing',
+  );
+  failRequiredOutcomeWrite = false;
 
   const technicalArgs = makeArgs({
     vmafTranscodeStatus: 'technical_failure',
@@ -86,7 +144,7 @@ async function main() {
   assert.strictEqual(exhaustedSizeResult.outputNumber, 4, 'exhausted size retries must keep the original without replacement');
   assert.strictEqual(exhaustedSizeArgs.variables.vmafTranscodeStatus, 'keep_original_size_retries_exhausted');
 
-  console.log('PASS transcode outcome state machine (5 cases)');
+  console.log('PASS transcode outcome state machine and mandatory candidate-ready durability (6 cases)');
 }
 
 main().catch((error) => {

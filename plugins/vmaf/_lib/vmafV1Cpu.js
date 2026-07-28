@@ -26,7 +26,6 @@ const CAMBI_PQ_ALIAS = 'cambi_ceot_pq_hrs_1080_cmxv_17_vlt_0.06';
 
 const POOLING_METHODS = new Set(['min', 'max', 'mean', 'harmonic_mean']);
 const TRANSPORTS = new Set(['raw', 'y4m']);
-const GEOMETRY_NORMALIZATIONS = new Set(['none']);
 const FFPROBE_PATH = '/usr/local/bin/tdarr-ffprobe';
 
 const MODEL_DEFINITIONS = Object.freeze({
@@ -86,14 +85,27 @@ function assertPositiveInteger(value, label) {
   }
 }
 
-function normalizedAspectRatio(value, label) {
+function geometryError(code, message, ErrorType = RangeError) {
+  const error = new ErrorType(message);
+  error.code = code;
+  return error;
+}
+
+function parsedAspectRatio(value, label) {
   const text = String(value === undefined || value === null ? '' : value).trim();
   const match = text.match(/^(\d+):(\d+)$/u);
-  if (!match || Number(match[1]) <= 0 || Number(match[2]) <= 0) {
-    throw new TypeError(`${label} must be an explicit positive N:D ratio`);
+  const rawNumerator = match ? Number(match[1]) : NaN;
+  const rawDenominator = match ? Number(match[2]) : NaN;
+  if (!match || !Number.isSafeInteger(rawNumerator) || rawNumerator <= 0
+      || !Number.isSafeInteger(rawDenominator) || rawDenominator <= 0) {
+    throw geometryError(
+      'VMAF_V1_GEOMETRY_INCOMPLETE',
+      `${label} must be an explicit positive N:D ratio with safe-integer components`,
+      TypeError,
+    );
   }
-  let numerator = Number(match[1]);
-  let denominator = Number(match[2]);
+  let numerator = rawNumerator;
+  let denominator = rawDenominator;
   function gcd(a, b) {
     while (b) { const next = a % b; a = b; b = next; }
     return a;
@@ -101,7 +113,11 @@ function normalizedAspectRatio(value, label) {
   const divisor = gcd(numerator, denominator);
   numerator /= divisor;
   denominator /= divisor;
-  return `${numerator}:${denominator}`;
+  return Object.freeze({
+    numerator,
+    denominator,
+    text: `${numerator}:${denominator}`,
+  });
 }
 
 function assertPath(value, label) {
@@ -125,6 +141,65 @@ function resolutionClassForGeometry(width, height) {
   if ((width === 3840 && height >= 1440 && height <= 2160)
       || (height === 2160 && width >= 2880 && width <= 3840)) return '4k';
   return null;
+}
+
+/**
+ * Authenticate the complete coded/display geometry accepted by the pinned
+ * model families. The exact rational equality prevents a stale or inferred
+ * DAR from laundering a crop or anamorphic source into CPU-v1 authority.
+ */
+function validateGeometry(options) {
+  assertPlainObject(options, 'geometry options');
+  try {
+    assertPositiveInteger(options.width, 'width');
+    assertPositiveInteger(options.height, 'height');
+  } catch (error) {
+    throw geometryError(
+      'VMAF_V1_GEOMETRY_INCOMPLETE',
+      `CPU VMAF-v1 geometry requires positive integer coded dimensions: ${error.message}`,
+      TypeError,
+    );
+  }
+  if (options.geometryNormalization !== 'none') {
+    throw geometryError(
+      'VMAF_V1_GEOMETRY_NORMALIZATION_UNSUPPORTED',
+      'CPU VMAF-v1 geometryNormalization must explicitly be none',
+    );
+  }
+
+  const sample = parsedAspectRatio(options.sampleAspectRatio, 'sampleAspectRatio');
+  const display = parsedAspectRatio(options.displayAspectRatio, 'displayAspectRatio');
+  const resolutionClass = resolutionClassForGeometry(options.width, options.height);
+  if (!resolutionClass) {
+    throw geometryError(
+      'VMAF_V1_GEOMETRY_UNSUPPORTED',
+      `CPU VMAF-v1 does not support coded geometry ${options.width}x${options.height}; `
+        + 'only even 1080/2160 full-height or 1920/3840 full-width model-family rasters are eligible',
+    );
+  }
+
+  const expectedLeft = BigInt(options.width)
+    * BigInt(sample.numerator)
+    * BigInt(display.denominator);
+  const expectedRight = BigInt(options.height)
+    * BigInt(sample.denominator)
+    * BigInt(display.numerator);
+  if (expectedLeft !== expectedRight) {
+    throw geometryError(
+      'VMAF_V1_GEOMETRY_ASPECT_MISMATCH',
+      `CPU VMAF-v1 coded geometry ${options.width}x${options.height}, `
+        + `SAR ${sample.text}, and DAR ${display.text} are inconsistent`,
+    );
+  }
+
+  return Object.freeze({
+    width: options.width,
+    height: options.height,
+    sampleAspectRatio: sample.text,
+    displayAspectRatio: display.text,
+    geometryNormalization: 'none',
+    resolutionClass,
+  });
 }
 
 function selectModel({ width, height, modelProfile } = {}) {
@@ -178,13 +253,13 @@ function buildMetricIdentity(options) {
     throw new RangeError('pooling must be min, max, mean, or harmonic_mean');
   }
   assertPositiveInteger(options.subsample, 'subsample');
-  assertPositiveInteger(options.codedWidth, 'codedWidth');
-  assertPositiveInteger(options.codedHeight, 'codedHeight');
-  const sampleAspectRatio = normalizedAspectRatio(options.sampleAspectRatio, 'sampleAspectRatio');
-  const displayAspectRatio = normalizedAspectRatio(options.displayAspectRatio, 'displayAspectRatio');
-  if (!GEOMETRY_NORMALIZATIONS.has(options.geometryNormalization)) {
-    throw new RangeError('geometryNormalization must explicitly be none');
-  }
+  const geometry = validateGeometry({
+    width: options.codedWidth,
+    height: options.codedHeight,
+    sampleAspectRatio: options.sampleAspectRatio,
+    displayAspectRatio: options.displayAspectRatio,
+    geometryNormalization: options.geometryNormalization,
+  });
   if (!['sdr', 'hdr-pq-provisional'].includes(options.contentClass)) {
     throw new RangeError('contentClass must be sdr or hdr-pq-provisional');
   }
@@ -198,11 +273,11 @@ function buildMetricIdentity(options) {
     pooling: options.pooling,
     subsample: options.subsample,
     contentClass: options.contentClass,
-    codedWidth: options.codedWidth,
-    codedHeight: options.codedHeight,
-    sampleAspectRatio,
-    displayAspectRatio,
-    geometryNormalization: options.geometryNormalization,
+    codedWidth: geometry.width,
+    codedHeight: geometry.height,
+    sampleAspectRatio: geometry.sampleAspectRatio,
+    displayAspectRatio: geometry.displayAspectRatio,
+    geometryNormalization: geometry.geometryNormalization,
   };
   const id = Object.entries(fields)
     .map(([key, value]) => `${key}=${value}`)
@@ -239,13 +314,13 @@ function buildCommand(options) {
   assertPath(referencePath, 'referencePath');
   assertPath(distortedPath, 'distortedPath');
   assertPath(outputPath, 'outputPath');
-  assertPositiveInteger(width, 'width');
-  assertPositiveInteger(height, 'height');
-  const canonicalSampleAspectRatio = normalizedAspectRatio(sampleAspectRatio, 'sampleAspectRatio');
-  const canonicalDisplayAspectRatio = normalizedAspectRatio(displayAspectRatio, 'displayAspectRatio');
-  if (!GEOMETRY_NORMALIZATIONS.has(geometryNormalization)) {
-    throw new RangeError('geometryNormalization must explicitly be none');
-  }
+  const geometry = validateGeometry({
+    width,
+    height,
+    sampleAspectRatio,
+    displayAspectRatio,
+    geometryNormalization,
+  });
   if (!TRANSPORTS.has(transport)) {
     throw new RangeError('transport must be raw or y4m');
   }
@@ -284,8 +359,17 @@ function buildCommand(options) {
     throw new RangeError('contentClass must be sdr or hdr-pq');
   }
 
+  const selectedModel = selectModel({
+    width: geometry.width,
+    height: geometry.height,
+    modelProfile,
+  });
   const model = Object.freeze({
-    ...selectModel({ width, height, modelProfile }),
+    ...selectedModel,
+    // The pinned FIFO scorer passes name=<model version> to libvmaf. Bind that
+    // exact JSON metric alias so results from another model (or a bare default
+    // alias) can never be accepted as this measurement.
+    vmafAlias: selectedModel.version,
     // PQ EOTF produces a distinct model-qualified CAMBI key alongside the
     // standalone `cambi_ceot_pq` full-reference feature. Bind the exact model
     // key so the parser does not guess between those two candidate metrics.
@@ -299,14 +383,14 @@ function buildCommand(options) {
     pooling,
     subsample,
     contentClass: identityContentClass,
-    codedWidth: width,
-    codedHeight: height,
-    sampleAspectRatio: canonicalSampleAspectRatio,
-    displayAspectRatio: canonicalDisplayAspectRatio,
-    geometryNormalization,
+    codedWidth: geometry.width,
+    codedHeight: geometry.height,
+    sampleAspectRatio: geometry.sampleAspectRatio,
+    displayAspectRatio: geometry.displayAspectRatio,
+    geometryNormalization: geometry.geometryNormalization,
   });
 
-  const modelOptions = [`version=${model.version}`];
+  const modelOptions = [`version=${model.version}`, `name=${model.vmafAlias}`];
   if (identityContentClass === 'hdr-pq-provisional') {
     modelOptions.push('cambi.cambi_eotf=pq');
   }
@@ -317,8 +401,8 @@ function buildCommand(options) {
   ];
   if (transport === 'raw') {
     args.push(
-      '--width', String(width),
-      '--height', String(height),
+      '--width', String(geometry.width),
+      '--height', String(geometry.height),
       '--pixel_format', CHROMA_SUBSAMPLING,
       '--bitdepth', String(BIT_DEPTH),
     );
@@ -339,11 +423,11 @@ function buildCommand(options) {
     pixelFormat: PIXEL_FORMAT,
     chromaSubsampling: CHROMA_SUBSAMPLING,
     bitDepth: BIT_DEPTH,
-    width,
-    height,
-    sampleAspectRatio: canonicalSampleAspectRatio,
-    displayAspectRatio: canonicalDisplayAspectRatio,
-    geometryNormalization,
+    width: geometry.width,
+    height: geometry.height,
+    sampleAspectRatio: geometry.sampleAspectRatio,
+    displayAspectRatio: geometry.displayAspectRatio,
+    geometryNormalization: geometry.geometryNormalization,
   });
   const expectedMeasuredFrames = Math.floor((frameCount - 1) / subsample) + 1;
 
@@ -370,6 +454,7 @@ function validateCommandMetadata(command) {
     && command.metricIdentity.revision === REVISION
     && command.metricIdentity.id === buildMetricIdentity(command.metricIdentity).id;
   const expectedModel = command.model && MODELS_BY_VERSION.get(command.model.version);
+  const expectedVmafAlias = expectedModel && expectedModel.version;
   const expectedCambiAlias = command.metricIdentity
     && command.metricIdentity.contentClass === 'hdr-pq-provisional'
     ? CAMBI_PQ_ALIAS : CAMBI_ALIAS;
@@ -397,6 +482,7 @@ function validateCommandMetadata(command) {
     && command.revision === REVISION
     && expectedModel
     && command.model.maxScore === expectedModel.maxScore
+    && command.model.vmafAlias === expectedVmafAlias
     && command.model.cambiAlias === expectedCambiAlias
     && validIdentity
     && contentContractValid
@@ -422,34 +508,80 @@ function parseDocument(input) {
   return input;
 }
 
-function findAliases(metrics, command) {
-  assertPlainObject(metrics, 'pooled_metrics');
+function exactVmafAlias(metrics, command, label) {
+  assertPlainObject(metrics, label);
+  const aliases = Object.keys(metrics).filter((key) =>
+    key === 'vmaf' || key.startsWith('vmaf_'));
+  const expected = command && command.model && command.model.vmafAlias;
+  if (!expected || aliases.length !== 1 || aliases[0] !== expected) {
+    throw new Error(aliases.length
+      ? `${label} has unexpected VMAF metric aliases: ${aliases.join(', ')}; expected ${expected || '(missing command alias)'}`
+      : `${label} is missing exact VMAF metric ${expected || '(missing command alias)'}`);
+  }
+  return expected;
+}
+
+function findAliases(metrics, command, label = 'metrics') {
+  assertPlainObject(metrics, label);
   const keys = Object.keys(metrics);
-  const candidates = keys.filter((key) => (
-    key === 'cambi'
-      || (key.startsWith('cambi_')
-        && !key.startsWith('cambi_source')
-        && !key.startsWith('cambi_full_reference'))
-  ));
-  if (candidates.length === 0) throw new Error('missing CAMBI metric');
   const expected = command && command.model && command.model.cambiAlias;
-  const selected = candidates.includes(expected)
-    ? expected : (candidates.length === 1 ? candidates[0] : null);
-  if (!selected) throw new Error(`ambiguous CAMBI metrics: ${candidates.join(', ')}`);
+  const expectedBareDistorted = command.fullReferenceCambi
+    ? (command.metricIdentity.contentClass === 'hdr-pq-provisional'
+      ? 'cambi_ceot_pq' : 'cambi')
+    : null;
+  const bareDistorted = keys.filter((key) =>
+    key === 'cambi' || key === 'cambi_ceot_pq');
+  const candidates = keys.filter((key) => (
+    key.startsWith('cambi_')
+      && !key.startsWith('cambi_source')
+      && !key.startsWith('cambi_full_reference')
+      && key !== 'cambi_ceot_pq'
+  ));
+  const observedCandidates = candidates.concat(bareDistorted);
+  if (!expected || candidates.length !== 1 || candidates[0] !== expected) {
+    throw new Error(observedCandidates.length
+      ? `${label} has unexpected candidate CAMBI metric aliases: ${observedCandidates.join(', ')}; expected ${expected || '(missing command alias)'}`
+      : `${label} is missing exact candidate CAMBI metric ${expected || '(missing command alias)'}`);
+  }
+
+  // `--feature cambi=full_ref=true` publishes a second standalone distorted
+  // metric alongside the model-qualified candidate feature: `cambi` for SDR
+  // and `cambi_ceot_pq` for provisional PQ. It is an expected, separately
+  // bounded full-reference observation, not a competing candidate alias. Bind
+  // it exactly so arbitrary duplicate model aliases remain fail-closed.
+  if ((expectedBareDistorted
+      && (bareDistorted.length !== 1 || bareDistorted[0] !== expectedBareDistorted))
+      || (!expectedBareDistorted && bareDistorted.length !== 0)) {
+    throw new Error(bareDistorted.length
+      ? `${label} has unexpected full-reference distorted CAMBI metric aliases: ${bareDistorted.join(', ')}; expected ${expectedBareDistorted || 'none'}`
+      : `${label} is missing exact full-reference distorted CAMBI metric ${expectedBareDistorted}`);
+  }
 
   const source = keys.filter((key) => key === 'cambi_source' || key.startsWith('cambi_source_'));
   const fullReference = keys.filter((key) => (
     key === 'cambi_full_reference' || key.startsWith('cambi_full_reference_')
   ));
-  if (source.length > 1) throw new Error(`ambiguous source CAMBI metrics: ${source.join(', ')}`);
-  if (fullReference.length > 1) {
-    throw new Error(`ambiguous full-reference CAMBI metrics: ${fullReference.join(', ')}`);
+  const expectedSource = command.fullReferenceCambi ? 'cambi_source' : null;
+  const expectedFullReference = command.fullReferenceCambi ? 'cambi_full_reference' : null;
+  if ((expectedSource && (source.length !== 1 || source[0] !== expectedSource))
+      || (!expectedSource && source.length !== 0)) {
+    throw new Error(source.length
+      ? `${label} has unexpected source CAMBI metric aliases: ${source.join(', ')}; expected ${expectedSource || 'none'}`
+      : `${label} is missing exact source CAMBI metric ${expectedSource}`);
+  }
+  if ((expectedFullReference
+      && (fullReference.length !== 1 || fullReference[0] !== expectedFullReference))
+      || (!expectedFullReference && fullReference.length !== 0)) {
+    throw new Error(fullReference.length
+      ? `${label} has unexpected full-reference CAMBI metric aliases: ${fullReference.join(', ')}; expected ${expectedFullReference || 'none'}`
+      : `${label} is missing exact full-reference CAMBI metric ${expectedFullReference}`);
   }
 
   return {
-    cambi: selected,
-    cambiSource: source[0],
-    cambiFullReference: fullReference[0],
+    cambi: expected,
+    cambiDistorted: expectedBareDistorted || undefined,
+    cambiSource: expectedSource || undefined,
+    cambiFullReference: expectedFullReference || undefined,
   };
 }
 
@@ -500,24 +632,10 @@ function parseOutput(input, command) {
     );
   }
   assertPlainObject(document.pooled_metrics, 'VMAF output pooled_metrics');
-  const vmafAliases = Object.keys(document.pooled_metrics).filter((key) =>
-    key === 'vmaf' || key.startsWith('vmaf_'));
-  if (vmafAliases.length !== 1) throw new Error(vmafAliases.length
-    ? `ambiguous pooled VMAF metrics: ${vmafAliases.join(', ')}` : 'missing pooled VMAF metric');
-  const vmafAlias = vmafAliases[0];
+  const vmafAlias = exactVmafAlias(document.pooled_metrics, command, 'pooled_metrics');
 
-  const aliases = findAliases(document.pooled_metrics, command);
-  // The pinned model-qualified feature explicitly carries cmxv=17. A bare
-  // compatibility alias does not attest that model option, so it must use the
-  // pinned extractor's finite default ceiling instead of being mislabeled.
-  const candidateCambiMax = aliases.cambi === command.model.cambiAlias
-    ? CAMBI_MODEL_MAX : CAMBI_FULL_REFERENCE_MAX;
-  if (command.fullReferenceCambi && !aliases.cambiSource) {
-    throw new Error('missing pooled source CAMBI metric');
-  }
-  if (command.fullReferenceCambi && !aliases.cambiFullReference) {
-    throw new Error('missing pooled full-reference CAMBI metric');
-  }
+  const aliases = findAliases(document.pooled_metrics, command, 'pooled_metrics');
+  const candidateCambiMax = CAMBI_MODEL_MAX;
 
   const pooling = command.metricIdentity.pooling;
   const maxVmaf = command.model.maxScore;
@@ -528,6 +646,8 @@ function parseOutput(input, command) {
       throw new Error(`frameNum at output index ${index} must be ${expectedFrameNum}`);
     }
     assertPlainObject(frame.metrics, `frame ${frame.frameNum} metrics`);
+    exactVmafAlias(frame.metrics, command, `frame ${frame.frameNum} metrics`);
+    findAliases(frame.metrics, command, `frame ${frame.frameNum} metrics`);
 
     const parsed = {
       frameNum: frame.frameNum,
@@ -536,6 +656,16 @@ function parseOutput(input, command) {
       cambi: frameScore(frame.metrics, aliases.cambi,
         `CAMBI frame ${frame.frameNum} score (${aliases.cambi})`, 0, candidateCambiMax),
     };
+    if (aliases.cambiDistorted || command.fullReferenceCambi) {
+      parsed.cambiDistorted = frameScore(
+        frame.metrics,
+        aliases.cambiDistorted,
+        `full-reference distorted CAMBI frame ${frame.frameNum} score (${aliases.cambiDistorted})`,
+        0,
+        CAMBI_FULL_REFERENCE_MAX,
+        command.fullReferenceCambi,
+      );
+    }
     if (aliases.cambiSource || command.fullReferenceCambi) {
       parsed.cambiSource = frameScore(
         frame.metrics,
@@ -577,6 +707,16 @@ function parseOutput(input, command) {
     aliases: Object.freeze({ vmaf: vmafAlias, ...aliases }),
     frames: Object.freeze(parsedFrames),
   };
+  if (aliases.cambiDistorted || command.fullReferenceCambi) {
+    result.cambiDistorted = pooledScore(
+      document.pooled_metrics,
+      aliases.cambiDistorted,
+      pooling,
+      'full-reference distorted CAMBI pooled score',
+      0,
+      CAMBI_FULL_REFERENCE_MAX,
+    );
+  }
   if (aliases.cambiSource || command.fullReferenceCambi) {
     result.cambiSource = pooledScore(
       document.pooled_metrics,
@@ -753,5 +893,7 @@ module.exports = Object.freeze({
   parseOutput,
   parseScorerOutput,
   profileForModelVersion,
+  resolutionClassForGeometry,
   selectModel,
+  validateGeometry,
 });

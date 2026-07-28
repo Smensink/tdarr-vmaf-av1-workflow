@@ -1,5 +1,5 @@
 name=nvencc
-version=9.25-r2
+version=9.25-r3
 git_url=https://github.com/rigaya/NVEnc
 git_tag=9.25
 git_commit=8c873e4d15aefb93dd50396e5c70fffb842f7d22
@@ -14,4 +14,4 @@ compiler=gcc 13.3.0
 nvenc_api=13.0
 cuda_headers=13.3
 binary_sha256=03d8a26631fef47881f30243e4442dcb26a66cabbb586ae9637c9e22b9776294
-coordinator_sha256=bcba1c9d16d3c6342eabbd8fc59397fbff04b30fb8301a338f29a0ba0a077921
+coordinator_sha256=6ba05f26647611c1be0986ffee218858f1c0b0734f94bf21af7759e067954576

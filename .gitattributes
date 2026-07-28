@@ -1,6 +1,7 @@
 # Keep scripts/configs portable when this repo is cloned on Windows.
 *.sh text eol=lf
 *.py text eol=lf
+*.ps1 text eol=lf
 *.js text eol=lf
 *.json text eol=lf
 *.yml text eol=lf
@@ -14,5 +15,8 @@
 .env.example text eol=lf
 Dockerfile* text eol=lf
 container-overrides/* text eol=lf
+custom-nvencc/SHA256SUMS text eol=lf
+runtime/denoise-trial/tdarr-ffmpeg text eol=lf
+runtime/denoise-trial/tdarr-ffprobe text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf

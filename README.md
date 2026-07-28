@@ -5,43 +5,67 @@ per-title AV1 NVENC settings, measures sample quality, applies size and
 banding constraints, optionally reconstructs film grain, and learns from prior
 runs.
 
-The tracked live snapshot was exported on 2026-07-27. It contains 34 nodes and
-53 edges. Twenty Local plugin identities are active; four more are retained as
-inactive reference implementations. The flow snapshot is credential-redacted.
+The tracked flow was exported on 2026-07-27 and then received the audited r3
+fail-closed routing and delivery migration. It now contains 36 nodes and 58
+edges. Twenty-three Local plugin identities occur in the tracked graph; four
+more are retained as inactive reference implementations. The flow snapshot is
+credential-redacted.
 
-> **Audit status:** the workflow is operational, but the 2026-07-27 review found
-> security and correctness defects that should be fixed before accepting
-> untrusted filenames or broadening deployment. In particular, three active
-> plugins build shell commands from media paths, CPU VMAF-v1 lacks a complete
-> geometry preflight, ambiguous BT.2020 sources can be retagged as PQ, and
-> direct film-grain output is not fully decode-validated. See the
-> [full audit](docs/audit-2026-07-27.md).
+> **Audit status:** the 2026-07-27 repair source addresses the identified
+> security and correctness blockers. Media-path commands now use literal argv
+> with no shell boundary; the two audited graph routes fail closed; CPU-v1
+> geometry is authenticated before authority; ambiguous BT.2020 transfer keeps
+> the original; the GPU lock uses atomic generation-owned lease state; direct
+> grain rewrites require a full-title decode, with GPU decode under a narrow
+> lease;
+> and delivery uses a validator, attested replacement transaction, and final
+> database authority. A checkout is not proof of live deployment:
+> verify process-level drain, catalog/flow parity, runtime hashes, and a
+> controlled canary. CPU-v1 HDR calibration and the remaining design work are
+> tracked in the [full audit](docs/audit-2026-07-27.md).
+
+> **Current deployment evidence (2026-07-28):** immutable release
+> `r3-20260727T233311Z-7b625a1f-final` is live and healthy. The active Flow,
+> canonical, and redacted export agree at 36 nodes/58 edges; learning schema 17
+> passed integrity checks; and 366 catalog files plus 23 runtime helpers passed
+> parity twice. Authentication, Compose, settings, and toolchain qualification
+> passed. The node remains paused and quiescent because the queue-isolated live
+> canary is still withheld.
 
 ## What the flow does
 
-For each eligible source, the active graph:
+For each eligible source, the tracked graph:
 
 1. applies a seven-day file-age gate and checks for an NVIDIA encoder;
 2. classifies HDR signalling and analyzes source grain;
 3. enriches filename metadata where configured;
 4. extracts representative samples;
 5. searches AV1 NVENC CQ candidates and scores them with VMAF/CAMBI;
-6. selects a candidate under quality and projected-size constraints;
+6. selects a candidate under quality constraints and a separately bounded
+   projected-size research contract;
 7. records learning data and performs the full transcode;
-8. validates the transcode, retries a bounded number of times when needed,
+8. validates the base transcode, retries a bounded number of times when needed,
    and optionally synthesizes film grain;
-9. reorders streams, replaces the source, notifies Radarr/Sonarr, and cleans
-   job-owned temporary files.
+9. remuxes as needed, applies the exact delivered-byte policy, performs a
+   crash-safe attested replacement, and finalizes the immutable delivered
+   database outcome; and
+10. notifies Radarr/Sonarr, unmonitors only a path-verified Arr identity, and
+    cleans job-owned temporary files.
+
+The current delivered-size policy is one versioned contract: a 30% search
+target, a 20% minimum delivered reduction, and an 80% maximum final
+output/source ratio. The historical 90% projected-ratio boundary is separate
+research/advisory evidence and is not a delivered-success threshold.
 
 This is not a claim that every quality policy has been prospectively
-validated. The repository records the policy that is running, its tests, and
-the audit evidence that still needs controlled validation.
+validated. The repository records the policy represented by the tracked graph,
+its tests, and the audit evidence that still needs controlled validation.
 
 ## Repository map
 
-- `flow/tdarr-flow-vmaf-av1.json` — redacted export of the active 34-node flow.
-- `configs/flow_YR5PZ1QaD_CANONICAL.json` — parity input for the active graph.
-- `plugins/` — readable Local Flow Plugin source; 24 plugin identities.
+- `flow/tdarr-flow-vmaf-av1.json` — redacted 36-node audited flow.
+- `configs/flow_YR5PZ1QaD_CANONICAL.json` — parity input for the tracked graph.
+- `plugins/` — readable Local Flow Plugin source; 27 plugin identities.
 - `custom-cont-init.d/` — deployment payload and startup pinning hooks.
 - `build-scripts/` — FFmpeg/libvmaf, grain-tool, parity, and canary utilities.
 - `runtime/vmaf-v1/` — reproducible CPU VMAF-v1 image layer and scorer wrapper.
@@ -50,9 +74,14 @@ the audit evidence that still needs controlled validation.
   are deliberately excluded.
 - `container-overrides/` — Tdarr init override for the custom FFmpeg contract.
 - `test-*.js`, `test-*.sh` — static, contract, and explicit runtime tests for
-  the deployed flow. Workload-heavy scripts are not part of routine CI.
+  the tracked flow and deployment contract. Workload-heavy scripts are not part
+  of routine CI.
+  `test-plugin-safety-boundaries.js` covers age-record publication, cleanup and
+  retry containment, grain real-path scope, the final watchdog, and source/init
+  mirror parity.
 - `data/public/vmaf-learning-public.sqlite3` — fresh, aggregate-only learning
-  snapshot. It is not a copy of the private runtime database.
+  snapshot using public export schema `tdarr-vmaf-public-learning/v3`. It is
+  not a copy of the private schema-17 runtime database.
 - `dashboard/` — local audit/operations dashboard source; generated state and
   dependencies are excluded.
 - `tools/` — export, manifest, source-parity, install, validation, and privacy
@@ -72,13 +101,18 @@ Start with [the installation guide](docs/installation.md). The short version:
 cp .env.example .env
 cp docker-compose.example.yml docker-compose.yml
 
+# Before build/start, generate or populate the required private TDARR_API_KEY,
+# create a unique external Docker volume for private runtime evidence, and set
+# TDARR_PRIVATE_RUNTIME_VOLUME to its exact name. Never commit .env.
+# On Windows, use build-scripts/new-private-tdarr-env.ps1 instead of copying
+# .env.example; it generates both values, then create the named Docker volume.
 # New empty database only: temporarily set TDARR_FLOW_PARITY_BOOTSTRAP=1.
 # Populate the documented FFmpeg, libvmaf, CUDA, grav1synth, grain-pipeline,
 # NVEncC, and model artifact directories before starting.
 docker compose build
 docker compose up -d
 
-# Installs plugin files without restarting Tdarr.
+# On a new, idle deployment, installs plugin files without restarting Tdarr.
 bash tools/install-local-plugins.sh tdarr
 bash tools/validate-install.sh tdarr
 ```
@@ -90,6 +124,7 @@ The example compose file:
 - binds web/API ports to loopback and enables authentication;
 - uses a cheap TCP liveness check rather than recurring deep GPU tests;
 - puts CPU scorer scratch outside Tdarr's `/temp` cache scanner;
+- mounts the explicitly named private-runtime evidence volume read-only; and
 - disables automatic container replacement.
 
 On a genuinely new database, follow the two-phase bootstrap in the
@@ -102,10 +137,30 @@ Add media mounts deliberately. Read-only mounts are safest for evaluation, but
 the final replacement stage requires an explicitly writable path when used in
 production.
 
-For an existing deployment, never run the installer with `--restart`, recreate
-the container, rebuild FFmpeg, or change the live graph while jobs are active.
-The current audited host also has a live/canonical parity mismatch that must be
-reconciled during a drained maintenance window.
+For an existing deployment, drain before copying plugin or helper bytes at
+all. Omitting `--restart` avoids an interruption, but it does not make a live
+catalog mutation safe: a partial copy or an already-loaded module can create a
+mixed generation. Never run the installer with `--restart`, recreate the
+container, rebuild FFmpeg, or change the live graph while jobs are active. Do
+not trust the API's idle flag alone: require the production GPU lock to be
+absent and inspect the real process tree for coordinators, NVEncC, FFmpeg,
+VMAF, and grain work. Reconcile any live/canonical mismatch only in that
+process-level drained maintenance window.
+
+The exceptional retained-candidate migration is split deliberately: the public
+schema-1 utility only imports and arms exact reuse, while the private one-shot
+schema-2 dispatcher binds safety gates to the actual FileJSONDB queue write.
+Immediately before queueing it authenticates the exact unredacted live Flow,
+global settings, complete library-root collection, descriptor-bound updater
+controls from `/run/s6/container_environment`, both strict runtime
+configuration JSON files, every plugin/helper in the full r2 graph across
+exact source/server/node namespaces, and a full-byte source copy on a distinct
+device outside every media root. It treats an absent
+`TDARR_FLOW_PARITY_BOOTSTRAP` entry as effective zero, but requires explicit
+`enableDockerAutoUpdater=false` and a zero-byte `cronPluginUpdate`. It repeats
+the proof before opening the worker aperture and prints no paths, hashes,
+Flow/job identities, or raw errors. See
+[Retained-candidate recovery](docs/retained-candidate-recovery.md).
 
 ## Runtime and data boundaries
 
@@ -132,7 +187,7 @@ from the manifest.
 
 ## Documentation
 
-- [Architecture and live flow](docs/architecture.md)
+- [Architecture and tracked flow](docs/architecture.md)
 - [Plugin and helper reference](docs/plugin-reference.md)
 - [Quality policy](docs/quality-policy.md)
 - [Runtime image and artifacts](docs/runtime-image.md)
@@ -141,6 +196,11 @@ from the manifest.
 - [Privacy and database handling](docs/privacy-and-data.md)
 - [Release checklist](docs/release-checklist.md)
 - [2026-07-27 extensive audit report](docs/audit-2026-07-27.md)
+- [2026-07-28 r3 rollout evidence and limits](docs/r3-rollout-evidence-2026-07-28.md)
+- [Live job forensics and remediation](docs/live-forensics-2026-07-27.md)
+- [Retained-candidate recovery](docs/retained-candidate-recovery.md)
+- [Post-recovery private evidence](docs/post-recovery-private-evidence.md)
+- [Sample-only denoise retention trials](docs/denoise-retention-trials.md)
 
 ## Licensing
 

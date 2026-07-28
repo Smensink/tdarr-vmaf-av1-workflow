@@ -4,7 +4,7 @@ This directory persists the reviewed Linux x86-64 NVEncC build and the
 non-shell coordinator used to stream its CUDA KNN output into the production
 FFmpeg AV1 encode. Container startup does not download or rebuild either file.
 
-- Artifact release: `9.25-r2` (NVEncC reports `9.25 (r1)`)
+- Artifact release: `9.25-r3` (NVEncC reports `9.25 (r1)`)
 - Source: `https://github.com/rigaya/NVEnc`
 - Tag: `9.25`
 - Commit: `8c873e4d15aefb93dd50396e5c70fffb842f7d22`
@@ -13,7 +13,12 @@ FFmpeg AV1 encode. Container startup does not download or rebuild either file.
 - Binary SHA-256:
   `03d8a26631fef47881f30243e4442dcb26a66cabbb586ae9637c9e22b9776294`
 - Coordinator SHA-256:
-  `bcba1c9d16d3c6342eabbd8fc59397fbff04b30fb8301a338f29a0ba0a077921`
+  `6ba05f26647611c1be0986ffee218858f1c0b0734f94bf21af7759e067954576`
+
+The r3 coordinator treats any FFmpeg-consumer exit while NVEncC is still
+running as a failed pipeline and terminates the producer. This prevents a
+zero-exit early consumer from leaving a hidden NVEncC process and GPU lease
+alive after Tdarr reports its worker idle.
 
 The local patch makes bundled Dolby Vision and HDR10+ Rust metadata libraries
 optional. This artifact was built with both disabled; those formats are

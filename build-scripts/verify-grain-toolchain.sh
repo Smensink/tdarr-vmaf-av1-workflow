@@ -17,12 +17,16 @@ NVENCC_ARTIFACT_COORDINATOR="$NVENCC_ARTIFACT_ROOT/libexec/tdarr-nvencc-knn-ffmp
 NVENCC_ARTIFACT_PROVENANCE="$NVENCC_ARTIFACT_ROOT/PROVENANCE.txt"
 NVENCC_ARTIFACT_SUMS="$NVENCC_ARTIFACT_ROOT/SHA256SUMS"
 NVENCC_KNN_SMOKE="${NVENCC_KNN_SMOKE:-/usr/local/build-scripts/test-nvencc-knn-smoke.sh}"
+GPU_PIPELINE_LOCK_DIR="${TDARR_GPU_PIPELINE_LOCK_DIR:-/temp/tdarr-vmaf-gpu-pipeline.lock}"
+GPU_SELFTEST_RUNNER="${TDARR_GRAIN_GPU_SELFTEST_RUNNER:-/usr/local/build-scripts/run-grain-gpu-selftests.js}"
+GPU_LOCK_HELPER="${TDARR_GPU_LOCK_HELPER:-/custom-cont-init.d/vmaf-plugin-patches/_lib/gpuPipelineLock.js}"
 PIPELINE="${TDARR_GRAIN_PIPELINE:-/opt/grain-pipeline/current/grain_pipeline_v5_direct.py}"
 FFMPEG="${TDARR_FFMPEG:-/usr/local/bin/tdarr-ffmpeg}"
 FFPROBE="${TDARR_FFPROBE:-/usr/local/bin/tdarr-ffprobe}"
 MKVMERGE="${TDARR_MKVMERGE:-mkvmerge}"
 RUNTIME_USER="${TDARR_RUNTIME_USER:-abc}"
 NVENCC_CONTRACT_ENABLED=false
+GPU_RUNTIME_SELFTESTS_RAN=false
 if [[ "${TDARR_NVENCC_REQUIRED:-0}" == "1" ||
       -n "${TDARR_NVENCC+x}" ||
       -n "${TDARR_NVENCC_COORDINATOR+x}" ||
@@ -43,8 +47,8 @@ EXPECTED_NVENCC_COMMIT="8c873e4d15aefb93dd50396e5c70fffb842f7d22"
 EXPECTED_NVENCC_PATCH="nvencc-9.25-optional-metadata-libs.patch"
 EXPECTED_NVENCC_PATCH_SHA256="8fb6dd6c3770f1e239b56686e0e4e1b02f6f28513ad21c7f5d5e3920f62ea64e"
 EXPECTED_NVENCC_SHA256="03d8a26631fef47881f30243e4442dcb26a66cabbb586ae9637c9e22b9776294"
-EXPECTED_NVENCC_COORDINATOR_SHA256="bcba1c9d16d3c6342eabbd8fc59397fbff04b30fb8301a338f29a0ba0a077921"
-EXPECTED_NVENCC_RELEASE="/opt/nvencc/releases/9.25-r2-03d8a26631fe-bcba1c9d16d3"
+EXPECTED_NVENCC_COORDINATOR_SHA256="6ba05f26647611c1be0986ffee218858f1c0b0734f94bf21af7759e067954576"
+EXPECTED_NVENCC_RELEASE="/opt/nvencc/releases/9.25-r3-03d8a26631fe-6ba05f266476"
 EXPECTED_NVENCC_REAL="$EXPECTED_NVENCC_RELEASE/bin/nvencc"
 EXPECTED_NVENCC_COORDINATOR_REAL="$EXPECTED_NVENCC_RELEASE/libexec/tdarr-nvencc-knn-ffmpeg.js"
 EXPECTED_PIPELINE="/opt/grain-pipeline/current/grain_pipeline_v5_direct.py"
@@ -93,6 +97,7 @@ fi
 [[ -x "$FFMPEG" ]] || fail "Tdarr FFmpeg is not executable: $FFMPEG"
 [[ -x "$FFPROBE" ]] || fail "Tdarr ffprobe is not executable: $FFPROBE"
 command -v python3 >/dev/null 2>&1 || fail "python3 is not available"
+command -v node >/dev/null 2>&1 || fail "node is not available"
 command -v "$MKVMERGE" >/dev/null 2>&1 || \
     fail "mkvmerge is required for lossless Matroska ancillary preservation"
 command -v runuser >/dev/null 2>&1 || fail "runuser is not available"
@@ -275,20 +280,44 @@ grep -Fq "av1_nvenc" <<<"$ENCODERS" || fail "Tdarr FFmpeg lacks av1_nvenc"
 "$FFPROBE" -version >/dev/null 2>&1
 "$MKVMERGE" --version >/dev/null 2>&1 || \
     fail "mkvmerge version probe failed"
+[[ -f "$GPU_SELFTEST_RUNNER" && ! -L "$GPU_SELFTEST_RUNNER" && \
+    -r "$GPU_SELFTEST_RUNNER" ]] || \
+    fail "owned GPU self-test runner is not a readable regular file: $GPU_SELFTEST_RUNNER"
+[[ -f "$GPU_LOCK_HELPER" && ! -L "$GPU_LOCK_HELPER" && -r "$GPU_LOCK_HELPER" ]] || \
+    fail "GPU lock helper is not a readable regular file: $GPU_LOCK_HELPER"
 [[ -f "$GRAV1SYNTH_NVENC_REGRESSION" && ! -L "$GRAV1SYNTH_NVENC_REGRESSION" && \
     -r "$GRAV1SYNTH_NVENC_REGRESSION" ]] || \
     fail "grav1synth NVENC regression is not a readable regular file: $GRAV1SYNTH_NVENC_REGRESSION"
-runuser -u "$RUNTIME_USER" -- env GRAV1SYNTH_REGRESSION_QUIET=1 \
-    bash "$GRAV1SYNTH_NVENC_REGRESSION" "$GRAV1SYNTH" "$FFMPEG" || \
-    fail "grav1synth NVENC regression failed for runtime user $RUNTIME_USER"
+NVENCC_CONTRACT_FLAG=0
 if "$NVENCC_CONTRACT_ENABLED"; then
+    NVENCC_CONTRACT_FLAG=1
     [[ -f "$NVENCC_KNN_SMOKE" && ! -L "$NVENCC_KNN_SMOKE" && -r "$NVENCC_KNN_SMOKE" ]] || \
         fail "NVEncC KNN smoke test is not a readable regular file: $NVENCC_KNN_SMOKE"
-    env TDARR_NVENCC="$NVENCC" TDARR_FFMPEG="$FFMPEG" \
-        TDARR_RUNTIME_USER="$RUNTIME_USER" NVENCC_SMOKE_BASE="${TMPDIR:-/tmp}" \
-        bash "$NVENCC_KNN_SMOKE" >/dev/null || \
-        fail "NVEncC 8-bit/10-bit KNN smoke test failed for runtime user $RUNTIME_USER"
 fi
+GPU_SELFTEST_RESULT="$(
+    TDARR_GPU_PIPELINE_LOCK_DIR="$GPU_PIPELINE_LOCK_DIR" \
+    TDARR_GPU_LOCK_HELPER="$GPU_LOCK_HELPER" \
+    TDARR_RUNTIME_USER="$RUNTIME_USER" \
+    TDARR_GRAV1SYNTH="$GRAV1SYNTH" \
+    GRAV1SYNTH_NVENC_REGRESSION="$GRAV1SYNTH_NVENC_REGRESSION" \
+    TDARR_FFMPEG="$FFMPEG" \
+    TDARR_NVENCC_CONTRACT_ENABLED="$NVENCC_CONTRACT_FLAG" \
+    TDARR_NVENCC="$NVENCC" \
+    NVENCC_KNN_SMOKE="$NVENCC_KNN_SMOKE" \
+    NVENCC_SMOKE_BASE="${TMPDIR:-/tmp}" \
+    node "$GPU_SELFTEST_RUNNER"
+)" || fail "owned GPU runtime self-tests failed"
+case "$GPU_SELFTEST_RESULT" in
+    RAN)
+        GPU_RUNTIME_SELFTESTS_RAN=true
+        ;;
+    SKIPPED_BUSY)
+        echo "[grain preflight] INFO: GPU pipeline is busy; runtime GPU self-tests were not started"
+        ;;
+    *)
+        fail "owned GPU self-test runner returned an invalid result"
+        ;;
+esac
 
 # Exercise the exact lossless intermediate codec used by source analysis. CUDA
 # KNN itself is exercised above at both supported bit depths; this independent
@@ -335,7 +364,11 @@ if [[ "${GRAIN_PREFLIGHT_QUIET:-0}" != "1" ]]; then
     echo "[grain preflight] OK: $ACTUAL_VERSION ($ACTUAL_SHA256)"
     if "$NVENCC_CONTRACT_ENABLED"; then
         echo "[grain preflight] OK: $ACTUAL_NVENCC_VERSION_LINE ($ACTUAL_NVENCC_SHA256)"
-        echo "[grain preflight] OK: NVEncC CUDA KNN 8-bit and 10-bit runtime-user paths"
+        if "$GPU_RUNTIME_SELFTESTS_RAN"; then
+            echo "[grain preflight] OK: NVEncC CUDA KNN 8-bit and 10-bit runtime-user paths"
+        else
+            echo "[grain preflight] INFO: NVEncC CUDA KNN runtime paths were not exercised while busy"
+        fi
     else
         echo "[grain preflight] INFO: NVEncC contract deferred until the new artifact mount is deployed"
     fi

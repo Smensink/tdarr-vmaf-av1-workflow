@@ -20,7 +20,6 @@ let fullDecodeCalls = 0;
 // One bounded sample first tries NVDEC and then software. Fail both backends
 // once to model a genuinely transient validator outage.
 let transientDecodeFailures = 2;
-let failNextFullDecode = false;
 let mergeCalls = 0;
 let failMerge = true;
 
@@ -75,10 +74,6 @@ childProcess.spawnSync = function mockSpawnSync(command, argv) {
             const timeoutError = new Error('injected transient decoder spawn timeout');
             timeoutError.code = 'ETIMEDOUT';
             return { error: timeoutError, status: null, stdout: '', stderr: '' };
-        }
-        if (failNextFullDecode) {
-            failNextFullDecode = false;
-            return { status: 69, stdout: '', stderr: 'injected AV1 decode corruption' };
         }
         return { status: 0, stdout: '', stderr: '' };
     }
@@ -184,13 +179,17 @@ async function main() {
     failMerge = false;
     const thirdArgs = argsFor('tdarr-workDir-job-3');
     const third = await plugin(thirdArgs);
-    // Output 2: the checkpoint is still reused and no re-encode happens, but the
-    // finished output is refused by the post-encode size gate (see below).
+    // Output 2: the checkpoint is reused and no re-encode happens, but the
+    // finished output is refused by the post-encode size gate and the exact
+    // oversized generation is retired so it cannot be reused again.
     assert.strictEqual(third.outputNumber, 2);
     assert.strictEqual(encodeCalls, 1,
         'a new Tdarr job with the same source/command must not run another title encode');
     assert.strictEqual(mergeCalls, 2, 'only the cheap failed postprocess stage should be retried');
-    assert.strictEqual(thirdArgs.variables.vmafPostEncodeCheckpointStatus, 'reused');
+    assert.strictEqual(
+        thirdArgs.variables.vmafPostEncodeCheckpointStatus,
+        'retired_size_rejected'
+    );
     assert.strictEqual(secondArgs.variables.vmafPostEncodeCheckpointStatus, 'reused');
     assert.strictEqual(fullDecodeCalls, 8,
         'transient dual-backend attempt plus two three-window validations must run');
@@ -214,9 +213,8 @@ async function main() {
         warning.code === 'final-output-larger-than-source' && warning.advisory === false));
     assert(thirdArgs._logs.some((line) => line.includes('refusing the encode and preserving the original')));
 
-    // A fingerprint-matching file that no longer full-decodes is not reusable. Only
-    // this integrity failure is allowed to trigger another real encode.
-    failNextFullDecode = true;
+    // The oversized generation was retired, so a later job must encode again
+    // even though the source fingerprint and command are unchanged.
     const fourthArgs = argsFor('tdarr-workDir-job-4');
     const fourth = await plugin(fourthArgs);
     // Re-encoded, committed, then refused by the size gate: the synthetic output
@@ -224,14 +222,17 @@ async function main() {
     assert.strictEqual(fourth.outputNumber, 2);
     assert.strictEqual(encodeCalls, 2,
         'failed full-decode validation must invalidate the checkpoint and run a real encode');
-    assert.strictEqual(fullDecodeCalls, 12,
-        'rejected reuse plus replacement commit must run bounded corruption checks');
-    assert.strictEqual(fourthArgs.variables.vmafPostEncodeCheckpointStatus, 'committed');
-    assert(fourthArgs._logs.some((line) =>
-        line.includes('GPU decode confirmed corruption') ||
-        line.includes('bounded decode confirmed corruption')));
+    assert.strictEqual(fullDecodeCalls, 11,
+        'the replacement commit must run the three bounded decode windows');
+    assert.strictEqual(
+        fourthArgs.variables.vmafPostEncodeCheckpointStatus,
+        'retired_size_rejected'
+    );
+    assert(!fourthArgs._logs.some((line) =>
+        line.includes('skipping the completed title encode')),
+    'retired oversized checkpoint must never be reused');
 
-    console.log('PASS post-encode retry resumes checkpoint; oversized output fails closed; decode corruption re-encodes');
+    console.log('PASS post-encode retry resumes checkpoint; oversized generation fails closed and is retired');
 }
 
 main().catch((error) => {

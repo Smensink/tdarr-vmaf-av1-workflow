@@ -13,6 +13,32 @@ var grainArtifact = require('../../_lib/grainAnalysisArtifact.js');
 var grainVmafContract = require('../../_lib/grainVmafContract.js');
 var nvenccKnn = require('../../_lib/nvenccKnn.js');
 
+function buildSampleExtractionArgs(inputPath, outputPath, seekSeconds, durationSeconds, videoMap) {
+    return [
+        '-ss', Number(seekSeconds).toFixed(2),
+        '-i', String(inputPath),
+        '-t', String(durationSeconds),
+        '-map', String(videoMap),
+        '-an', '-sn', '-dn',
+        '-c:v', 'copy',
+        '-avoid_negative_ts', 'make_zero',
+        '-reset_timestamps', '1',
+        '-y', String(outputPath),
+    ];
+}
+
+function buildFeatureExtractionArgs(inputPath, filterComplex) {
+    return [
+        '-y',
+        '-hwaccel', 'cuda',
+        '-i', String(inputPath),
+        '-filter_complex', String(filterComplex),
+        '-map', '[o1]',
+        '-an',
+        '-f', 'null', '-',
+    ];
+}
+
 function resetVmafJobIdentity(variables) {
     if (!variables || typeof variables !== 'object') {
         throw new Error('VMAF job identity reset requires a variables object');
@@ -1070,7 +1096,7 @@ function isValidVideoSample(samplePath, args, expectedDuration) {
 
 
 
-    var execSync = require('child_process').execSync;
+    var execFileSync = require('child_process').execFileSync;
 
 
 
@@ -1114,7 +1140,10 @@ function isValidVideoSample(samplePath, args, expectedDuration) {
 
 
 
-                var probeOut = execSync('tdarr-ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "' + samplePath + '"', {
+                var probeOut = execFileSync(args.ffprobePath || 'tdarr-ffprobe', [
+                    '-v', 'error', '-show_entries', 'format=duration',
+                    '-of', 'default=nw=1:nk=1', samplePath
+                ], {
 
 
 
@@ -1122,7 +1151,9 @@ function isValidVideoSample(samplePath, args, expectedDuration) {
 
 
 
-                    timeout: 15000
+                    timeout: 15000,
+                    shell: false,
+                    windowsHide: true
 
 
 
@@ -1186,7 +1217,10 @@ function isValidVideoSample(samplePath, args, expectedDuration) {
 
 
 
-        execSync('"' + args.ffmpegPath + '" -v error -i "' + samplePath + '" -map 0:v:0 -frames:v 1 -f null -', { stdio: 'pipe', timeout: 30000 });
+        execFileSync(args.ffmpegPath, [
+            '-v', 'error', '-i', samplePath, '-map', '0:v:0',
+            '-frames:v', '1', '-f', 'null', '-'
+        ], { stdio: 'pipe', timeout: 30000, shell: false, windowsHide: true });
 
 
 
@@ -1880,7 +1914,7 @@ var plugin = function (args) {
 
 
 
-    var execSync = require('child_process').execSync;
+    var execFileSync = require('child_process').execFileSync;
 
 
 
@@ -6647,15 +6681,14 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-            var cmd = '"' + args.ffmpegPath + '" -ss ' + seekAttempts[att].toFixed(2) + ' -i "' + inputFile + '"'
+            var extractionArgs = buildSampleExtractionArgs(
+                inputFile, outputPath, seekAttempts[att], segmentDuration, videoMap);
 
 
 
-                + ' -t ' + segmentDuration + ' -map ' + videoMap
 
 
 
-                + ' -an -sn -dn -c:v copy -avoid_negative_ts make_zero -reset_timestamps 1 -y "' + outputPath + '"';
 
 
 
@@ -6663,7 +6696,9 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-                execSync(cmd, { stdio: 'pipe', timeout: 120000 });
+                execFileSync(args.ffmpegPath, extractionArgs, {
+                    stdio: 'pipe', timeout: 120000, shell: false, windowsHide: true
+                });
 
 
 
@@ -6823,15 +6858,16 @@ for (var i = 0; i < numSegments; i++) {
 
         for (var ha = 0; ha < holdoutAttempts.length && !holdoutExtracted; ha++) {
 
-            var hcmd = '"' + args.ffmpegPath + '" -ss ' + holdoutAttempts[ha].toFixed(2) + ' -i "' + inputFile + '"'
+            var holdoutExtractionArgs = buildSampleExtractionArgs(
+                inputFile, holdoutPath, holdoutAttempts[ha], segmentDuration, holdoutMap);
 
-                + ' -t ' + segmentDuration + ' -map ' + holdoutMap
 
-                + ' -an -sn -dn -c:v copy -avoid_negative_ts make_zero -reset_timestamps 1 -y "' + holdoutPath + '"';
 
             try {
 
-                execSync(hcmd, { stdio: 'pipe', timeout: 120000 });
+                execFileSync(args.ffmpegPath, holdoutExtractionArgs, {
+                    stdio: 'pipe', timeout: 120000, shell: false, windowsHide: true
+                });
 
                 if (isValidVideoSample(holdoutPath, args, segmentDuration)) {
 
@@ -7084,7 +7120,7 @@ for (var i = 0; i < numSegments; i++) {
     var srcGrain = null, srcSI = null, srcTI = null, srcDark = null, srcLuma = null;
     try {
         if (samplePaths.length > 0) {
-            var execFeat = require('child_process').execSync;
+            var execFeat = require('child_process').execFileSync;
             var fsFeat = require('fs');
             var featIdx = [0];
             if (samplePaths.length >= 3) { featIdx.push(Math.floor(samplePaths.length / 2)); featIdx.push(samplePaths.length - 1); }
@@ -7112,8 +7148,9 @@ for (var i = 0; i < numSegments; i++) {
                     + '[b]sobel,signalstats,metadata=print:file=' + _f2 + ',nullsink;'
                     + '[c]split[c1][c2];[c2]hqdn3d=4:4:6:6[cd];[c1][cd]blend=all_mode=difference,signalstats,metadata=print:file=' + _f3 + ',nullsink';
                 try {
-                    execFeat('"' + args.ffmpegPath + '" -y -hwaccel cuda -i "' + _sp + '" -filter_complex "' + _fc + '" -map "[o1]" -an -f null -',
-                        { stdio: 'pipe', timeout: 120000, shell: '/bin/sh' });
+                    execFeat(args.ffmpegPath, buildFeatureExtractionArgs(_sp, _fc), {
+                        stdio: 'pipe', timeout: 120000, shell: false, windowsHide: true
+                    });
                 } catch (e) {}
                 yavgAll = yavgAll.concat(_featVals(_f1, 'YAVG'));
                 ydifAll = ydifAll.concat(_featVals(_f1, 'YDIF'));
@@ -7169,6 +7206,8 @@ for (var i = 0; i < numSegments; i++) {
 
 exports.plugin = plugin;
 exports._test = {
+    buildSampleExtractionArgs: buildSampleExtractionArgs,
+    buildFeatureExtractionArgs: buildFeatureExtractionArgs,
     knownColorValue: knownColorValue,
     matroskaColorValue: matroskaColorValue,
     buildMkvColorMetadataArgs: buildMkvColorMetadataArgs,

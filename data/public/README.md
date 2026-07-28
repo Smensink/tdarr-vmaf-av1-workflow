@@ -4,7 +4,10 @@
 consistent read-only SQLite online backup. It is not a redacted copy of raw
 pages.
 
-Schema:
+Its export schema is `tdarr-vmaf-public-learning/v3`. This is independent of
+the private live learning database's runtime schema 17.
+
+Tables:
 
 - `snapshot_metadata` — export schema, timestamp, source row counts, and
   minimum bucket size;

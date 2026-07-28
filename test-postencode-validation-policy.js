@@ -37,6 +37,7 @@ const sourceProbe = {
         width: 3840,
         height: 2160,
         avg_frame_rate: '24/1',
+        nb_read_packets: '2400',
         disposition: { attached_pic: 0 },
     }],
 };
@@ -45,6 +46,9 @@ const originalSpawnSync = childProcess.spawnSync;
 let calls = [];
 let failNextCuda = false;
 let corruptNextCuda = false;
+let outputDuration = '100';
+let outputRate = '24/1';
+let outputPackets = '2400';
 childProcess.spawnSync = function mockSpawnSync(command, argv) {
     calls.push({ command, argv: argv.slice() });
     if (command === 'ffprobe') {
@@ -53,7 +57,7 @@ childProcess.spawnSync = function mockSpawnSync(command, argv) {
         return {
             status: 0,
             stdout: JSON.stringify({
-                format: { format_name: 'matroska,webm', duration: '100' },
+                format: { format_name: 'matroska,webm', duration: outputDuration },
                 streams: [{
                     index: 0,
                     codec_type: 'video',
@@ -61,9 +65,9 @@ childProcess.spawnSync = function mockSpawnSync(command, argv) {
                     width: 3840,
                     height: 2160,
                     pix_fmt: 'yuv420p10le',
-                    avg_frame_rate: '24/1',
-                    r_frame_rate: '24/1',
-                    nb_read_packets: '2400',
+                    avg_frame_rate: outputRate,
+                    r_frame_rate: outputRate,
+                    nb_read_packets: outputPackets,
                     disposition: { attached_pic: 0 },
                 }],
             }),
@@ -134,6 +138,39 @@ try {
         'one failed CUDA sample may add one bounded software fallback only');
     assert.strictEqual(fallbackCalls[1].argv.includes('-hwaccel'), false);
     assert(fallbackCalls[1].argv.includes('-t'));
+
+    const sparseSourceProbe = {
+        format: { duration: '5206.944' },
+        streams: [{
+            index: 0,
+            codec_type: 'video',
+            codec_name: 'hevc',
+            width: 3840,
+            height: 2160,
+            avg_frame_rate: '24000/1001',
+            nb_read_packets: '122264',
+            disposition: { attached_pic: 0 },
+        }],
+    };
+    outputDuration = '5206.952';
+    outputRate = '24000/1001';
+    outputPackets = '122252';
+    const sparse = validation.validatePostEncodeMedia(
+        'ffprobe', 'ffmpeg', artifactPath, sparseSourceProbe,
+        { width: 3840, height: 2160 }, true, { mode: 'exhaustive' }
+    );
+    assert.strictEqual(sparse.primary.source_packet_count, 122264);
+    assert.strictEqual(sparse.primary.packet_count_delta, -12,
+        'measured sparse/VFR source packet counts must replace nominal fps*duration');
+
+    outputPackets = '122100';
+    assert.throws(() => validation.validatePostEncodeMedia(
+        'ffprobe', 'ffmpeg', artifactPath, sparseSourceProbe,
+        { width: 3840, height: 2160 }, true, { mode: 'exhaustive' }
+    ), /packet coverage is incomplete/);
+    outputDuration = '100';
+    outputRate = '24/1';
+    outputPackets = '2400';
 
     calls = [];
     corruptNextCuda = true;

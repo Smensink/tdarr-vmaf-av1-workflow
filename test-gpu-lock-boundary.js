@@ -72,25 +72,28 @@ const calcSrc = fs.readFileSync(path.join(__dirname,
   'custom-cont-init.d/vmaf-plugin-patches/calculateVMAF/1.0.0/index.js'), 'utf8');
 
 assert.ok(/function releaseGpuLockForCpuScoring/.test(calcSrc));
-assert.ok(/function reacquireGpuLockAfterCpuScoring/.test(calcSrc));
+assert.ok(!/function reacquireGpuLockAfterCpuScoring/.test(calcSrc),
+  'CPU-only aggregation must not contain a blocking internal reacquire');
 
 // Anchor on the call sites, not the function definitions (which contain the
 // same identifier and would otherwise match first).
-const releaseAt = calcSrc.indexOf('= releaseGpuLockForCpuScoring(args, hasCpuV1)');
+const releaseAt = calcSrc.indexOf('releaseGpuLockForCpuScoring(args, hasCpuV1);');
 const startAt = calcSrc.indexOf('=== Starting VMAF Calculations ===');
-const reacquireAt = calcSrc.indexOf('reacquireGpuLockAfterCpuScoring(args, _gpuLockReleasedForCpuScoring)');
 const aggregateAt = calcSrc.indexOf('=== Aggregating Results ===');
-assert.ok(releaseAt > 0 && startAt > 0 && reacquireAt > 0 && aggregateAt > 0);
+assert.ok(releaseAt > 0 && startAt > 0 && aggregateAt > 0);
 assert.ok(releaseAt < startAt, 'the lock must be released before scoring begins');
-assert.ok(startAt < reacquireAt, 'the lock must stay released across scoring');
-assert.ok(reacquireAt < aggregateAt, 'the lock must be back before anything downstream');
+assert.ok(startAt < aggregateAt, 'the lock must stay released across CPU-only aggregation');
+assert.ok(!calcSrc.includes('reacquireGpuLockAfterCpuScoring('),
+  'explicit downstream Acquire nodes own the next GPU transition');
 
 // Only the CPU-v1 path may release; the GPU-v0 rollback path must not.
 assert.ok(/if \(hasCpuV1 !== true\) return null;/.test(calcSrc),
   'the GPU-v0 rollback path must never release the lock');
 
 // A failed release must keep the lock rather than continue unlocked.
-assert.ok(/keeping lock/.test(calcSrc),
+assert.ok(/releaseResult\.released !== true/.test(calcSrc) &&
+  /retaining ownership/.test(calcSrc) &&
+  /expectedGeneration: info\.leaseGeneration/.test(calcSrc),
   'a failed release must fall back to holding the lock');
 
 // --- the scorer must genuinely be GPU-free -----------------------------------

@@ -29,7 +29,7 @@ var details = function () { return ({
             type: 'boolean',
             defaultValue: 'false',
             inputUI: { type: 'switch' },
-            tooltip: 'If enabled, release even when the owner token does not match. Normally leave disabled.',
+            tooltip: 'Deprecated safety control. Force-releasing a lease owned by another job is refused.',
         },
     ],
     outputs: [
@@ -52,7 +52,10 @@ var plugin = function (args) {
     var forceRelease = args.inputs.forceRelease === true || args.inputs.forceRelease === 'true';
 
     args.jobLog('=== Release GPU Pipeline Lock ===');
-    if (!forceRelease && (!args.variables.vmafGpuPipelineLockAcquired || !token)) {
+    if (forceRelease) {
+        throw new Error('Force-releasing the GPU pipeline lock is disabled; wait for owner liveness checks to retire a stale lease.');
+    }
+    if (!args.variables.vmafGpuPipelineLockAcquired || !token) {
         args.jobLog('No GPU pipeline lock is owned by this job - release is an idempotent no-op.');
         args.variables.vmafGpuPipelineLockReleased = true;
         args.variables.vmafGpuPipelineLockAcquired = false;
@@ -62,7 +65,10 @@ var plugin = function (args) {
             variables: args.variables,
         };
     }
-    var result = lock.release(lockDir, token, { force: forceRelease });
+    var result = lock.release(lockDir, token, {
+        force: false,
+        expectedGeneration: lockInfo.leaseGeneration || null
+    });
     if (result.released) {
         args.jobLog('GPU pipeline lock released: ' + lock.describeOwner(result.owner));
         args.variables.vmafGpuPipelineLockReleased = true;

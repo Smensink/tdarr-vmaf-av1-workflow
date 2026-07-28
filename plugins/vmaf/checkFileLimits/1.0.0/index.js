@@ -47,29 +47,49 @@ var details = function () { return ({
     ],
 }); };
 exports.details = details;
+
+function parseLimit(value, defaultValue) {
+    if (value === undefined || value === null || String(value).trim() === '') {
+        return defaultValue;
+    }
+    var parsed = Number(value);
+    return isFinite(parsed) && parsed >= 0 ? parsed : defaultValue;
+}
+
+function fileSizeGiB(inputFileObj) {
+    var file = inputFileObj || {};
+    // Tdarr's file_size field is expressed in MiB, not bytes.
+    var tdarrSizeMiB = Number(file.file_size);
+    if (isFinite(tdarrSizeMiB) && tdarrSizeMiB >= 0) {
+        return tdarrSizeMiB / 1024;
+    }
+    // ffprobe format.size is a byte count and is a safe fallback when Tdarr has
+    // not populated file_size.
+    var ffprobeBytes = Number(file.ffProbeData && file.ffProbeData.format
+        && file.ffProbeData.format.size);
+    return isFinite(ffprobeBytes) && ffprobeBytes >= 0
+        ? ffprobeBytes / (1024 * 1024 * 1024)
+        : 0;
+}
+
 var plugin = function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
 
-    var maxFileSizeGB = Number(args.inputs.maxFileSizeGB) || 50;
-    var maxDurationHours = Number(args.inputs.maxDurationHours) || 4;
+    var maxFileSizeGB = parseLimit(args.inputs.maxFileSizeGB, 50);
+    var maxDurationHours = parseLimit(args.inputs.maxDurationHours, 4);
 
-    // ENHANCEMENT FIX #14: Input validation
-    if (isNaN(maxFileSizeGB) || maxFileSizeGB < 0) {
+    if (Number(args.inputs.maxFileSizeGB) < 0 || (String(args.inputs.maxFileSizeGB || '').trim() !== ''
+        && !isFinite(Number(args.inputs.maxFileSizeGB)))) {
         args.jobLog('WARNING: Invalid maxFileSizeGB (' + args.inputs.maxFileSizeGB + '), using default 50');
-        maxFileSizeGB = 50;
     }
-    if (isNaN(maxDurationHours) || maxDurationHours < 0) {
+    if (Number(args.inputs.maxDurationHours) < 0 || (String(args.inputs.maxDurationHours || '').trim() !== ''
+        && !isFinite(Number(args.inputs.maxDurationHours)))) {
         args.jobLog('WARNING: Invalid maxDurationHours (' + args.inputs.maxDurationHours + '), using default 4');
-        maxDurationHours = 4;
     }
 
-    var fileSizeGB = 0;
+    var fileSizeGB = fileSizeGiB(args.inputFileObj);
     var durationHours = 0;
-
-    if (args.inputFileObj.file_size) {
-        fileSizeGB = args.inputFileObj.file_size / (1024 * 1024 * 1024); // Convert bytes to GB
-    }
 
     if (args.inputFileObj.ffProbeData && args.inputFileObj.ffProbeData.format) {
         var durationSeconds = parseFloat(args.inputFileObj.ffProbeData.format.duration) || 0;
@@ -102,3 +122,7 @@ var plugin = function (args) {
     };
 };
 exports.plugin = plugin;
+exports._test = {
+    parseLimit: parseLimit,
+    fileSizeGiB: fileSizeGiB,
+};

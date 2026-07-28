@@ -35,7 +35,7 @@ var details = function () { return ({
             type: 'boolean',
             defaultValue: 'false',
             inputUI: { type: 'dropdown', options: ['true', 'false'] },
-            tooltip: 'Explicit production promotion switch. Uses the promoted native-10-bit CPU VMAF-v1 plus integrated CAMBI contract and never falls back to GPU-v0 evidence.',
+            tooltip: 'Explicit production promotion switch. Unsupported geometry is rejected before activation and retains the existing GPU-v0 contract; once an eligible CPU identity is active, result-level cross-contract fallback is forbidden.',
         },
         {
             label: 'Authorize Provisional HDR/PQ CPU-v1',
@@ -49,9 +49,17 @@ var details = function () { return ({
             label: 'Max Parallel CPU VMAF-v1',
             name: 'maxParallelCpuV1',
             type: 'number',
+            defaultValue: '1',
+            inputUI: { type: 'text' },
+            tooltip: 'Per-job CPU-v1 task count. Fixed at one; the wrapper semaphore enforces the host-wide concurrency limit.',
+        },
+        {
+            label: 'CPU VMAF-v1 Threads Per Score',
+            name: 'cpuV1ThreadsPerScore',
+            type: 'number',
             defaultValue: '2',
             inputUI: { type: 'text' },
-            tooltip: 'Qualification-only CPU-v1 worker count, clamped to 1-2. With four threads per task this respects the container limit of eight logical CPUs.',
+            tooltip: 'Worker threads for each CPU-v1 score, independently clamped to 1-4. This is separate from task concurrency and standalone pre-FGS CAMBI threads.',
         },
         {
             label: 'Pre-FGS CAMBI CPU Threads Per Task',
@@ -149,7 +157,10 @@ function runSsimAsync(ffmpegPath, distortedPath, referencePath) {
                 '-i', referencePath,
                 '-filter_complex', '[0:v]settb=1/1000,setpts=N[d];[1:v]settb=1/1000,setpts=N[r];[d][r]ssim',
                 '-f', 'null', '-'];
-            var child = spawn(ffmpegPath, fargs, { stdio: ['ignore', 'pipe', 'pipe'] });
+            var child = spawn(ffmpegPath, fargs, {
+                shell: false,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
             var out = '';
             var timer = setTimeout(function() { try { child.kill('SIGKILL'); } catch (e) {} }, 180000);
             if (child.stderr) child.stderr.on('data', function(d) { out += d.toString(); });
@@ -220,6 +231,38 @@ function resolveCpuV1ProvisionalHdrAuthorized(args) {
          String(args.inputs.vmafCpuV1ProductionAllowProvisionalHdr).toLowerCase() === 'true'));
 }
 
+function resolveCpuV1ExecutionPolicy(args) {
+    var productionRequested = resolveCpuV1ProductionEnabled(args);
+    var qualificationRequested = productionRequested || resolveCpuV1QualificationEnabled(args);
+    var isHdr = Boolean(args && args.variables && args.variables.isHDR === true);
+    if (qualificationRequested && isHdr) {
+        if (productionRequested && !resolveCpuV1ProvisionalHdrAuthorized(args)) {
+            return Object.freeze({
+                productionRequested: true,
+                qualificationRequested: true,
+                productionEnabled: false,
+                qualificationEnabled: false,
+                fallbackToGpuV0: true,
+                fallbackCode: 'CPU_V1_PROVISIONAL_HDR_NOT_AUTHORIZED',
+                fallbackReason: 'CPU VMAF-v1 HDR/PQ production authority is not authorized',
+            });
+        }
+        if (!productionRequested &&
+                (!args.variables || args.variables.vmafCpuV1AllowProvisionalHdr !== true)) {
+            throw new Error('CPU VMAF-v1 HDR/PQ qualification requires explicit vmafCpuV1AllowProvisionalHdr=true');
+        }
+    }
+    return Object.freeze({
+        productionRequested: productionRequested,
+        qualificationRequested: qualificationRequested,
+        productionEnabled: productionRequested,
+        qualificationEnabled: qualificationRequested,
+        fallbackToGpuV0: false,
+        fallbackCode: null,
+        fallbackReason: null,
+    });
+}
+
 function parseFrameRate(stream) {
     var raw = stream && (stream.avg_frame_rate || stream.r_frame_rate || stream.frame_rate);
     if (typeof raw === 'string' && raw.indexOf('/') !== -1) {
@@ -237,18 +280,26 @@ var GPU_LOCK_MODULE = '/custom-cont-init.d/vmaf-plugin-patches/_lib/gpuPipelineL
 
 /**
  * Release the exclusive GPU pipeline lock around CPU-only VMAF-v1 scoring.
- * Returns the lock descriptor needed to re-acquire, or null when nothing was
- * released (GPU-v0 rollback path, or we never held the lock).
+ * Returns the released lock descriptor, or null when nothing was released.
+ * A non-confirming release retains every ownership variable unchanged.
  */
-function releaseGpuLockForCpuScoring(args, hasCpuV1) {
+function releaseGpuLockForCpuScoring(args, hasCpuV1, lockImpl) {
     if (hasCpuV1 !== true) return null;
     var info = args.variables && args.variables.vmafGpuPipelineLock;
     if (!args.variables || args.variables.vmafGpuPipelineLockAcquired !== true || !info || !info.token) {
         return null;
     }
     try {
-        var lock = require(GPU_LOCK_MODULE);
-        lock.release(info.lockDir, info.token, { force: false });
+        var lock = lockImpl || require(GPU_LOCK_MODULE);
+        var releaseResult = lock.release(info.lockDir, info.token, {
+            force: false,
+            expectedGeneration: info.leaseGeneration || null,
+        });
+        if (!releaseResult || releaseResult.released !== true) {
+            args.jobLog('GPU pipeline lock release skipped (retaining ownership): ' +
+                String(releaseResult && releaseResult.reason || 'release was not confirmed'));
+            return null;
+        }
         args.variables.vmafGpuPipelineLockAcquired = false;
         args.variables.vmafGpuPipelineLockReleased = true;
         args.variables.vmafGpuPipelineLockReleasedForCpuScoring = true;
@@ -262,51 +313,21 @@ function releaseGpuLockForCpuScoring(args, hasCpuV1) {
     }
 }
 
-/** Re-take the lock after CPU-only scoring. Blocks until the GPU is ours again. */
-function reacquireGpuLockAfterCpuScoring(args, info) {
-    if (!info || !info.lockDir) return;
-    var lock = require(GPU_LOCK_MODULE);
-    var startedAt = Date.now();
-    var result = lock.acquireBlocking({
-        lockDir: info.lockDir,
-        owner: {
-            ownerId: info.ownerId,
-            workerName: info.workerName,
-            filePath: info.ownerId,
-            stage: 'vmaf-gpu-pipeline',
-            plugin: 'calculateVMAF'
-        },
-        waitPollSeconds: 5,
-        waitLogSeconds: 60,
-        maxWaitSeconds: 12 * 3600,
-        staleHeartbeatSeconds: 2 * 3600,
-        maxLockAgeSeconds: 8 * 3600,
-        orphanProcessGraceSeconds: 180,
-        heartbeatIntervalSeconds: 30,
-        existingToken: null,
-        log: function (message) { args.jobLog(message); }
-    });
-    var waited = Math.round((Date.now() - startedAt) / 1000);
-    args.variables.vmafGpuPipelineLock = {
-        lockDir: info.lockDir,
-        token: result.owner.token,
-        ownerId: result.owner.ownerId,
-        workerName: info.workerName,
-        acquiredAt: result.owner.acquiredAt,
-        waitedSeconds: waited
-    };
-    args.variables.vmafGpuPipelineLockAcquired = true;
-    args.variables.vmafGpuPipelineLockReleased = false;
-    args.variables.vmafGpuPipelineLockReleasedForCpuScoring = false;
-    accumulateTimingSeconds(args.variables, 'vmafGpuLockCpuScoringWaitSec', waited);
-    args.jobLog('GPU pipeline lock re-acquired after CPU-only scoring'
-        + (waited > 0 ? ' after waiting ' + waited + 's' : '') + '.');
-}
-
 function maxParallelCpuV1(args) {
     var value = Number(args && args.inputs && args.inputs.maxParallelCpuV1);
+    if (!isFinite(value) || value < 1) value = 1;
+    return 1;
+}
+
+function cpuV1ThreadsPerScore(args) {
+    var value = Number(args && args.inputs && args.inputs.cpuV1ThreadsPerScore);
     if (!isFinite(value) || value < 1) value = 2;
-    return Math.max(1, Math.min(2, Math.floor(value)));
+    return Math.max(1, Math.min(4, Math.floor(value)));
+}
+
+function isCpuV1GeometryError(error) {
+    return Boolean(error && typeof error.code === 'string' &&
+        error.code.indexOf('VMAF_V1_GEOMETRY_') === 0);
 }
 
 function cpuV1Capability(args, contract, fsImpl) {
@@ -316,6 +337,20 @@ function cpuV1Capability(args, contract, fsImpl) {
         contract.upstreamRevision !== vmafV1Cpu.REVISION ||
         contract.runtimePath !== vmafV1Cpu.WRAPPER_PATH) return false;
     try {
+        var geometry = vmafV1Cpu.validateGeometry({
+            width: Number(contract.sourceWidth),
+            height: Number(contract.sourceHeight),
+            sampleAspectRatio: contract.sourceSampleAspectRatio,
+            displayAspectRatio: contract.sourceDisplayAspectRatio,
+            geometryNormalization: contract.geometryNormalization,
+        });
+        var selectedModel = vmafV1Cpu.selectModel({
+            width: geometry.width,
+            height: geometry.height,
+            modelProfile: vmafV1Cpu.profileForModelVersion(contract.modelVersion),
+        });
+        if (selectedModel.version !== contract.modelVersion ||
+                selectedModel.resolutionClass !== geometry.resolutionClass) return false;
         fsImpl.accessSync(vmafV1Cpu.WRAPPER_PATH, fsImpl.constants.X_OK);
         fsImpl.accessSync(vmafV1Cpu.SCORE_WRAPPER_PATH, fsImpl.constants.X_OK);
         return true;
@@ -531,7 +566,7 @@ function calculateSingleVmafV1CpuAsync(args, result, samples, cacheDir, metricCo
                 contentClass: metricContract.contentClass,
                 allowProvisionalHdr: metricContract.contentClass === 'hdr-pq',
                 subsample: getVmafSubsampleInt(args),
-                threads: preFgsCambiThreads(args),
+                threads: cpuV1ThreadsPerScore(args),
                 pooling: metricContract.poolingPrimary,
             });
         } catch (error) {
@@ -656,11 +691,11 @@ function calculateSingleVmafGpuAsync(args, result, samples, cacheDir, modelPath,
             // The Blackwell-compatible path performs pixel-format conversion in
             // system memory and uploads yuv420p frames for GPU scoring. There is
             // no second CPU-VMAF path and no duplicate retry of this command.
-            var cmd = buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample,
+            var command = buildGpuVmafCommand(args.ffmpegPath, result.outputPath, originalSample,
                 logPath, modelPath, args.inputFileObj, true, distortedEncoder, nSubsample);
             var start = Date.now();
-            var child = execSpawn(cmd, {
-                shell: true,
+            var child = execSpawn(command.executable, command.args, {
+                shell: false,
                 stdio: ['ignore', 'pipe', 'pipe'],
                 env: process.env,
                 detached: true
@@ -745,7 +780,7 @@ function calculateSingleVmafGpuAsync(args, result, samples, cacheDir, modelPath,
 // unavailable in this CUDA-only contract and is deliberately not requested
 // from libvmaf_cuda (which silently omits it).
 function checkGpuVmafSupport(ffmpegPath, metricContract) {
-    var execSync = require('child_process').execSync;
+    var execFileSync = require('child_process').execFileSync;
     var fs = require('fs');
     if (!metricContract || metricContract.backend !== 'cuda' ||
             metricContract.filterName !== 'libvmaf_cuda' ||
@@ -758,9 +793,10 @@ function checkGpuVmafSupport(ffmpegPath, metricContract) {
         var preferred = '/custom-libvmaf-lib:/usr/local/ffmpeg-custom/lib:/usr/local/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:/usr/local/lib';
         env.LD_LIBRARY_PATH = preferred + (env.LD_LIBRARY_PATH ? ':' + env.LD_LIBRARY_PATH : '');
 
-        var filters = execSync('"' + ffmpegPath + '" -hide_banner -filters 2>&1', {
+        var filters = execFileSync(ffmpegPath, ['-hide_banner', '-filters'], {
             encoding: 'utf8',
-            shell: true,
+            shell: false,
+            windowsHide: true,
             timeout: 10000,
             env: env,
             maxBuffer: 10 * 1024 * 1024
@@ -770,16 +806,23 @@ function checkGpuVmafSupport(ffmpegPath, metricContract) {
         var modelParam = ':model=path=' + metricContract.modelPath;
         try { if (fs.existsSync(logPath)) fs.unlinkSync(logPath); } catch (ignore) {}
 
-        var cmd = '"' + ffmpegPath + '" -hide_banner -y -init_hw_device cuda=cuda0:0 -filter_hw_device cuda0 ' +
-                    '-f lavfi -i testsrc2=s=128x128:d=0.25:r=8 ' +
-                    '-f lavfi -i testsrc2=s=128x128:d=0.25:r=8 ' +
-                    '-filter_complex "[0:v]format=' + metricContract.scoringPixelFormat + ',hwupload[dist];[1:v]format=' + metricContract.scoringPixelFormat + ',hwupload[ref];[dist][ref]' +
-                    metricContract.filterName + '=log_fmt=json:log_path=' + logPath + modelParam + '" ' +
-                    '-f null -';
-        execSync(cmd, {
+        var capabilityFilter = '[0:v]format=' + metricContract.scoringPixelFormat +
+            ',hwupload[dist];[1:v]format=' + metricContract.scoringPixelFormat +
+            ',hwupload[ref];[dist][ref]' + metricContract.filterName +
+            '=log_fmt=json:log_path=' + logPath + modelParam;
+        execFileSync(ffmpegPath, [
+            '-hide_banner', '-y',
+            '-init_hw_device', 'cuda=cuda0:0',
+            '-filter_hw_device', 'cuda0',
+            '-f', 'lavfi', '-i', 'testsrc2=s=128x128:d=0.25:r=8',
+            '-f', 'lavfi', '-i', 'testsrc2=s=128x128:d=0.25:r=8',
+            '-filter_complex', capabilityFilter,
+            '-f', 'null', '-',
+        ], {
             stdio: ['ignore', 'pipe', 'pipe'],
             encoding: 'utf8',
-            shell: true,
+            shell: false,
+            windowsHide: true,
             timeout: 20000,
             env: env,
             maxBuffer: 10 * 1024 * 1024
@@ -881,9 +924,15 @@ function checkXpsnrShadowCapability(args) {
     if (args.variables.vmafXpsnrCapable === true) return true;
     if (args.variables.vmafXpsnrCapable === false) return false;
     try {
-        var execSyncXp = require('child_process').execSync;
-        var filtersOut = execSyncXp('"' + args.ffmpegPath + '" -hide_banner -filters 2>&1', { encoding: 'utf8', shell: true, timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
-        var decodersOut = execSyncXp('"' + args.ffmpegPath + '" -hide_banner -decoders 2>&1', { encoding: 'utf8', shell: true, timeout: 10000, maxBuffer: 10 * 1024 * 1024 });
+        var execFileSyncXp = require('child_process').execFileSync;
+        var filtersOut = execFileSyncXp(args.ffmpegPath, ['-hide_banner', '-filters'], {
+            encoding: 'utf8', shell: false, windowsHide: true,
+            timeout: 10000, maxBuffer: 10 * 1024 * 1024
+        });
+        var decodersOut = execFileSyncXp(args.ffmpegPath, ['-hide_banner', '-decoders'], {
+            encoding: 'utf8', shell: false, windowsHide: true,
+            timeout: 10000, maxBuffer: 10 * 1024 * 1024
+        });
         var capable = filtersOut.indexOf(' xpsnr ') !== -1 && decodersOut.indexOf('libdav1d') !== -1;
         // Cache either way: the binary cannot gain/lose filters mid-job.
         args.variables.vmafXpsnrCapable = capable;
@@ -1070,8 +1119,7 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
     // Build command - both inputs use CUVID decode to keep everything in GPU memory
     // Initialize CUDA device with explicit name for filter use
     var distortedCuvid = mapEncoderToCuvid(distortedEncoder);
-    var cmdParts = [
-        '"' + ffmpegPath + '"',
+    var commandArgs = [
         '-init_hw_device', 'cuda=cuda0:0',
         '-filter_hw_device', 'cuda0',
         '-hwaccel', 'cuda',
@@ -1082,9 +1130,9 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
     // compute_90-only in this build and crashes on Blackwell (sm_120), so format
     // conversion is done on CPU (format=yuv420p) then re-uploaded with generic hwupload.
     if (distortedCuvid) {
-        cmdParts.push('-c:v', distortedCuvid);
+        commandArgs.push('-c:v', distortedCuvid);
     }
-    cmdParts.push('-i', '"' + distortedPath + '"');
+    commandArgs.push('-i', String(distortedPath));
 
     // Add reference file input with CUVID decoder if supported.
         // This keeps both streams in GPU memory from decode to VMAF calculation.
@@ -1096,22 +1144,22 @@ function buildGpuVmafCommand(ffmpegPath, distortedPath, referencePath, logPath, 
         // conservative) proxy for the 10-bit output's banding. Native 10-bit VMAF is CPU-only here.
         var tonemapRef = '';
         if (referenceCuvid) {
-            cmdParts.push('-hwaccel', 'cuda');
-            cmdParts.push('-hwaccel_device', '0');
-            cmdParts.push('-c:v', referenceCuvid);
-            cmdParts.push('-i', '"' + referencePath + '"');
+            commandArgs.push('-hwaccel', 'cuda');
+            commandArgs.push('-hwaccel_device', '0');
+            commandArgs.push('-c:v', referenceCuvid);
+            commandArgs.push('-i', String(referencePath));
             // cuvid decodes to system memory; CPU tonemap (HDR) + format=yuv420p makes both
             // streams identical 8-bit, then generic hwupload puts them on the CUDA device for
             // libvmaf_cuda. (hwdownload cannot target yuv420p directly from an nv12/p010 surface.)
-            cmdParts.push('-filter_complex', '"[0:v]settb=1/1000,setpts=N' + tonemapRef + ',format=' + targetFormat + ',hwupload[dis];[1:v]settb=1/1000,setpts=N' + tonemapRef + ',format=' + targetFormat + ',hwupload[ref];[dis][ref]libvmaf_cuda=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest' + (nSubsample > 1 ? ':n_subsample=' + nSubsample : '') + '"');
+            commandArgs.push('-filter_complex', '[0:v]settb=1/1000,setpts=N' + tonemapRef + ',format=' + targetFormat + ',hwupload[dis];[1:v]settb=1/1000,setpts=N' + tonemapRef + ',format=' + targetFormat + ',hwupload[ref];[dis][ref]libvmaf_cuda=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest' + (nSubsample > 1 ? ':n_subsample=' + nSubsample : ''));
                     } else {
                                 // Reference codec not supported by CUVID; decode in software then upload to GPU.
-                                cmdParts.push('-i', '"' + referencePath + '"');
-                                cmdParts.push('-filter_complex', '"[0:v]settb=1/1000,setpts=N' + tonemapRef + ',format=' + targetFormat + ',hwupload[dis];[1:v]settb=1/1000,setpts=N' + tonemapRef + ',format=' + targetFormat + ',hwupload[ref];[dis][ref]libvmaf_cuda=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest' + (nSubsample > 1 ? ':n_subsample=' + nSubsample : '') + '"');
+                                commandArgs.push('-i', String(referencePath));
+                                commandArgs.push('-filter_complex', '[0:v]settb=1/1000,setpts=N' + tonemapRef + ',format=' + targetFormat + ',hwupload[dis];[1:v]settb=1/1000,setpts=N' + tonemapRef + ',format=' + targetFormat + ',hwupload[ref];[dis][ref]libvmaf_cuda=log_path=' + logPath + ':log_fmt=json' + modelParam + cambiFeatureParam + ':shortest=1:repeatlast=0:ts_sync_mode=nearest' + (nSubsample > 1 ? ':n_subsample=' + nSubsample : ''));
                             }
 
-        cmdParts.push('-f', 'null', '-');
-        return cmdParts.join(' ');
+        commandArgs.push('-f', 'null', '-');
+        return { executable: String(ffmpegPath), args: commandArgs };
 }
 
 function buildEncodeTimeTotals(testResults) {
@@ -1294,7 +1342,7 @@ var plugin = async function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
     var fs = require('fs');
-    var execSync = require('child_process').execSync;
+    var execFileSync = require('child_process').execFileSync;
 
     // Infeasible-file cooldown (2026-07-20): testEncodingParameters skipped the sweep, so
     // there is nothing to score — pass straight through without capability probes or setup.
@@ -1349,15 +1397,21 @@ var plugin = async function (args) {
             !(Number(videoStreamForModel.height) > 0)) {
         throw new Error('VMAF metric contract resolution requires a primary video stream with dimensions');
     }
-    var cpuV1ProductionEnabled = resolveCpuV1ProductionEnabled(args);
-    var cpuV1QualificationEnabled = cpuV1ProductionEnabled || resolveCpuV1QualificationEnabled(args);
-    if (cpuV1QualificationEnabled && args.variables.isHDR === true) {
-        if (cpuV1ProductionEnabled && !resolveCpuV1ProvisionalHdrAuthorized(args)) {
-            throw new Error('CPU VMAF-v1 HDR/PQ production authority requires explicit vmafCpuV1ProductionAllowProvisionalHdr=true');
-        }
-        if (!cpuV1ProductionEnabled && args.variables.vmafCpuV1AllowProvisionalHdr !== true) {
-            throw new Error('CPU VMAF-v1 HDR/PQ qualification requires explicit vmafCpuV1AllowProvisionalHdr=true');
-        }
+    var cpuV1ExecutionPolicy = resolveCpuV1ExecutionPolicy(args);
+    var cpuV1ProductionEnabled = cpuV1ExecutionPolicy.productionEnabled;
+    var cpuV1QualificationEnabled = cpuV1ExecutionPolicy.qualificationEnabled;
+    args.variables.vmafCpuV1HdrAuthorityFallbackUsed =
+        cpuV1ExecutionPolicy.fallbackToGpuV0;
+    if (cpuV1ExecutionPolicy.fallbackToGpuV0) {
+        args.variables.vmafCpuV1HdrAuthorityRejectionCode =
+            cpuV1ExecutionPolicy.fallbackCode;
+        args.variables.vmafCpuV1HdrAuthorityRejectionReason =
+            cpuV1ExecutionPolicy.fallbackReason;
+        args.jobLog(cpuV1ExecutionPolicy.fallbackReason +
+            '. Retaining the exact GPU-v0 production contract for this HDR file.');
+    } else {
+        delete args.variables.vmafCpuV1HdrAuthorityRejectionCode;
+        delete args.variables.vmafCpuV1HdrAuthorityRejectionReason;
     }
     var cpuV1ContractInput = {
         width: videoStreamForModel.width,
@@ -1373,15 +1427,32 @@ var plugin = async function (args) {
         attestedEncoderProfileId: args.variables.vmafReferenceComparisonEncoderProfileId ||
             args.variables.vmafEncoderProfileId,
     };
-    var metricContract = cpuV1ProductionEnabled
-        ? vmafMetricContract.resolveCpuV1Production(cpuV1ContractInput, cpuV1ContractOptions)
-        : (cpuV1QualificationEnabled
-            ? vmafMetricContract.resolveCpuV1Candidate(cpuV1ContractInput, cpuV1ContractOptions)
-            : vmafMetricContract.resolveProductionForVideo(
-                videoStreamForModel.width,
-                videoStreamForModel.height,
-                cpuV1ContractOptions
-            ));
+    var metricContract = null;
+    if (cpuV1QualificationEnabled) {
+        try {
+            metricContract = cpuV1ProductionEnabled
+                ? vmafMetricContract.resolveCpuV1Production(
+                    cpuV1ContractInput, cpuV1ContractOptions)
+                : vmafMetricContract.resolveCpuV1Candidate(
+                    cpuV1ContractInput, cpuV1ContractOptions);
+        } catch (cpuV1ContractError) {
+            if (!isCpuV1GeometryError(cpuV1ContractError)) throw cpuV1ContractError;
+            args.variables.vmafCpuV1GeometryRejected = true;
+            args.variables.vmafCpuV1GeometryRejectionCode = cpuV1ContractError.code;
+            args.variables.vmafCpuV1GeometryRejectionReason = cpuV1ContractError.message;
+            args.jobLog('CPU VMAF-v1 authority disabled for this file: ' +
+                cpuV1ContractError.message + '. Retaining the exact GPU-v0 production contract.');
+            cpuV1ProductionEnabled = false;
+            cpuV1QualificationEnabled = false;
+        }
+    }
+    if (!metricContract) {
+        metricContract = vmafMetricContract.resolveProductionForVideo(
+            videoStreamForModel.width,
+            videoStreamForModel.height,
+            cpuV1ContractOptions
+        );
+    }
     if (!cpuV1QualificationEnabled) {
         try {
             vmafMetricContract.assertModelFile(metricContract, { fs: fs });
@@ -1460,7 +1531,10 @@ var plugin = async function (args) {
 
     var modelPath = metricContract.modelPath || '';
     try {
-        var versionOutput = execSync('"' + args.ffmpegPath + '" -hide_banner -version 2>&1', { encoding: 'utf8', shell: true, timeout: 10000, maxBuffer: 1024 * 1024 });
+        var versionOutput = execFileSync(args.ffmpegPath, ['-hide_banner', '-version'], {
+            encoding: 'utf8', shell: false, windowsHide: true,
+            timeout: 10000, maxBuffer: 1024 * 1024
+        });
         args.variables.vmafFfmpegVersion = (versionOutput.split('\n')[0] || '').trim();
     } catch (versionErr) {
         args.variables.vmafFfmpegVersion = '';
@@ -1671,11 +1745,10 @@ var plugin = async function (args) {
     //
     // Releasing here does not weaken the invariant the lock exists for (one job on
     // the GPU at a time) precisely because this section touches no GPU. The GPU
-    // sample encodes that bracket it re-acquire below and in the next round's
-    // Acquire node, which is token-re-entrant and therefore free when we still hold
-    // it. If this section throws, the lock simply stays released — which is what we
-    // want on a failing job, and the flow's error handler release becomes a no-op.
-    var _gpuLockReleasedForCpuScoring = releaseGpuLockForCpuScoring(args, hasCpuV1);
+    // sample encodes that bracket it are protected by explicit downstream
+    // Acquire nodes. Do not block this CPU-only plugin waiting to reacquire.
+    // If this section throws, the flow's error-handler release is a no-op.
+    releaseGpuLockForCpuScoring(args, hasCpuV1);
 
     args.jobLog('');
     args.jobLog('=== Starting VMAF Calculations ===');
@@ -2134,11 +2207,6 @@ var plugin = async function (args) {
     if (successRate < 0.8) {
         args.jobLog('WARNING: VMAF success rate is ' + (successRate * 100).toFixed(1) + '%');
     }
-
-    // CPU-only scoring is done; take the GPU lock back before anything downstream
-    // can reach a GPU stage. Blocking here is intended: if another worker holds the
-    // GPU we must wait, exactly as we would have at the next Acquire node.
-    reacquireGpuLockAfterCpuScoring(args, _gpuLockReleasedForCpuScoring);
 
     // Aggregate results by parameter set
     args.jobLog('');
@@ -2601,7 +2669,8 @@ var plugin = async function (args) {
     args.jobLog('Parameter sets: ' + aggregatedResults.length);
     args.jobLog('GPU VMAF available: ' + (hasGpuVmaf ? 'Yes' : 'No'));
     args.jobLog('GPU VMAF actually used: ' + (gpuVmafActuallyUsed ? 'Yes' : 'No'));
-    args.jobLog('CPU VMAF-v1 ' + (cpuV1ProductionEnabled ? 'production' : 'qualification') +
+    args.jobLog('CPU VMAF-v1 ' + (cpuV1ProductionEnabled ? 'production' :
+        (cpuV1QualificationEnabled ? 'qualification' : 'disabled')) +
         ' runtime actually used: ' + (cpuV1ActuallyUsed ? 'Yes' : 'No'));
 
     if (args.updateWorker) {
@@ -2627,8 +2696,12 @@ exports._test = {
     resolveCpuV1QualificationEnabled: resolveCpuV1QualificationEnabled,
     resolveCpuV1ProductionEnabled: resolveCpuV1ProductionEnabled,
     resolveCpuV1ProvisionalHdrAuthorized: resolveCpuV1ProvisionalHdrAuthorized,
+    resolveCpuV1ExecutionPolicy: resolveCpuV1ExecutionPolicy,
+    releaseGpuLockForCpuScoring: releaseGpuLockForCpuScoring,
+    isCpuV1GeometryError: isCpuV1GeometryError,
     cpuV1Capability: cpuV1Capability,
     maxParallelCpuV1: maxParallelCpuV1,
+    cpuV1ThreadsPerScore: cpuV1ThreadsPerScore,
     parseFrameRate: parseFrameRate,
     findVmafModel: findVmafModel,
     parseXpsnrStderr: parseXpsnrStderr,

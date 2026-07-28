@@ -4,7 +4,7 @@ exports.plugin = exports.details = void 0;
 
 var details = function () { return ({
     name: 'Acquire GPU Pipeline Lock',
-    description: 'Serializes VMAF GPU-heavy stages across multiple Tdarr GPU workers while allowing pre/post-GPU work to overlap.',
+    description: 'Serializes VMAF GPU-heavy stages across Tdarr workers with atomic metadata. Established leases fail closed after owner loss until quiescence is verified manually.',
     style: {
         borderColor: 'orange',
     },
@@ -53,7 +53,7 @@ var details = function () { return ({
             type: 'number',
             defaultValue: '2',
             inputUI: { type: 'text' },
-            tooltip: 'Only break a lock after the owner heartbeat has been stale this long. Keep high because full encodes can be long.',
+            tooltip: 'Age used for diagnostics. A valid established lease is never auto-stolen solely because its heartbeat is old.',
         },
         {
             label: 'Max Lock Age Hours',
@@ -61,15 +61,15 @@ var details = function () { return ({
             type: 'number',
             defaultValue: '8',
             inputUI: { type: 'text' },
-            tooltip: 'Safety ceiling for a lock with missing/stale heartbeat metadata.',
+            tooltip: 'Diagnostic safety window. Only an aged, metadata-free initialization directory can be retired automatically.',
         },
         {
-            label: 'Orphan Process Grace Seconds',
+            label: 'Legacy Orphan Grace Seconds (Ignored)',
             name: 'orphanProcessGraceSeconds',
             type: 'number',
             defaultValue: '180',
             inputUI: { type: 'text' },
-            tooltip: 'Break the lock after this grace period if the owning Tdarr worker PID has exited, even if a heartbeat file/process remains.',
+            tooltip: 'Retained for flow compatibility. Owner exit no longer permits automatic lease theft because GPU descendants may survive the worker.',
         },
     ],
     outputs: [
@@ -100,7 +100,7 @@ function getWorkerName() {
         'unknown-worker';
 }
 
-var plugin = function (args) {
+var plugin = async function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
 
@@ -114,7 +114,7 @@ var plugin = function (args) {
     args.jobLog('=== Acquire GPU Pipeline Lock ===');
     args.jobLog('Requesting GPU pipeline lock at ' + lockDir + ' for ' + filePath);
 
-    var result = lock.acquireBlocking({
+    var result = await lock.acquire({
         lockDir: lockDir,
         owner: {
             ownerId: ownerId,
@@ -128,7 +128,7 @@ var plugin = function (args) {
         maxWaitSeconds: (Number(args.inputs.maxWaitHours) || 12) * 3600,
         staleHeartbeatSeconds: (Number(args.inputs.staleHeartbeatHours) || 2) * 3600,
         maxLockAgeSeconds: (Number(args.inputs.maxLockAgeHours) || 8) * 3600,
-        orphanProcessGraceSeconds: Number(args.inputs.orphanProcessGraceSeconds) || 180,
+        initializationGraceSeconds: 30,
         heartbeatIntervalSeconds: 30,
         existingToken: (args.variables.vmafGpuPipelineLockAcquired && args.variables.vmafGpuPipelineLock)
             ? args.variables.vmafGpuPipelineLock.token
@@ -138,8 +138,9 @@ var plugin = function (args) {
 
     var waitedSeconds = Math.round((Date.now() - startedAt) / 1000);
     args.variables.vmafGpuPipelineLock = {
-        lockDir: lockDir,
+        lockDir: result.owner.lockDir,
         token: result.owner.token,
+        leaseGeneration: result.owner.leaseGeneration,
         ownerId: result.owner.ownerId,
         workerName: workerName,
         acquiredAt: result.owner.acquiredAt,

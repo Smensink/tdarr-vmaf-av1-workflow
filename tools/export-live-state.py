@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = "tdarr-vmaf-public-learning/v2"
+SCHEMA_VERSION = "tdarr-vmaf-public-learning/v3"
+DELIVERY_SIZE_POLICY_VERSION = "delivered-minimum-reduction-v1"
 SECRET_KEY_RE = re.compile(
     r"(?:token|password|secret|authorization|api[_-]?key)",
     re.IGNORECASE,
@@ -33,7 +34,10 @@ SECRET_PLACEHOLDERS = {
     "plextoken": "${TDARR_PLEX_TOKEN}",
     "tmdbapikey": "${TDARR_TMDB_API_KEY}",
     "tvdbapikey": "${TDARR_TVDB_API_KEY}",
-    "arr_api_key": "${TDARR_ARR_API_KEY}",
+}
+ARR_SECRET_PLACEHOLDERS = {
+    "radarr": "${TDARR_RADARR_API_KEY}",
+    "sonarr": "${TDARR_SONARR_API_KEY}",
 }
 
 
@@ -71,11 +75,38 @@ def atomic_write_text(path: Path, content: str) -> None:
     os.replace(temp_path, path)
 
 
-def placeholder_for(key: str) -> str:
+def arr_service(inputs: dict[str, Any]) -> str:
+    declared = str(inputs.get("arr") or "").strip().lower()
+    if declared and declared not in ARR_SECRET_PLACEHOLDERS:
+        raise SystemExit("refusing to redact arr_api_key with an unknown Arr service")
+
+    host = str(inputs.get("arr_host") or "").strip().lower()
+    port_match = re.search(r":(7878|8989)(?:[/?#]|$)", host)
+    host_service = None
+    if port_match:
+        host_service = "radarr" if port_match.group(1) == "7878" else "sonarr"
+
+    if declared and host_service and declared != host_service:
+        raise SystemExit("refusing to redact conflicting Arr service evidence")
+    service = declared or host_service
+    if not service:
+        raise SystemExit(
+            "refusing to redact arr_api_key without an unambiguous Radarr/Sonarr identity"
+        )
+    return service
+
+
+def arr_placeholder_for(inputs: dict[str, Any]) -> str:
+    return ARR_SECRET_PLACEHOLDERS[arr_service(inputs)]
+
+
+def placeholder_for(key: str, container: dict[str, Any] | None = None) -> str:
     normalized = key.replace("-", "_").lower()
     compact = normalized.replace("_", "")
     if normalized == "arr_api_key":
-        return SECRET_PLACEHOLDERS["arr_api_key"]
+        if container is None:
+            raise SystemExit("refusing to redact arr_api_key without its input object")
+        return arr_placeholder_for(container)
     return SECRET_PLACEHOLDERS.get(compact, "${REDACTED_SECRET}")
 
 
@@ -88,7 +119,7 @@ def redact_secrets(value: Any) -> Any:
     redacted: dict[str, Any] = {}
     for key, item in value.items():
         if SECRET_KEY_RE.search(key):
-            redacted[key] = placeholder_for(key)
+            redacted[key] = placeholder_for(key, value)
         else:
             redacted[key] = redact_secrets(item)
     return redacted
@@ -110,6 +141,21 @@ def assert_flow_redacted(value: Any) -> None:
             continue
         if not isinstance(item, str) or not item.startswith("${"):
             leaks.append(key)
+    def assert_arr_placeholders(item: Any) -> None:
+        if isinstance(item, dict):
+            if "arr_api_key" in item:
+                expected = arr_placeholder_for(item)
+                if item["arr_api_key"] != expected:
+                    raise SystemExit(
+                        "refusing to publish a non-service-specific Arr API placeholder"
+                    )
+            for child in item.values():
+                assert_arr_placeholders(child)
+        elif isinstance(item, list):
+            for child in item:
+                assert_arr_placeholders(child)
+
+    assert_arr_placeholders(value)
     if leaks:
         names = ", ".join(sorted(set(leaks)))
         raise SystemExit(f"refusing to publish unredacted flow fields: {names}")
@@ -226,11 +272,30 @@ def content_bucket(value: Any) -> str:
 def collect_job_buckets(
     connection: sqlite3.Connection,
 ) -> tuple[dict[tuple[str, ...], dict[str, list[float]]], int]:
+    available = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(jobs)")
+    }
+    delivery_columns = {
+        "outcome_stage",
+        "size_policy_version",
+        "target_size_reduction_pct",
+        "minimum_size_reduction_pct",
+        "max_final_output_ratio_pct",
+    }
+    missing = sorted(delivery_columns - available)
+    if missing:
+        raise SystemExit(
+            "refusing to export job priors without delivered-outcome provenance: "
+            + ", ".join(missing)
+        )
     columns = (
         "source_width, source_height, source_codec, media_source_type, "
         "media_is_animation, bits_per_pixel, selected_cq, selected_vmaf, "
         "selected_vmaf_min, selected_cambi, source_cambi, "
-        "final_output_ratio_pct, target_min_vmaf, transcode_succeeded"
+        "final_output_ratio_pct, target_min_vmaf, transcode_succeeded, "
+        "outcome_stage, size_policy_version, target_size_reduction_pct, "
+        "minimum_size_reduction_pct, "
+        "max_final_output_ratio_pct"
     )
     rows = connection.execute(f"SELECT {columns} FROM jobs")
     buckets: dict[tuple[str, ...], dict[str, list[float]]] = defaultdict(
@@ -253,10 +318,23 @@ def collect_job_buckets(
             output_ratio,
             target_vmaf,
             succeeded,
+            outcome_stage,
+            size_policy_version,
+            target_reduction,
+            minimum_reduction,
+            maximum_ratio,
         ) = row
         cq = safe_float(selected_cq)
         vmaf = safe_float(selected_vmaf)
-        if succeeded != 1 or cq is None:
+        if (
+            succeeded != 1
+            or str(outcome_stage or "") != "delivered"
+            or str(size_policy_version or "") != DELIVERY_SIZE_POLICY_VERSION
+            or safe_float(target_reduction) != 30
+            or safe_float(minimum_reduction) != 20
+            or safe_float(maximum_ratio) != 80
+            or cq is None
+        ):
             continue
         if vmaf is not None and not 0 <= vmaf <= 100:
             continue
@@ -367,9 +445,23 @@ def create_public_database(
     output: Path,
     minimum_bucket_samples: int,
 ) -> None:
+    source_resolved = source.resolve(strict=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    temp_output = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-    temp_output.unlink(missing_ok=True)
+    output_resolved = output.resolve(strict=False)
+    if source_resolved == output_resolved:
+        raise SystemExit("refusing to overwrite the private source database")
+    if output.is_symlink():
+        raise SystemExit("refusing to replace a symlinked public database path")
+    if output.exists() and os.path.samefile(source_resolved, output):
+        raise SystemExit("refusing source/output hard-link alias")
+    with tempfile.NamedTemporaryFile(
+        "wb",
+        dir=output.parent,
+        prefix=f".{output.name}.review.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp_handle:
+        temp_output = Path(temp_handle.name)
     try:
         with tempfile.TemporaryDirectory(prefix="tdarr-vmaf-public-") as temp_dir:
             snapshot_path = Path(temp_dir) / "source-snapshot.db"
@@ -457,10 +549,11 @@ def create_public_database(
                         "paths, filenames, titles, release groups, or exact event "
                         "timestamps are present."
                     ),
+                    "delivered_outcome_policy": DELIVERY_SIZE_POLICY_VERSION,
                     "minimum_bucket_samples": str(minimum_bucket_samples),
                     "source_jobs": str(source_job_count),
                     "source_sweep_points": str(source_sweep_count),
-                    "accepted_completed_jobs": str(accepted_jobs),
+                    "accepted_delivered_jobs": str(accepted_jobs),
                     "accepted_valid_sweep_points": str(accepted_sweeps),
                 }
                 public.executemany(

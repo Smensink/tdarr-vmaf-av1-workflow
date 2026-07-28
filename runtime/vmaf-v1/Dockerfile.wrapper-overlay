@@ -1,0 +1,24 @@
+# Maintenance-only overlay for deploying audited wrapper changes onto an
+# already qualified, immutable VMAF-v1 runtime image. This deliberately does
+# not rebuild libvmaf. The caller must provide the exact qualified base tag or
+# digest and must run the normal runtime qualification before deployment.
+ARG TDARR_VMAF_BASE_IMAGE
+FROM ${TDARR_VMAF_BASE_IMAGE}
+
+ARG SCORE_WRAPPER_SHA256
+ARG VMAF_WRAPPER_SHA256
+COPY vmaf-v1-wrapper.sh /usr/local/bin/vmaf-v1
+COPY vmaf-v1-score.sh /usr/local/bin/vmaf-v1-score
+RUN chmod 755 /usr/local/bin/vmaf-v1 /usr/local/bin/vmaf-v1-score \
+    && test "$(sha256sum /usr/local/bin/vmaf-v1 | awk '{print $1}')" = "${VMAF_WRAPPER_SHA256}" \
+    && test "$(sha256sum /usr/local/bin/vmaf-v1-score | awk '{print $1}')" = "${SCORE_WRAPPER_SHA256}" \
+    && /usr/local/bin/vmaf-v1 --version
+
+LABEL tdarr.vmaf.wrapper-overlay="true"
+LABEL tdarr.vmaf.wrapper.sha256="${VMAF_WRAPPER_SHA256}"
+LABEL tdarr.vmaf.score-wrapper.sha256="${SCORE_WRAPPER_SHA256}"
+LABEL org.opencontainers.image.title="Tdarr VMAF v1 CPU runtime"
+LABEL org.opencontainers.image.description="Isolated official libvmaf 3.2.0 CPU/float scorer; production-eligible only for the pinned SDR contract, with HDR production disabled"
+LABEL tdarr.vmaf.contract="official-libvmaf-v3.2.0-plus-78e11b5-cpu-float-sdr-production"
+LABEL tdarr.vmaf.production-scope="eligible-sdr-only"
+LABEL tdarr.vmaf.hdr-production-eligible="false"

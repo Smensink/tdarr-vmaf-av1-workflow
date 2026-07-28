@@ -6,6 +6,7 @@ var canonicalDenoise = require('../../_lib/canonicalDenoise.js');
 var grainVmafContract = require('../../_lib/grainVmafContract.js');
 var referenceContractBridge = require('../../_lib/referenceContractBridge.js');
 var vmafMetricContract = require('../../_lib/vmafMetricContract.js');
+var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
 var fs = require('fs');
 var details = function () { return ({
     name: 'Test Encoding Parameters',
@@ -48,7 +49,7 @@ var details = function () { return ({
             inputUI: {
                 type: 'text',
             },
-            tooltip: 'Target size reduction percentage for dynamic CQ calculation. Higher = more aggressive CQ range. Default: 30',
+            tooltip: 'Fixed current search target: 30% size reduction. Values other than 30 fail closed so search, delivery validation, and final replacement use one policy.',
         },
         {
             label: 'CQ Range Width',
@@ -506,7 +507,6 @@ var plugin = async function (args) {
     // Read inputs
     var dynamicCQ = args.inputs.dynamicCQ !== false && args.inputs.dynamicCQ !== 'false';
     var targetMinVMAF = Number(args.inputs.targetMinVMAF) || 90;
-    var targetSizeReduction = Number(args.inputs.targetSizeReduction) || 30;
     var cqRangeWidth = Number(args.inputs.cqRangeWidth) || 8;
     var cqStep = Number(args.inputs.cqStep) || 2;
     var effectiveRangeWidth = cqRangeWidth;
@@ -604,10 +604,18 @@ var plugin = async function (args) {
     }
 
     var targetSizeReduction = Number(args.inputs.targetSizeReduction);
-    if (isNaN(targetSizeReduction) || targetSizeReduction < 0 || targetSizeReduction > 100) {
-        args.jobLog('WARNING: Invalid targetSizeReduction (' + args.inputs.targetSizeReduction + '), using default 30');
-        targetSizeReduction = 30;
+    if (!isFinite(targetSizeReduction) ||
+            targetSizeReduction !== deliveryPolicy.DEFAULT_TARGET_REDUCTION_PCT) {
+        throw new Error('targetSizeReduction must equal the current policy value ' +
+            deliveryPolicy.DEFAULT_TARGET_REDUCTION_PCT);
     }
+    args.variables.vmafTargetSizeReductionPct = targetSizeReduction;
+    var initialDeliveryPolicy = deliveryPolicy.resolve(args.variables);
+    args.jobLog('Delivery size policy: search target ' +
+        initialDeliveryPolicy.targetReductionPct + '%, minimum delivered reduction ' +
+        initialDeliveryPolicy.minimumReductionPct + '%, final byte cap ' +
+        initialDeliveryPolicy.maxFinalOutputRatioPct + '% (' +
+        initialDeliveryPolicy.version + ')');
 
     // ── Prior infeasible-result telemetry (cooldown retired 2026-07-23) ──
     // 24 files terminally failed, were requeued unchanged, and failed again (26 extra full

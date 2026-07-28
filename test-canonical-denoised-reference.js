@@ -133,10 +133,11 @@ try {
     { ffProbeData: { streams: [{ codec_type: 'video', codec_name: 'hevc', pix_fmt: 'yuv420p10le' }] } },
     false, 'av1_nvenc', 1,
   );
-  assert.ok(gpuVmaf.indexOf('-c:v av1_cuvid -i "distorted-av1.mkv"') >= 0);
-  assert.ok(gpuVmaf.indexOf('-i "canonical-ffv1.mkv"') > gpuVmaf.indexOf('-i "distorted-av1.mkv"'));
-  assert.ok(!gpuVmaf.includes('hevc_cuvid'), 'reference decoder must not be derived from the source codec');
-  assert.ok(!gpuVmaf.includes('ffv1_cuvid'), 'FFV1 reference must software-decode');
+  assert.strictEqual(gpuVmaf.executable, 'tdarr-ffmpeg');
+  assert.ok(gpuVmaf.args.includes('av1_cuvid'));
+  assert.ok(gpuVmaf.args.indexOf('canonical-ffv1.mkv') > gpuVmaf.args.indexOf('distorted-av1.mkv'));
+  assert.ok(!gpuVmaf.args.includes('hevc_cuvid'), 'reference decoder must not be derived from the source codec');
+  assert.ok(!gpuVmaf.args.includes('ffv1_cuvid'), 'FFV1 reference must software-decode');
   console.log('PASS real 10-bit canonical-denoised FFV1 reference fixture');
 } finally {
   for (const file of [source, output]) {

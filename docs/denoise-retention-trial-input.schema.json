@@ -1,0 +1,474 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/tdarr-vmaf-av1/denoise-retention-trial-input.schema.json",
+  "title": "Private denoise-retention trial input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "acknowledge_node_paused_and_drained",
+    "private_output_root",
+    "acknowledge_protected_roots_complete",
+    "protected_roots",
+    "nvenc_quality_profile",
+    "tools",
+    "expected_tool_identities",
+    "cases"
+  ],
+  "properties": {
+    "schema": {
+      "const": 3
+    },
+    "acknowledge_node_paused_and_drained": {
+      "const": true
+    },
+    "private_output_root": {
+      "$ref": "#/$defs/absoluteNonRootPath"
+    },
+    "acknowledge_protected_roots_complete": {
+      "const": true
+    },
+    "acknowledge_no_git_checkout_mounted": {
+      "type": "boolean"
+    },
+    "protected_roots": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "media",
+        "tdarr_database",
+        "tdarr_config",
+        "tdarr_plugins",
+        "git",
+        "backups"
+      ],
+      "properties": {
+        "media": {
+          "$ref": "#/$defs/nonEmptyRootList"
+        },
+        "tdarr_database": {
+          "$ref": "#/$defs/nonEmptyRootList"
+        },
+        "tdarr_config": {
+          "$ref": "#/$defs/nonEmptyRootList"
+        },
+        "tdarr_plugins": {
+          "$ref": "#/$defs/nonEmptyRootList"
+        },
+        "git": {
+          "$ref": "#/$defs/rootList"
+        },
+        "backups": {
+          "$ref": "#/$defs/nonEmptyRootList"
+        }
+      }
+    },
+    "production_gpu_lock_path": {
+      "$ref": "#/$defs/absoluteNonRootPath"
+    },
+    "nvenc_quality_profile": {
+      "enum": [
+        "enhanced",
+        "baseline"
+      ]
+    },
+    "minimum_control_saving_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 50
+    },
+    "minimum_source_estimate_saving_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 50
+    },
+    "maximum_vmaf_drop": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 5
+    },
+    "maximum_cambi_increase": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 5
+    },
+    "maximum_band_mae_increase_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "include_strength_014": {
+      "type": "boolean"
+    },
+    "acknowledge_s012_was_reviewed": {
+      "type": "boolean"
+    },
+    "strength_014_justification": {
+      "type": "string",
+      "minLength": 20,
+      "pattern": "^\\s*\\S[\\s\\S]{18,}\\S\\s*$"
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ffmpeg",
+        "ffprobe",
+        "nvencc",
+        "grav1synth"
+      ],
+      "properties": {
+        "ffmpeg": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "ffprobe": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "nvencc": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "grav1synth": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        }
+      }
+    },
+    "expected_tool_identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ffmpeg",
+        "ffprobe",
+        "nvencc",
+        "grav1synth"
+      ],
+      "properties": {
+        "ffmpeg": {
+          "$ref": "#/$defs/toolIdentity"
+        },
+        "ffprobe": {
+          "$ref": "#/$defs/toolIdentity"
+        },
+        "nvencc": {
+          "$ref": "#/$defs/toolIdentity"
+        },
+        "grav1synth": {
+          "$ref": "#/$defs/toolIdentity"
+        }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "include_strength_014": {
+            "const": true
+          }
+        },
+        "required": [
+          "include_strength_014"
+        ]
+      },
+      "then": {
+        "required": [
+          "acknowledge_s012_was_reviewed",
+          "strength_014_justification"
+        ],
+        "properties": {
+          "acknowledge_s012_was_reviewed": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "protected_roots": {
+            "properties": {
+              "git": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "acknowledge_no_git_checkout_mounted"
+        ],
+        "properties": {
+          "acknowledge_no_git_checkout_mounted": {
+            "const": true
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "acknowledge_no_git_checkout_mounted": {
+            "const": false
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "absoluteNonRootPath": {
+      "type": "string",
+      "pattern": "^/(?!$)[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "rootList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/absoluteNonRootPath"
+      }
+    },
+    "nonEmptyRootList": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/rootList"
+        },
+        {
+          "minItems": 1
+        }
+      ]
+    },
+    "safeId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "clip": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clip_id",
+        "timestamp_seconds",
+        "duration_seconds"
+      ],
+      "properties": {
+        "clip_id": {
+          "$ref": "#/$defs/safeId"
+        },
+        "timestamp_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 4,
+          "maximum": 12
+        },
+        "review_note": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "review_crop_x": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "review_crop_y": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "source_path",
+        "expected_source_sha256",
+        "expected_source_size_bytes",
+        "provenance_receipt",
+        "cq",
+        "clips"
+      ],
+      "properties": {
+        "case_id": {
+          "$ref": "#/$defs/safeId"
+        },
+        "source_path": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "expected_source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "expected_source_size_bytes": {
+          "$ref": "#/$defs/positiveSafeInteger"
+        },
+        "provenance_receipt": {
+          "$ref": "#/$defs/provenanceReceiptReference"
+        },
+        "cq": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 51
+        },
+        "clips": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/clip"
+          }
+        }
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "positiveSafeInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "provenanceReceiptReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/provenanceReceiptSize"
+        }
+      }
+    },
+    "provenanceReceiptSize": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/positiveSafeInteger"
+        },
+        {
+          "maximum": 1048576
+        }
+      ]
+    },
+    "toolIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "resolved_path",
+        "sha256",
+        "size_bytes",
+        "reviewed_symlink_chain"
+      ],
+      "properties": {
+        "resolved_path": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/positiveSafeInteger"
+        },
+        "reviewed_symlink_chain": {
+          "$ref": "#/$defs/reviewedSymlinkChain"
+        },
+        "wrapper_contract": {
+          "$ref": "#/$defs/wrapperContract"
+        }
+      }
+    },
+    "executableDependencyIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "resolved_path",
+        "sha256",
+        "size_bytes",
+        "reviewed_symlink_chain"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "resolved_path": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/positiveSafeInteger"
+        },
+        "reviewed_symlink_chain": {
+          "$ref": "#/$defs/reviewedSymlinkChain"
+        }
+      }
+    },
+    "reviewedSymlinkChain": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/reviewedSymlinkHop"
+      }
+    },
+    "reviewedSymlinkHop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "target"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/absoluteNonRootPath"
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        }
+      }
+    },
+    "wrapperContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "interpreter",
+        "exec_target",
+        "ld_library_path"
+      ],
+      "properties": {
+        "kind": {
+          "const": "posix-sh-exec-v1"
+        },
+        "interpreter": {
+          "$ref": "#/$defs/executableDependencyIdentity"
+        },
+        "exec_target": {
+          "$ref": "#/$defs/executableDependencyIdentity"
+        },
+        "ld_library_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?=.*\\S)[^\\r\\n\\u0000]+$"
+        }
+      }
+    }
+  }
+}

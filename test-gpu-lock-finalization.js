@@ -4,11 +4,16 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const lock = require('./custom-cont-init.d/vmaf-plugin-patches/_lib/gpuPipelineLock.js');
 
 const lockDir = path.join(os.tmpdir(), `tdarr-lock-finalization-${process.pid}-${Date.now()}`);
+process.env.TDARR_GPU_PIPELINE_LOCK_DIR = lockDir;
+const lock = require('./custom-cont-init.d/vmaf-plugin-patches/_lib/gpuPipelineLock.js');
 fs.mkdirSync(lockDir, { recursive: true });
-fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ token: 'job-a', ownerId: 'job-a' }));
+fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({
+  token: 'job-a',
+  leaseGeneration: 'generation-a',
+  ownerId: 'job-a',
+}));
 
 assert.strictEqual(lock.release(lockDir, null).reason, 'missing owner token');
 assert.ok(fs.existsSync(lockDir), 'tokenless release must preserve another job lock');

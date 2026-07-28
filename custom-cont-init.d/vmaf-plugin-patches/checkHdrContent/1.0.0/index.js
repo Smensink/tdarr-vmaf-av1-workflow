@@ -3,7 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.isHdr10PlusStaticHdr10Compatible = exports.plugin = exports.details = void 0;
 var details = function () { return ({
     name: 'Check HDR Content',
-    description: 'Detects HDR content and sets color metadata variables for proper encoding.',
+    description: 'Detects HDR content, preserves explicit SDR metadata, and keeps ambiguous color signalling out of the transcode path.',
     style: {
         borderColor: 'purple',
     },
@@ -34,7 +34,7 @@ var details = function () { return ({
         },
         {
             number: 3,
-            tooltip: 'Unsupported dynamic HDR - keep original',
+            tooltip: 'Unsupported dynamic HDR or ambiguous color transfer - keep original',
         },
     ],
 }); };
@@ -310,15 +310,16 @@ var plugin = function (args) {
     var hasDolbyVision = false;
     var hasHDR10Plus = false;
     var dolbyVisionInfo = null;
+    var keepOriginalUnsupportedColor = false;
     var dynamicHdrPolicy = String(args.inputs.dynamicHdrPolicy || 'profileAwareHdr10');
     var stream = getVideoStream(args.inputFileObj);
     var mediaInfoVideo = getMediaInfoVideoTrack(args.inputFileObj, stream);
 
     if (stream) {
-        var colorTransfer = String(stream.color_transfer || '').toLowerCase();
-        var primaries = String(stream.color_primaries || '').toLowerCase();
-        var space = String(stream.color_space || '').toLowerCase();
-        var pix = String(stream.pix_fmt || '').toLowerCase();
+        var colorTransfer = String(stream.color_transfer || '').toLowerCase().trim();
+        var primaries = String(stream.color_primaries || '').toLowerCase().trim();
+        var space = String(stream.color_space || '').toLowerCase().trim();
+        var pix = String(stream.pix_fmt || '').toLowerCase().trim();
         var explicitSdrTransfers = ['bt709', 'iec61966-2-1', 'gamma22', 'gamma28', 'smpte170m',
             'smpte240m', 'bt470bg', 'bt470m', 'bt2020-10', 'bt2020-12'];
         var transferIsExplicitSdr = explicitSdrTransfers.indexOf(colorTransfer) !== -1;
@@ -333,8 +334,8 @@ var plugin = function (args) {
         hasHDR10Plus = hasHdr10PlusEvidence(stream, mediaInfoVideo);
 
         if (colorTransfer.indexOf('smpte2084') !== -1 || colorTransfer.indexOf('arib-std-b67') !== -1 ||
-            colorTransfer.indexOf('hlg') !== -1 || masteringSideData || cllSideData || hasDolbyVision || hasHDR10Plus ||
-            highBitBt2020WithoutTransfer) {
+            colorTransfer.indexOf('hlg') !== -1 || masteringSideData || cllSideData ||
+            hasDolbyVision || hasHDR10Plus) {
             isHDR = true;
         }
 
@@ -344,7 +345,17 @@ var plugin = function (args) {
             isHDR = false;
         }
 
-        if (isHDR) {
+        // BT.2020 primaries plus 10/12-bit samples do not identify an EOTF.
+        // They can represent PQ, HLG, or wide-gamut SDR. Never invent PQ: keep
+        // the untouched source and require corrected metadata or manual review.
+        if (highBitBt2020WithoutTransfer) {
+            keepOriginalUnsupportedColor = true;
+            isHDR = false;
+            colorPrimaries = primaries || 'unknown';
+            colorTrc = colorTransfer || 'unknown';
+            colorspace = space || 'unknown';
+            pixFmt = pix || 'unknown';
+        } else if (isHDR) {
             colorPrimaries = primaries.indexOf('bt2020') !== -1 ? 'bt2020' : 'bt2020';
             if (colorTransfer.indexOf('smpte2084') !== -1) {
                 colorTrc = 'smpte2084';
@@ -369,7 +380,10 @@ var plugin = function (args) {
         }
     }
 
-    if (!isHDR) {
+    if (keepOriginalUnsupportedColor) {
+        args.jobLog('KEEP ORIGINAL: 10/12-bit BT.2020 source has an unknown transfer function; ' +
+            'PQ/HLG/SDR cannot be inferred safely and no color tags will be rewritten.');
+    } else if (!isHDR) {
         args.jobLog(colorTrc.indexOf('bt2020-') === 0
             ? 'Wide-gamut SDR content detected. Preserving BT.2020 SDR transfer and 10/12-bit signal.'
             : 'SDR content detected. Using bt709 color space.');
@@ -403,12 +417,18 @@ var plugin = function (args) {
     args.variables.isHDR10Plus = hasHDR10Plus;
     args.variables.vmafDolbyVisionInfo = dolbyVisionInfo;
     args.variables.vmafDynamicHdrPolicy = dynamicHdrPolicy;
+    if (keepOriginalUnsupportedColor) {
+        args.variables.vmafColorMetadataUnsupported = true;
+        args.variables.vmafProcessingDisposition = 'keep_original_ambiguous_color_transfer';
+        args.variables.vmafProcessingDispositionReason =
+            'bt2020_high_bit_depth_unknown_transfer';
+    }
     var dolbyHdr10Compatible = hasDolbyVision && isDolbyVisionHdr10Compatible(dolbyVisionInfo, stream);
     var hdr10PlusHdr10Compatible = hasHDR10Plus && isHdr10PlusStaticHdr10Compatible(stream, mediaInfoVideo);
     args.variables.vmafHdr10PlusStaticHdr10Compatible = hdr10PlusHdr10Compatible;
     var staticFallbackAuthorized = false;
     var keepOriginalDynamicHdr = false;
-    if (hasDolbyVision || hasHDR10Plus) {
+    if ((hasDolbyVision || hasHDR10Plus) && !keepOriginalUnsupportedColor) {
         args.variables.hdr_dynamic_metadata_warning = 'Dynamic HDR metadata detected; AV1/NVENC flow preserves static HDR10/HLG signalling only.';
         staticFallbackAuthorized = dynamicHdrPolicy === 'allowStaticFallback' ||
             (dynamicHdrPolicy === 'profileAwareHdr10' && ((hasDolbyVision && dolbyHdr10Compatible) || hdr10PlusHdr10Compatible));
@@ -440,7 +460,8 @@ var plugin = function (args) {
     }
     return {
         outputFileObj: args.inputFileObj,
-        outputNumber: keepOriginalDynamicHdr ? 3 : (isHDR ? 1 : 2),
+        outputNumber: (keepOriginalDynamicHdr || keepOriginalUnsupportedColor)
+            ? 3 : (isHDR ? 1 : 2),
         variables: args.variables,
     };
 };
