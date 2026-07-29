@@ -255,8 +255,17 @@ async function run(parsed) {
             stopBoth('SIGTERM');
         }
     });
+    // Callers deliberately give the consumer one frame fewer than the producer emits
+    // (nvenccKnn.frameCount adds a guard frame so the FFmpeg trim/select stage owns the exact
+    // boundary), so a healthy run routinely ends with FFmpeg closing first and this coordinator
+    // SIGTERMing NVEncC. Record that case: the producer's signal death is then expected, not a
+    // failure, and must not be reported as `NVEncC exited without a code after SIGTERM`.
+    let producerStoppedAfterConsumerSuccess = false;
     consumerPromise.then((result) => {
         if (shouldStopPeerAfterExit('FFmpeg', result, childIsRunning(producer))) {
+            if (!result.error && result.code === 0) {
+                producerStoppedAfterConsumerSuccess = true;
+            }
             process.stderr.write(
                 `[${CONTRACT_ID}] FFmpeg exited before NVEncC; stopping the producer\n`
             );
@@ -275,6 +284,17 @@ async function run(parsed) {
             throw new Error(`${result.name} failed to start: ${result.error.message}`);
         }
         if (result.code !== 0) {
+            // Only the producer, only when we stopped it ourselves because the consumer had
+            // already finished cleanly, and only when it died by signal rather than returning a
+            // non-zero code of its own. Any other non-zero exit still fails the pipeline.
+            if (result.name === 'NVEncC' && producerStoppedAfterConsumerSuccess &&
+                result.code === null && result.signal) {
+                process.stderr.write(
+                    `[${CONTRACT_ID}] NVEncC stopped by ${result.signal} after FFmpeg consumed its ` +
+                    `requested frames; treating the pipeline as successful\n`
+                );
+                continue;
+            }
             throw new Error(
                 `${result.name} exited ${result.code === null ? 'without a code' : `with code ${result.code}`}` +
                 (result.signal ? ` after ${result.signal}` : '')

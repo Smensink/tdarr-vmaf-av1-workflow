@@ -7,8 +7,8 @@ const childProcess = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const artifactLib = require('../../_lib/grainAnalysisArtifact.js');
-const nvenccKnn = require('../../_lib/nvenccKnn.js');
 const gpuPipelineLock = require('../../_lib/gpuPipelineLock.js');
+const nvenccKnn = require('../../_lib/nvenccKnn.js');
 
 const details = () => ({
     name: 'Analyze Film Grain',
@@ -118,6 +118,28 @@ const details = () => ({
 });
 exports.details = details;
 
+// Caps how long a silent-but-queued run can be extended: 8 x the configured budget. At the
+// default 45 min that is 6 hours, comfortably past the longest observed VMAF sweep (~1h) while
+// still guaranteeing a genuinely wedged pipeline eventually dies.
+const MAX_IDLE_EXTENSIONS = 8;
+const QUEUED_HEARTBEAT_MAX_AGE_SECONDS = 300;
+
+// True when the shared GPU lock is held by a DIFFERENT owner whose heartbeat is still live, i.e.
+// this run is waiting its turn rather than hanging. Deliberately conservative: if we hold the
+// lock ourselves, silence means our own GPU work is stuck and must still be killed.
+function queuedBehindAnotherGpuOwner(ownId) {
+    try {
+        const lockDir = gpuPipelineLock.resolveLockDir();
+        const owner = gpuPipelineLock.readOwner(lockDir);
+        if (!owner || !owner.ownerId) return false;
+        if (ownId && String(owner.ownerId) === String(ownId)) return false;
+        const age = gpuPipelineLock.heartbeatAgeSeconds(lockDir, owner);
+        return age !== null && age >= 0 && age <= QUEUED_HEARTBEAT_MAX_AGE_SECONDS;
+    } catch (_) {
+        return false;
+    }
+}
+
 function appendBounded(existing, chunk, limit) {
     const combined = existing + chunk;
     return combined.length <= limit ? combined : combined.slice(combined.length - limit);
@@ -140,7 +162,7 @@ function runProcess(executable, argv, options) {
                 detached: detachedGroup,
                 stdio: ['ignore', 'pipe', 'pipe'],
                 cwd: options.cwd || undefined,
-                env: process.env,
+                env: options.env || process.env,
             });
         } catch (error) {
             reject(error);
@@ -158,15 +180,38 @@ function runProcess(executable, argv, options) {
                 }
             }
         };
-        if (options.timeoutMs > 0) {
+        // The budget is an INACTIVITY timeout, not a wall-clock cap. Since the GPU lease was
+        // narrowed to the denoise segment, this pipeline can legitimately sit blocked waiting
+        // for the lock behind an hour-long VMAF sweep - wall-clock would kill a perfectly
+        // healthy queued job (Dutton Ranch S01E09, 2026-07-29, died at ~43 min of a 45 min
+        // budget). The lock runner prints a wait line every 60s and the pipeline prints
+        // progress, so a queued or working run keeps the timer fresh while a genuinely wedged
+        // one still dies after the full budget of silence.
+        // Re-arming on child output alone is not enough: the pipeline's run_checked captures the
+        // lock runner's stderr (`stderr=subprocess.PIPE`), so its 60s "waiting asynchronously"
+        // heartbeat never reaches this stream. A job queued behind an hour-long VMAF sweep is
+        // therefore silent here and was being killed as wedged (Basquiat, 2026-07-29 13:09).
+        // Ask the lock directly instead: if someone ELSE holds it with a live heartbeat, this run
+        // is legitimately queued, not stuck. Bounded so a genuine wedge still terminates.
+        let idleExtensions = 0;
+        const armTimer = () => {
+            if (!(options.timeoutMs > 0)) return;
+            if (timer) clearTimeout(timer);
             timer = setTimeout(() => {
+                if (typeof options.onIdleTimeout === 'function' &&
+                    idleExtensions < MAX_IDLE_EXTENSIONS && options.onIdleTimeout(idleExtensions)) {
+                    idleExtensions += 1;
+                    armTimer();
+                    return;
+                }
                 timedOut = true;
                 signalTree('SIGTERM');
                 hardKillTimer = setTimeout(() => signalTree('SIGKILL'), 3000);
             }, options.timeoutMs);
-        }
-        child.stdout.on('data', (chunk) => { stdout = appendBounded(stdout, chunk.toString('utf8'), limit); });
-        child.stderr.on('data', (chunk) => { stderr = appendBounded(stderr, chunk.toString('utf8'), limit); });
+        };
+        armTimer();
+        child.stdout.on('data', (chunk) => { stdout = appendBounded(stdout, chunk.toString('utf8'), limit); armTimer(); });
+        child.stderr.on('data', (chunk) => { stderr = appendBounded(stderr, chunk.toString('utf8'), limit); armTimer(); });
         child.on('error', (error) => {
             if (settled) return;
             settled = true;
@@ -224,69 +269,6 @@ function sourcePathFromArgs(args) {
     );
 }
 
-async function withAnalysisGpuLease(
-    args, sourcePath, operation, lockOverride) {
-    if (typeof operation !== 'function') {
-        throw new Error('grain analysis GPU lease requires an operation');
-    }
-    const lock = lockOverride || gpuPipelineLock;
-    const lockDir = lock.resolveLockDir(
-        process.env.TDARR_GPU_PIPELINE_LOCK_DIR ||
-        '/temp/tdarr-vmaf-gpu-pipeline.lock');
-    const existing = args.variables &&
-        args.variables.vmafGpuPipelineLockAcquired === true &&
-        args.variables.vmafGpuPipelineLock;
-    const result = await lock.acquire({
-        lockDir,
-        owner: {
-            ownerId: `grain-analysis-${artifactLib.stableId(sourcePath)}`,
-            workerName: process.env.Tdarr_Node_Name ||
-                process.env.TDARR_NODE_NAME ||
-                process.env.nodeID ||
-                process.env.NODE_ID ||
-                process.env.HOSTNAME ||
-                'unknown-worker',
-            stage: 'grain-analysis-knn',
-            plugin: 'analyzeFilmGrain',
-        },
-        waitPollSeconds: 5,
-        waitLogSeconds: 60,
-        maxWaitSeconds: 43200,
-        staleHeartbeatSeconds: 7200,
-        maxLockAgeSeconds: 28800,
-        initializationGraceSeconds: 30,
-        heartbeatIntervalSeconds: 30,
-        existingToken: existing && existing.token || null,
-        log: (message) => args.jobLog(message),
-    });
-    const reentrant = result.reentrant === true;
-    let operationError = null;
-    try {
-        return await operation();
-    } catch (error) {
-        operationError = error;
-        throw error;
-    } finally {
-        if (!reentrant) {
-            const released = lock.release(
-                lockDir,
-                result.owner && result.owner.token,
-                {
-                    expectedGeneration:
-                        result.owner && result.owner.leaseGeneration,
-                },
-            );
-            if (!released || released.released !== true) {
-                const releaseError = new Error(
-                    'grain analysis GPU lease release failed: ' +
-                    String(released && released.reason || 'unknown reason'));
-                if (operationError) releaseError.cause = operationError;
-                throw releaseError;
-            }
-        }
-    }
-}
-
 function clearPublishedVariables(variables) {
     for (const key of artifactLib.ANALYSIS_UNAVAILABLE_FORBIDDEN_VARIABLES) delete variables[key];
 }
@@ -314,9 +296,15 @@ function makeAnalysisUnavailableResult(args, reason) {
 }
 
 function buildFitPipelineArgs(options) {
+    // The lock runner is a flag-free prefix so argparse's nargs="+" forwards it whole;
+    // owner identity travels in the child environment instead. See _lib/gpuLockRun.js.
+    const gpuLockRun = options.gpuLockRunCommand && options.gpuLockRunCommand.length
+        ? ['--gpu-lock-run', ...options.gpuLockRunCommand]
+        : [];
     return [
         options.pipelinePath,
         '--operation', 'fit-direct',
+        ...gpuLockRun,
         '--source', options.sourcePath,
         '--workdir', options.jobDir,
         '--output', options.tablePath,
@@ -441,8 +429,20 @@ async function plugin(args) {
         const outcomePath = path.join(jobDir, 'grain-fit-outcome.json');
         const timeoutMs = Math.min(240, Math.max(5,
             artifactLib.finiteNumber(args.inputs.pipelineTimeoutMinutes, 45))) * 60 * 1000;
+        // A flow that already holds the lock keeps the coarse whole-run lease (see the
+        // deadlock note below), so the per-denoise runner is wired in only otherwise.
+        const flowHoldsGpuLock = !!(args.variables &&
+            args.variables.vmafGpuPipelineLockAcquired === true &&
+            args.variables.vmafGpuPipelineLock);
+        let gpuLockRunCommand = null;
+        if (!flowHoldsGpuLock) {
+            const gpuLockRunPath = path.join(__dirname, '..', '..', '_lib', 'gpuLockRun.js');
+            artifactLib.assertRegularFile(gpuLockRunPath, 'GPU lock runner');
+            gpuLockRunCommand = [process.execPath, gpuLockRunPath];
+        }
         const pipelineArgs = buildFitPipelineArgs({
             pipelinePath,
+            gpuLockRunCommand,
             sourcePath,
             jobDir,
             tablePath,
@@ -461,19 +461,44 @@ async function plugin(args) {
             args.jobLog(`Dynamic HDR accepted provisionally from Check HDR Content: ${eligibility.dynamicEvidence.conversion}.`);
         }
         if (args.updateWorker) args.updateWorker({ CLIType: pythonPath, preset: pipelineArgs.join(' ') });
-        const pipelineResult = await withAnalysisGpuLease(
-            args,
-            sourcePath,
-            () => runProcess(pythonPath, pipelineArgs, {
-                timeoutMs,
-                maxOutputBytes: 16 * 1024 * 1024,
-            }),
-        );
-        if (pipelineResult.timedOut) throw new Error('grain analysis pipeline timed out');
+        // Only the NVEncC denoise inside the pipeline touches the GPU; the surrounding
+        // ranking, extraction, grav1synth diff and hashing are CPU-bound and used to
+        // hold the exclusive GPU lease for minutes at ~0% GPU utilisation, queueing
+        // unrelated VMAF and transcode jobs behind an idle device. The pipeline now
+        // leases the GPU per denoise via the lock runner.
+        //
+        // When the flow already holds the lock, that outer lease still covers the whole
+        // run: re-acquiring from a child process would deadlock, because the lock is not
+        // reentrant across process boundaries.
+        const grainOwnerId = `grain-analysis-${artifactLib.stableId(sourcePath)}`;
+        const pipelineResult = await runProcess(pythonPath, pipelineArgs, {
+            timeoutMs,
+            maxOutputBytes: 16 * 1024 * 1024,
+            onIdleTimeout: (extensionsSoFar) => {
+                if (!queuedBehindAnotherGpuOwner(grainOwnerId)) return false;
+                args.jobLog(`Grain analysis idle ${Math.round(timeoutMs / 60000)} min but the GPU ` +
+                    `pipeline lock is held by another job with a live heartbeat - waiting rather ` +
+                    `than killing (extension ${extensionsSoFar + 1}/${MAX_IDLE_EXTENSIONS}).`);
+                return true;
+            },
+            env: gpuLockRunCommand ? Object.assign({}, process.env, {
+                TDARR_GPU_LOCK_OWNER_ID: `grain-analysis-${artifactLib.stableId(sourcePath)}`,
+                TDARR_GPU_LOCK_STAGE: 'grain-analysis-knn',
+                TDARR_GPU_LOCK_PLUGIN: 'analyzeFilmGrain',
+            }) : undefined,
+        });
         // Python writes progress to stdout and the decisive fail-closed reason
         // to stderr. Preserve stderr priority even when progress was emitted.
         const tail = commandTail(pipelineResult);
         if (tail) args.jobLog(`Grain analysis pipeline tail:\n${tail}`);
+        // Log the tail BEFORE throwing. Discarding it on timeout is what made the Dutton Ranch
+        // stall undiagnosable - the wait/progress lines that identify whether the run was
+        // blocked on the GPU lock or genuinely wedged were captured and then dropped.
+        if (pipelineResult.timedOut) {
+            throw new Error('grain analysis pipeline timed out after ' +
+                Math.round(timeoutMs / 60000) + ' min without output' +
+                (tail ? ' (last output above)' : ' (no output captured)'));
+        }
         if (pipelineResult.code === 3) {
             if (fs.existsSync(tablePath) || fs.existsSync(manifestPath)) {
                 throw new Error('no-grain bypass unexpectedly published a table or fit manifest');
@@ -575,7 +600,6 @@ exports._test = {
     sourcePathFromArgs,
     clearPublishedVariables,
     boundedAnalysisDiagnostic,
-    withAnalysisGpuLease,
     ANALYSIS_DIAGNOSTIC_MAX_CHARS,
     makeAnalysisUnavailableResult,
     buildPipelineArgsForContract: buildFitPipelineArgs,

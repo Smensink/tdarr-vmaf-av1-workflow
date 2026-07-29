@@ -177,6 +177,7 @@ function chooseRefinementSubsample(args) {
 var plugin = function (args) {
     var lib = require('../../../../../methods/lib')();
     var feasibility = require('../../_lib/feasibility.js');
+    var adaptiveFrameFloor = require('../../_lib/adaptiveFrameFloor.js');
     args.inputs = lib.loadDefaultValues(args.inputs, details);
 
     var policyInputs = resolveCriticalDefaults(args.inputs);
@@ -235,10 +236,20 @@ var plugin = function (args) {
     // ── Per-CQ feasibility (VMAF mean + 1%-low floor + CAMBI), shared by the constraint-aware
     //    bracket check and active-boundary refinement below ──
     var _feasibleCqs = [], _allCqs = [], _unknownCqs = [];
+    // Refinement is only sound when the SAME binding constraints selection will apply are in
+    // force here. feasibility.evaluatePoint silently drops the 1%-low constraint when the floor
+    // is null, so an unresolved floor makes every CQ "feasible" on mean VMAF alone and the
+    // bisection anchors itself to a boundary that does not exist. Gladiator II (2026-07-29,
+    // job Z6ErJV9Y3) burned four probes and 40 minutes bisecting 26->27->27.5->27.8->27.9 while
+    // every one of those CQs was already measured 4-8 points under an 86.30 floor; selection
+    // later rejected all of them, and even CQ16 (p1 83.35) could not clear it - the band was
+    // empty from the start. Track resolution explicitly and refuse to refine without it.
+    var _bindingFloorResolved = false;
     try {
-        var _floor = Number(args.variables.vmafMinFrameVMAF)
-            || (args.variables.vmafQualityRiskPolicy && Number(args.variables.vmafQualityRiskPolicy.adaptiveFrameFloor))
-            || null;
+        // selectBestParameters publishes the floor, but it runs AFTER this plugin on the first
+        // cycle, so derive it here from the same shared table when it has not been published yet.
+        var _floor = adaptiveFrameFloor.resolveAdaptiveFrameFloor(args.inputFileObj, args.variables);
+        if (!(Number(_floor) > 0)) _floor = null;
         var _effCambi = feasibility.effectiveCambiLimit({
             isHDR: args.variables.isHDR === true,
             isAnimation: args.variables.vmafMediaIsAnimation === true,
@@ -252,6 +263,7 @@ var plugin = function (args) {
             vmafP1Floor: _floor,
             cambiLimit: _effCambi
         };
+        _bindingFloorResolved = Number(_floor) > 0;
         var _curveEval = feasibility.evaluateCurve(aggregated, _policy);
         var _cqStates = {};
         for (var _bi = 0; _bi < _curveEval.length; _bi++) {
@@ -295,6 +307,17 @@ var plugin = function (args) {
 
     function tryActiveRefinement() {
         if (args.variables.vmafActiveBoundary === false) return null;
+        if (!_bindingFloorResolved) {
+            // Fail closed: without the 1%-low floor, "feasible" here means "passed mean VMAF
+            // only" and cannot be trusted as a bisection anchor. Leaving the CQs unrefined
+            // costs one coarse round; refining on a phantom boundary costs several probes and
+            // still ends in no_feasible_parameters. Kill switch: vmafRefineRequireFloor===false.
+            if (args.variables.vmafRefineRequireFloor !== false) {
+                args.jobLog('Active-boundary refinement skipped: 1%-low frame floor unresolved, ' +
+                    'so per-CQ feasibility here would ignore the binding constraint selection applies.');
+                return null;
+            }
+        }
         if (_feasibleCqs.length === 0) return null;
         var _lo = Math.max.apply(null, _feasibleCqs);
         var _above = _allCqs.filter(function (c) { return c > _lo; });

@@ -1446,6 +1446,28 @@ var plugin = async function (args) {
         });
     }
 
+    // Describes the encoder's input after a zero-frame encode, so the job report carries evidence
+    // instead of a guess. Deliberately best-effort and bounded: this runs on a failure path and
+    // must never itself throw or stall the sweep.
+    function describeEmptyEncodeInput(args, samplePath) {
+        if (!samplePath) return 'sample path unknown';
+        var childProcess = require('child_process');
+        var bytes = null;
+        try { bytes = fs.statSync(samplePath).size; } catch (e) { return 'sample missing: ' + samplePath; }
+        var probe = '';
+        try {
+            probe = childProcess.execFileSync(args.ffprobePath || 'tdarr-ffprobe', [
+                '-v', 'error', '-select_streams', 'v:0',
+                '-count_packets', '-show_entries', 'stream=nb_read_packets,codec_name',
+                '-of', 'default=nw=1:nk=1', samplePath,
+            ], { stdio: 'pipe', timeout: 20000, shell: false, windowsHide: true })
+                .toString().trim().replace(/\s+/g, '/');
+        } catch (e) {
+            probe = 'probe failed';
+        }
+        return bytes + ' bytes, v:0 ' + (probe || 'no video stream');
+    }
+
     function handleEncodeResult(r) {
         completedTests++;
         if (!Array.isArray(args.variables.vmafTemporaryFiles)) args.variables.vmafTemporaryFiles = [];
@@ -1462,13 +1484,27 @@ var plugin = async function (args) {
             var fileSize = 0;
             try { fileSize = fs.statSync(r.outputPath).size / (1024 * 1024); }
             catch (e) { args.jobLog('Could not get file size for ' + r.outputPath); }
-            // A near-empty output means the encode produced no frames (e.g. the input sample had no
-            // video packets) even though ffmpeg exited 0. Treat as failure so it can't poison VMAF.
+            // A near-empty output means the encode produced no frames even though ffmpeg exited 0.
+            // Treat as failure so it can't poison VMAF.
+            //
+            // This branch used to drop ffmpeg's stderr and blame the input sample. That guess is
+            // often wrong - a 2026-07-29 DV Profile 7 remux failed all 80 encodes here while its
+            // samples decoded fine and re-encoded fine on retry - and discarding the stderr left
+            // nothing to diagnose from afterwards. Keep the encoder's own words, and probe the
+            // input so the report distinguishes "sample really had no video" from "encoder
+            // produced nothing from a good sample".
             if (fileSize * 1024 * 1024 < 20000) {
+                var emptyEvidence = describeEmptyEncodeInput(args, r.sample);
                 encodeFailures.push({ parameterSetId: r.paramSet.id, sampleIndex: r.sampleIndex,
                     error: 'Output file is empty/near-empty (' + (fileSize * 1024).toFixed(1) + ' KB) - no video frames encoded',
-                    outputPath: r.outputPath });
-                args.jobLog('  Failed: output is empty/near-empty (' + (fileSize * 1024).toFixed(1) + ' KB) - input sample likely has no video');
+                    stderrTail: r.stderrTail, inputEvidence: emptyEvidence, outputPath: r.outputPath });
+                args.jobLog('  Failed (' + r.paramSet.id + ' s' + (r.sampleIndex + 1) + '): output is empty/near-empty (' +
+                    (fileSize * 1024).toFixed(1) + ' KB) after ' + (r.encodingTime || 0).toFixed(1) + 's; input ' + emptyEvidence);
+                var emptyTail = (r.stderrTail || '').trim();
+                if (emptyTail) {
+                    args.jobLog('  FFmpeg tail (exit 0, empty output): ' +
+                        emptyTail.replace(/\s+/g, ' ').substring(0, 500));
+                }
             } else {
                 testResults.push({ parameterSetId: r.paramSet.id, sampleIndex: r.sampleIndex,
                     outputPath: r.outputPath, fileSizeMB: fileSize, encodingTimeSeconds: r.encodingTime,

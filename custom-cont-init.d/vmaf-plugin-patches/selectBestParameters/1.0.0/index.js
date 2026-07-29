@@ -11,6 +11,7 @@ var vmafMetricContract = require('../../_lib/vmafMetricContract.js');
 var vmafV1Cpu = require('../../_lib/vmafV1Cpu.js');
 var preFgsCambi = require('../../_lib/preFgsCambi.js');
 var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
+var adaptiveFrameFloorLib = require('../../_lib/adaptiveFrameFloor.js');
 
 function buildHoldoutVmafArgs(options) {
     options = options || {};
@@ -1401,27 +1402,12 @@ var plugin = function (args) {
 
         };
 
-        var frameFloor = {
-
-            '4k':    isAnimation ? 84.0 : (hdr ? 86.0 : 85.5),
-
-            '1440p': isAnimation ? 83.5 : (hdr ? 85.5 : 85.0),
-
-            '1080p': isAnimation ? 83.0 : (hdr ? 85.0 : 84.5),
-
-            '720p':  isAnimation ? 82.5 : 83.5,
-
-            'sd':    isAnimation ? 81.5 : 82.5
-
-        };
-
-        var adaptiveFloor = frameFloor[tier];
-
-        if (isBluray && !isAnimation) adaptiveFloor += 0.3;
-
-        if (isMovie && tier === '4k' && !isAnimation) adaptiveFloor += 0.2;
-
-        adaptiveFloor = Math.min(94, adaptiveFloor);
+        // Floor table lives in _lib/adaptiveFrameFloor.js so checkCQBracket - which runs before
+        // this plugin publishes the policy - derives the identical value instead of falling back
+        // to null and silently dropping the 1%-low constraint.
+        var adaptiveFloor = adaptiveFrameFloorLib.frameFloorForTier(tier, {
+            isHDR: hdr, isAnimation: isAnimation, isBluray: isBluray, isMovie: isMovie
+        });
 
         return {
 

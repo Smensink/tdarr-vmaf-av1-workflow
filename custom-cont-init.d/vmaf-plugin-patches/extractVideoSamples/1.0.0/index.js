@@ -13,18 +13,33 @@ var grainArtifact = require('../../_lib/grainAnalysisArtifact.js');
 var grainVmafContract = require('../../_lib/grainVmafContract.js');
 var nvenccKnn = require('../../_lib/nvenccKnn.js');
 
-function buildSampleExtractionArgs(inputPath, outputPath, seekSeconds, durationSeconds, videoMap) {
-    return [
-        '-ss', Number(seekSeconds).toFixed(2),
-        '-i', String(inputPath),
+// Hard ceiling for a single extracted sample. A legitimate few-second window off a
+// 4K remux is tens of MB; anything approaching this is a runaway copy, so capping
+// stops it in seconds instead of letting it write GBs until the spawn timeout.
+var SAMPLE_EXTRACTION_MAX_BYTES = 512 * 1024 * 1024;
+
+function buildSampleExtractionArgs(inputPath, outputPath, seekSeconds, durationSeconds, videoMap, options) {
+    var robustSeek = !!(options && options.robustSeek);
+    var seek = Number(seekSeconds).toFixed(2);
+    // Fast path: input-side seek, which uses the container index and is cheap.
+    // Robust path: output-side seek, which demuxes from 0 and discards. Structurally
+    // damaged Matroska (master-element overruns) has an unusable index, so input-side
+    // seek lands at the wrong offset and -t never bounds the copy - ffmpeg then runs
+    // to EOF and emits a multi-GB, multi-minute "sample". Output-side seek is immune
+    // to that because the cut is driven by decoded packet order, not the index.
+    var head = robustSeek
+        ? ['-i', String(inputPath), '-ss', seek]
+        : ['-ss', seek, '-i', String(inputPath)];
+    return head.concat([
         '-t', String(durationSeconds),
         '-map', String(videoMap),
         '-an', '-sn', '-dn',
         '-c:v', 'copy',
         '-avoid_negative_ts', 'make_zero',
         '-reset_timestamps', '1',
+        '-fs', String(SAMPLE_EXTRACTION_MAX_BYTES),
         '-y', String(outputPath),
-    ];
+    ]);
 }
 
 function buildFeatureExtractionArgs(inputPath, filterComplex) {
@@ -137,12 +152,23 @@ function buildDenoisedSampleArgs(options) {
     var stream = options.stream || {};
     var outputDepth = nvenccKnn.outputDepthForStream(stream);
     var frames = nvenccKnn.frameCount(duration, stream);
+    // The NUT stream out of NVEncC carries no sample aspect ratio, so the denoised reference was
+    // being written with SAR/DAR unset while the plain-extracted samples and the encoded distorted
+    // clips both carry the source's 1:1/16:9. The CPU VMAF-v1 scorer requires all three to agree
+    // and rejects the pair outright ("coded geometry/SAR/DAR mismatch ... reference sar=N/A",
+    // exit 65), which fails every sample on the canonical-denoise path. Restamp the source SAR;
+    // setsar is metadata-only and leaves pixels untouched.
+    var vfChain = 'setpts=PTS-STARTPTS';
+    var sourceSar = String(stream.sample_aspect_ratio || '').trim();
+    if (/^[0-9]+:[0-9]+$/.test(sourceSar) && sourceSar.indexOf('0:') !== 0) {
+        vfChain += ',setsar=' + sourceSar.replace(':', '/');
+    }
     var consumerArgs = [
         '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
         '-f', 'nut', '-i', 'pipe:0',
         '-map', '0:v:0', '-an', '-sn', '-dn',
         '-frames:v', String(Math.max(1, frames - 1)),
-        '-vf', 'setpts=PTS-STARTPTS',
+        '-vf', vfChain,
         '-c:v', 'ffv1', '-level', '3', '-coder', '1', '-context', '1', '-slicecrc', '1',
     ];
     consumerArgs.push('-pix_fmt', outputDepth === 10 ? 'yuv420p10le' : 'yuv420p');
@@ -6669,7 +6695,15 @@ for (var i = 0; i < numSegments; i++) {
 
 
 
-        var seekAttempts = [position, Math.max(0, position - keyframeSeekWindowSeconds)];
+        // Third attempt uses output-side seek. It is materially slower (everything up to
+        // the cut point is demuxed and discarded), so it stays a last resort - but it is
+        // the only mode that survives a damaged container index, where both index-driven
+        // attempts above copy to EOF instead of the requested window.
+        var seekAttempts = [
+            { seek: position, robustSeek: false },
+            { seek: Math.max(0, position - keyframeSeekWindowSeconds), robustSeek: false },
+            { seek: position, robustSeek: true },
+        ];
 
 
 
@@ -6682,7 +6716,8 @@ for (var i = 0; i < numSegments; i++) {
 
 
             var extractionArgs = buildSampleExtractionArgs(
-                inputFile, outputPath, seekAttempts[att], segmentDuration, videoMap);
+                inputFile, outputPath, seekAttempts[att].seek, segmentDuration, videoMap,
+                { robustSeek: seekAttempts[att].robustSeek });
 
 
 
@@ -6697,7 +6732,9 @@ for (var i = 0; i < numSegments; i++) {
 
 
                 execFileSync(args.ffmpegPath, extractionArgs, {
-                    stdio: 'pipe', timeout: 120000, shell: false, windowsHide: true
+                    stdio: 'pipe',
+                    timeout: seekAttempts[att].robustSeek ? 300000 : 120000,
+                    shell: false, windowsHide: true
                 });
 
 
@@ -6852,21 +6889,29 @@ for (var i = 0; i < numSegments; i++) {
 
         args.jobLog('Extracting reserved holdout sample: ' + holdoutStart + 's');
 
-        var holdoutAttempts = [holdoutPosition, Math.max(0, holdoutPosition - keyframeSeekWindowSeconds)];
+        // Same damaged-index fallback as the main sample loop above.
+        var holdoutAttempts = [
+            { seek: holdoutPosition, robustSeek: false },
+            { seek: Math.max(0, holdoutPosition - keyframeSeekWindowSeconds), robustSeek: false },
+            { seek: holdoutPosition, robustSeek: true },
+        ];
 
         var holdoutExtracted = false;
 
         for (var ha = 0; ha < holdoutAttempts.length && !holdoutExtracted; ha++) {
 
             var holdoutExtractionArgs = buildSampleExtractionArgs(
-                inputFile, holdoutPath, holdoutAttempts[ha], segmentDuration, holdoutMap);
+                inputFile, holdoutPath, holdoutAttempts[ha].seek, segmentDuration, holdoutMap,
+                { robustSeek: holdoutAttempts[ha].robustSeek });
 
 
 
             try {
 
                 execFileSync(args.ffmpegPath, holdoutExtractionArgs, {
-                    stdio: 'pipe', timeout: 120000, shell: false, windowsHide: true
+                    stdio: 'pipe',
+                    timeout: holdoutAttempts[ha].robustSeek ? 300000 : 120000,
+                    shell: false, windowsHide: true
                 });
 
                 if (isValidVideoSample(holdoutPath, args, segmentDuration)) {

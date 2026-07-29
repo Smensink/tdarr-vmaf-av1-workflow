@@ -5,7 +5,6 @@ var path = require('path');
 var childProcess = require('child_process');
 
 var DEFAULT_LOCK_DIR = '/temp/tdarr-vmaf-gpu-pipeline.lock';
-var atomicWriteCounter = 0;
 
 function nowIso() {
     return new Date().toISOString();
@@ -13,80 +12,8 @@ function nowIso() {
 
 function safeJsonRead(filePath) {
     try {
-        var stat = fs.lstatSync(filePath);
-        if (!stat.isFile() || stat.isSymbolicLink()) {
-            return null;
-        }
         return JSON.parse(fs.readFileSync(filePath, 'utf8'));
     } catch (err) {
-        return null;
-    }
-}
-
-function atomicJsonWrite(filePath, value) {
-    var parent = path.dirname(filePath);
-    var tempName = '.tdarr-gpu-lock-tmp.' + process.pid + '.' + Date.now() + '.' +
-        (++atomicWriteCounter) + '.json';
-    var tempPath = path.join(parent, tempName);
-    var fd = null;
-    try {
-        fd = fs.openSync(tempPath, 'wx', 0o600);
-        fs.writeFileSync(fd, JSON.stringify(value, null, 2), { encoding: 'utf8' });
-        fs.fsyncSync(fd);
-        fs.closeSync(fd);
-        fd = null;
-        fs.renameSync(tempPath, filePath);
-    } catch (err) {
-        if (fd !== null) {
-            try { fs.closeSync(fd); } catch (_) {}
-        }
-        try {
-            var tempStat = fs.lstatSync(tempPath);
-            if (tempStat.isFile() && !tempStat.isSymbolicLink()) {
-                fs.unlinkSync(tempPath);
-            }
-        } catch (_) {}
-        throw err;
-    }
-}
-
-function readDirectoryIdentity(targetPath) {
-    var stat = fs.lstatSync(targetPath);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        throw new Error('GPU pipeline lock path is not a real directory: ' + targetPath);
-    }
-    return {
-        dev: String(stat.dev),
-        ino: String(stat.ino),
-        birthtimeMs: Number(stat.birthtimeMs) || 0
-    };
-}
-
-function sameDirectoryIdentity(targetPath, expected) {
-    if (!expected) return false;
-    try {
-        var current = readDirectoryIdentity(targetPath);
-        if (current.dev !== expected.dev || current.ino !== expected.ino) {
-            return false;
-        }
-        if (current.ino === '0' && expected.birthtimeMs > 0 &&
-                current.birthtimeMs !== expected.birthtimeMs) {
-            return false;
-        }
-        return true;
-    } catch (_) {
-        return false;
-    }
-}
-
-function directoryAgeSeconds(targetPath) {
-    try {
-        var stat = fs.lstatSync(targetPath);
-        if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
-        var timestamp = Number(stat.mtimeMs) || Number(stat.ctimeMs) || Number(stat.birthtimeMs);
-        if (!Number.isFinite(timestamp)) return null;
-        return Math.max(0, (Date.now() - timestamp) / 1000);
-    } catch (_) {
         return null;
     }
 }
@@ -137,8 +64,7 @@ function removeManagedLockDir(targetPath, lockDir) {
     };
     var entries = fs.readdirSync(targetPath);
     for (var i = 0; i < entries.length; i++) {
-        var isAtomicTemp = /^\.tdarr-gpu-lock-tmp\.\d+\.\d+\.\d+\.json$/.test(entries[i]);
-        if (!allowed[entries[i]] && !isAtomicTemp) {
+        if (!allowed[entries[i]]) {
             throw new Error('Refusing to remove unexpected GPU lock entry: ' + entries[i]);
         }
         var entryPath = path.join(targetPath, entries[i]);
@@ -308,7 +234,7 @@ function writeHeartbeat(lockDir, token, leaseGeneration) {
         pid: process.pid,
         timestamp: nowIso()
     };
-    atomicJsonWrite(path.join(lockDir, 'heartbeat.json'), heartbeat);
+    fs.writeFileSync(path.join(lockDir, 'heartbeat.json'), JSON.stringify(heartbeat, null, 2));
 }
 
 function startHeartbeat(lockDir, token, leaseGeneration, intervalSeconds, ownerPid, ownerStartTime) {
@@ -322,38 +248,6 @@ function startHeartbeat(lockDir, token, leaseGeneration, intervalSeconds, ownerP
         'var interval=Math.max(5,Number(process.argv[4])||30)*1000;',
         'var ownerPid=process.argv[5];',
         'var ownerStartTime=process.argv[6];',
-        'var counter=0;',
-        'function identity(){',
-        '  try{var s=fs.lstatSync(lockDir);if(!s.isDirectory()||s.isSymbolicLink())return null;',
-        '    return {dev:String(s.dev),ino:String(s.ino),birthtimeMs:Number(s.birthtimeMs)||0};}catch(e){return null;}',
-        '}',
-        'var initialIdentity=identity();',
-        'if(!initialIdentity){process.exit(0);}',
-        'function sameIdentity(){var current=identity();if(!current)return false;',
-        '  if(current.dev!==initialIdentity.dev||current.ino!==initialIdentity.ino)return false;',
-        '  return !(current.ino==="0"&&initialIdentity.birthtimeMs>0&&current.birthtimeMs!==initialIdentity.birthtimeMs);',
-        '}',
-        'function atomicHeartbeat(){',
-        '  var target=path.join(lockDir,"heartbeat.json");',
-        '  var temp=path.join(lockDir,".tdarr-gpu-lock-tmp."+process.pid+"."+Date.now()+"."+(++counter)+".json");',
-        '  var fd=null;',
-        '  try{',
-        '    if(!sameIdentity())throw new Error("lock directory identity changed");',
-        '    var current=JSON.parse(fs.readFileSync(path.join(lockDir,"owner.json"),"utf8"));',
-        '    if(current.token!==token||current.leaseGeneration!==generation)throw new Error("lease changed");',
-        '    fd=fs.openSync(temp,"wx",0o600);',
-        '    fs.writeFileSync(fd,JSON.stringify({token:token,leaseGeneration:generation,pid:process.pid,timestamp:new Date().toISOString()},null,2),{encoding:"utf8"});',
-        '    fs.fsyncSync(fd);fs.closeSync(fd);fd=null;',
-        '    if(!sameIdentity())throw new Error("lock directory identity changed");',
-        '    current=JSON.parse(fs.readFileSync(path.join(lockDir,"owner.json"),"utf8"));',
-        '    if(current.token!==token||current.leaseGeneration!==generation)throw new Error("lease changed");',
-        '    fs.renameSync(temp,target);',
-        '  }catch(e){',
-        '    if(fd!==null){try{fs.closeSync(fd);}catch(_){}}',
-        '    try{var s=fs.lstatSync(temp);if(s.isFile()&&!s.isSymbolicLink())fs.unlinkSync(temp);}catch(_){}',
-        '    throw e;',
-        '  }',
-        '}',
         'function tick(){',
         '  try {',
         '    var owner=JSON.parse(fs.readFileSync(path.join(lockDir,"owner.json"),"utf8"));',
@@ -366,7 +260,7 @@ function startHeartbeat(lockDir, token, leaseGeneration, intervalSeconds, ownerP
         '          if(ownerStartTime && st!==Number(ownerStartTime)){process.exit(0);}',
         '        }}catch(e){process.exit(0);}',
         '    }',
-        '    atomicHeartbeat();',
+        '    fs.writeFileSync(path.join(lockDir,"heartbeat.json"), JSON.stringify({token:token,leaseGeneration:generation,pid:process.pid,timestamp:new Date().toISOString()}, null, 2));',
         '  } catch(e) { process.exit(0); }',
         '}',
         'tick();',
@@ -389,17 +283,9 @@ function startHeartbeat(lockDir, token, leaseGeneration, intervalSeconds, ownerP
 function tryAcquire(lockDir, owner, opts) {
     safeMkdirParent(lockDir);
     var created = false;
-    var createdIdentity = null;
     try {
         fs.mkdirSync(lockDir);
         created = true;
-        createdIdentity = readDirectoryIdentity(lockDir);
-        if (typeof opts._testAfterDirectoryCreated === 'function') {
-            opts._testAfterDirectoryCreated({
-                lockDir: lockDir,
-                identity: createdIdentity
-            });
-        }
         owner.token = owner.token || buildToken(owner.ownerId);
         owner.leaseGeneration = owner.leaseGeneration || buildToken('lease');
         owner.acquiredAt = nowIso();
@@ -410,14 +296,14 @@ function tryAcquire(lockDir, owner, opts) {
         // starttime is set at exec() and survives container restarts — unlike PID numbers which
         // get recycled.  This is the authoritative signal that the original worker is still alive.
         owner.workerStartTime = getProcStartTime(process.pid);
-        atomicJsonWrite(path.join(lockDir, 'owner.json'), owner);
+        fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify(owner, null, 2));
         writeHeartbeat(lockDir, owner.token, owner.leaseGeneration);
         var heartbeatPid = startHeartbeat(lockDir, owner.token, owner.leaseGeneration,
             opts.heartbeatIntervalSeconds || 30, owner.pid, owner.workerStartTime);
         if (heartbeatPid) {
             owner.heartbeatPid = heartbeatPid;
             owner.heartbeatAt = nowIso();
-            atomicJsonWrite(path.join(lockDir, 'owner.json'), owner);
+            fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify(owner, null, 2));
             writeHeartbeat(lockDir, owner.token, owner.leaseGeneration);
         }
         return { acquired: true, owner: owner };
@@ -425,15 +311,11 @@ function tryAcquire(lockDir, owner, opts) {
         if (err && err.code === 'EEXIST') {
             return { acquired: false, owner: readOwner(lockDir), reason: 'held' };
         }
-        if (created && sameDirectoryIdentity(lockDir, createdIdentity)) {
+        if (created && fs.existsSync(lockDir)) {
             var failedPath = lockDir + '.failed.' + Date.now() + '.' + process.pid;
             try {
                 fs.renameSync(lockDir, failedPath);
-                if (sameDirectoryIdentity(failedPath, createdIdentity)) {
-                    removeManagedLockDir(failedPath, lockDir);
-                } else if (!fs.existsSync(lockDir)) {
-                    fs.renameSync(failedPath, lockDir);
-                }
+                removeManagedLockDir(failedPath, lockDir);
             } catch (_) {}
         }
         throw err;
@@ -447,51 +329,11 @@ function tryAcquireOnce(opts) {
 }
 
 function shouldBreakStale(lockDir, owner, opts) {
-    opts = opts || {};
     var staleHeartbeatSeconds = Math.max(300, Number(opts.staleHeartbeatSeconds) || 7200);
     var maxLockAgeSeconds = Math.max(staleHeartbeatSeconds, Number(opts.maxLockAgeSeconds) || 28800);
-    var initializationGraceSeconds = Math.max(5, Number(opts.initializationGraceSeconds) || 30);
+    var orphanProcessGraceSeconds = Math.max(30, Number(opts.orphanProcessGraceSeconds) || 180);
     var hbAge = heartbeatAgeSeconds(lockDir, owner);
     var lockAge = owner && owner.acquiredAt ? secondsSinceIso(owner.acquiredAt) : null;
-    var lockDirectoryAge = directoryAgeSeconds(lockDir);
-    var lockIdentity = null;
-    try { lockIdentity = readDirectoryIdentity(lockDir); } catch (_) {}
-    var ownerValid = !!(owner && typeof owner === 'object' &&
-        typeof owner.token === 'string' && owner.token &&
-        typeof owner.leaseGeneration === 'string' && owner.leaseGeneration);
-
-    // mkdir publishes the exclusion boundary before owner.json can be written.
-    // A waiter must therefore treat a fresh empty/partial directory as an
-    // in-progress acquisition, not as an immediately stale lease.
-    if (!ownerValid) {
-        if (lockDirectoryAge === null || lockDirectoryAge < initializationGraceSeconds) {
-            return {
-                stale: false,
-                hbAge: hbAge,
-                lockAge: lockAge,
-                lockIdentity: lockIdentity,
-                reason: 'lock initialization grace'
-            };
-        }
-        var ownerFileExists = fs.existsSync(path.join(lockDir, 'owner.json'));
-        var heartbeatFileExists = fs.existsSync(path.join(lockDir, 'heartbeat.json'));
-        if (ownerFileExists || heartbeatFileExists) {
-            return {
-                stale: false,
-                hbAge: hbAge,
-                lockAge: lockAge,
-                lockIdentity: lockIdentity,
-                reason: 'invalid lease metadata requires manual recovery'
-            };
-        }
-        return {
-            stale: true,
-            hbAge: hbAge,
-            lockAge: lockAge,
-            lockIdentity: lockIdentity,
-            reason: 'abandoned empty lock initialization'
-        };
-    }
 
     // ── Container-restart-safe worker liveness check ──────────────────────────
     // Use starttime comparison for the owner PID.  This is the primary signal.
@@ -502,19 +344,15 @@ function shouldBreakStale(lockDir, owner, opts) {
     if (owner && owner.pid) {
         workerAlive = isWorkerAliveInContainer(owner.pid, owner.workerStartTime);
     }
+    // heartbeatPid is the detached node subprocess — it is allowed to outlive the
+    // worker (it runs independently).  Only check it when owner.pid is absent.
     var heartbeatPidAlive = owner && owner.heartbeatPid ? isPidAlive(owner.heartbeatPid) : null;
 
     // ── Stale lock decision tree ───────────────────────────────────────────────
     // CASE 1: a confirmed-live owner is authoritative. Neither same-file identity
     // nor elapsed wall time is sufficient to revoke its lease.
     if (workerAlive === true) {
-        return {
-            stale: false,
-            hbAge: hbAge,
-            lockAge: lockAge,
-            lockIdentity: lockIdentity,
-            reason: 'owner worker identity is live'
-        };
+        return { stale: false, hbAge: hbAge, lockAge: lockAge, reason: 'owner worker identity is live' };
     }
 
     // Maintenance self-tests deliberately choose a non-stealable lease. If
@@ -526,85 +364,68 @@ function shouldBreakStale(lockDir, owner, opts) {
             stale: false,
             hbAge: hbAge,
             lockAge: lockAge,
-            lockIdentity: lockIdentity,
             reason: 'owner requires manual recovery after supervisor loss'
         };
     }
 
-    // A worker can die while an FFmpeg/NVEncC descendant remains alive. The
-    // lease does not record every producer process-group identity, so owner
-    // death is not proof that the GPU is idle. Established leases are
-    // deliberately fail-closed and require the quiescence recovery procedure.
+    // CASE 2: owner worker confirmed dead (PID recycled or genuinely gone)
     if (workerAlive === false) {
         return {
-            stale: false,
+            stale: true,
             hbAge: hbAge,
             lockAge: lockAge,
-            lockIdentity: lockIdentity,
-            reason: 'owner worker identity is gone; possible GPU descendants require manual recovery'
+            reason: 'owner worker process ' +
+                (owner.workerStartTime !== undefined ? '(starttime mismatch — PID recycled after restart)' : '(PID does not exist)') +
+                ' ownerPid=' + owner.pid +
+                (heartbeatPidAlive === true ? ' orphan heartbeat ignored' : '')
         };
     }
 
+    // CASE 3: owner PID unknown but heartbeat process definitely dead
+    // (this handles the rare case where neither owner.pid nor workerStartTime were recorded)
+    if (workerAlive === null && heartbeatPidAlive === false &&
+            (hbAge === null || hbAge >= orphanProcessGraceSeconds) &&
+            (lockAge === null || lockAge >= orphanProcessGraceSeconds)) {
+        return {
+            stale: true,
+            hbAge: hbAge,
+            lockAge: lockAge,
+            reason: 'owner process unknown and heartbeat process exited'
+        };
+    }
+
+    // CASE 4: heartbeat is still fresh — lock is live
     if (hbAge !== null && hbAge < staleHeartbeatSeconds) {
-        return {
-            stale: false,
-            hbAge: hbAge,
-            lockAge: lockAge,
-            lockIdentity: lockIdentity,
-            reason: 'heartbeat fresh'
-        };
+        return { stale: false, hbAge: hbAge, lockAge: lockAge, reason: 'heartbeat fresh' };
     }
 
+    // CASE 5: heartbeat process still alive. Without a contradictory owner
+    // identity signal, do not steal the lease.
     if (heartbeatPidAlive === true) {
-        return {
-            stale: false,
-            hbAge: hbAge,
-            lockAge: lockAge,
-            lockIdentity: lockIdentity,
-            reason: 'heartbeat process still alive'
-        };
+        return { stale: false, hbAge: hbAge, lockAge: lockAge, reason: 'heartbeat process still alive' };
     }
 
+    // CASE 6: inside overall safety window
     if (lockAge !== null && lockAge < maxLockAgeSeconds && hbAge !== null && hbAge < maxLockAgeSeconds) {
-        return {
-            stale: false,
-            hbAge: hbAge,
-            lockAge: lockAge,
-            lockIdentity: lockIdentity,
-            reason: 'inside max lock age safety window'
-        };
+        return { stale: false, hbAge: hbAge, lockAge: lockAge, reason: 'inside max lock age safety window' };
     }
 
-    // A valid lease with no provably live supervisor is still not safe to
-    // steal: long-running descendants can survive their Tdarr worker.
+    // CASE 7: everything is stale and there is no live owner evidence
     return {
-        stale: false,
+        stale: true,
         hbAge: hbAge,
         lockAge: lockAge,
-        lockIdentity: lockIdentity,
-        reason: 'established lease is stale but requires manual quiescence recovery'
+        reason: 'heartbeat stale' + (readHeartbeat(lockDir) && readHeartbeat(lockDir).timestamp ? '' : ' or missing')
     };
 }
 
-function breakStaleLock(lockDir, expectedIdentity) {
-    if (!sameDirectoryIdentity(lockDir, expectedIdentity)) {
-        return false;
-    }
+function breakStaleLock(lockDir) {
     var stalePath = lockDir + '.stale.' + Date.now() + '.' + process.pid;
-    var renamed = false;
     try {
         fs.renameSync(lockDir, stalePath);
-        renamed = true;
-        if (!sameDirectoryIdentity(stalePath, expectedIdentity)) {
-            if (!fs.existsSync(lockDir)) fs.renameSync(stalePath, lockDir);
-            return false;
-        }
         removeManagedLockDir(stalePath, lockDir);
         return true;
     } catch (err) {
-        if (renamed && fs.existsSync(stalePath) && !fs.existsSync(lockDir)) {
-            try { fs.renameSync(stalePath, lockDir); } catch (_) {}
-        }
         return false;
     }
 }
@@ -641,7 +462,7 @@ function acquireBlocking(opts) {
                     ', lock age=' + (stale.lockAge === null ? 'unknown' : Math.round(stale.lockAge) + 's') +
                     '). Breaking stale lock: ' + describeOwner(existingOwner));
             }
-            breakStaleLock(lockDir, stale.lockIdentity);
+            breakStaleLock(lockDir);
             continue;
         }
 
@@ -695,7 +516,7 @@ async function acquire(opts) {
                 opts.log('GPU pipeline lock appears stale (' + stale.reason + '). Retiring stale lease: ' +
                     describeOwner(existingOwner));
             }
-            if (!breakStaleLock(lockDir, stale.lockIdentity)) {
+            if (!breakStaleLock(lockDir)) {
                 await sleepAsync(waitPollSeconds);
             }
             continue;
@@ -715,7 +536,47 @@ async function acquire(opts) {
     }
 }
 
+// The lock lives on a Windows-backed bind mount, where the retire rename intermittently
+// fails with EACCES/EPERM/EBUSY - typically right after acquire, while the freshly
+// spawned heartbeat still has the directory open. The same flakiness can let the rename
+// succeed but make the immediately following owner.json read fail, which surfaces as a
+// null owner and reads exactly like a stolen lease. Both are transient and clear within
+// milliseconds, but an unretried release leaves the lock held with no live owner - the
+// GPU then sits idle behind a lease nobody will ever free. Retry those two shapes only;
+// a real token or generation mismatch is a correctness signal and must never be retried.
+var RELEASE_RETRY_ATTEMPTS = 5;
+var RELEASE_RETRY_DELAY_MS = 100;
+var TRANSIENT_RELEASE_ERROR_CODES = ['EACCES', 'EPERM', 'EBUSY', 'ENOTEMPTY'];
+
+function isTransientReleaseFailure(result) {
+    if (!result || result.released === true) return false;
+    var reason = String(result.reason || '');
+    if (reason.indexOf('atomic release failed:') === 0) {
+        for (var i = 0; i < TRANSIENT_RELEASE_ERROR_CODES.length; i++) {
+            if (reason.indexOf(TRANSIENT_RELEASE_ERROR_CODES[i]) !== -1) return true;
+        }
+        return false;
+    }
+    // A verified-away lease reports the owner it found; a transient read reports none.
+    return reason === 'lease changed during release' && !result.owner;
+}
+
+function sleepMsBusy(ms) {
+    var until = Date.now() + ms;
+    while (Date.now() < until) { /* release must stay synchronous for finally blocks */ }
+}
+
 function release(lockDir, expectedToken, opts) {
+    var result = releaseOnce(lockDir, expectedToken, opts);
+    for (var attempt = 1; attempt < RELEASE_RETRY_ATTEMPTS &&
+        isTransientReleaseFailure(result); attempt++) {
+        sleepMsBusy(RELEASE_RETRY_DELAY_MS);
+        result = releaseOnce(lockDir, expectedToken, opts);
+    }
+    return result;
+}
+
+function releaseOnce(lockDir, expectedToken, opts) {
     lockDir = resolveLockDir(lockDir);
     var owner = readOwner(lockDir);
     if (!owner) {
