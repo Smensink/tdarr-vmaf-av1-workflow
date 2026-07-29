@@ -1,5 +1,86 @@
 # Tdarr VMAF AV1 workflow
 
+Quality-targeted AV1 encoding on an **NVIDIA GPU**, in Tdarr. Instead of picking
+one CQ for your whole library and hoping, this measures each title and picks the
+lowest bitrate that still hits a quality target you set.
+
+## The short version
+
+A fixed CQ is a compromise. Set it low and grainy or dark films fall apart; set
+it high and you waste space on easy content. Software encoders have tooling to
+solve this — but they're slow, and that tooling assumes you're using them.
+
+This does it with `av1_nvenc`, so a film takes tens of minutes rather than
+overnight. Two real results from the library it runs on:
+
+| Title | Source | AV1 output | Size |
+|---|---|---|---|
+| 4K HDR WEB-DL episode | 11.34 GB | 3.49 GB | 31% |
+| 4K HDR Bluray episode | 17.01 GB | 10.12 GB | 59% |
+
+Same quality target, very different outcomes — which is the entire point. The
+second title genuinely needed most of its bitrate; a fixed CQ tuned for it would
+have wasted several GB on the first.
+
+## Three things this measures
+
+**VMAF** — Netflix's perceptual quality score (0–100). Better than PSNR or SSIM
+at matching what people actually notice. The flow targets a harmonic-mean VMAF
+of 95 across samples, so one bad scene can't be hidden by easy ones.
+
+**1%-low frame VMAF** — the worst frames, not the average. A file can average 96
+and still contain a scene that visibly falls apart. There's a per-title floor
+(around 86 for 4K HDR) that a candidate has to clear.
+
+**CAMBI** — a banding detector. Banding is the blotchy stair-stepping you see in
+skies, smoke and dark gradients. It's the artifact AV1 encoders most often trade
+away for bitrate, and VMAF barely registers it — so it gets its own limit. In
+practice it's frequently the constraint that binds.
+
+## Film grain synthesis, and why it's here
+
+AV1 has a trick: rather than spending bitrate encoding grain (which is noise,
+and compresses terribly), strip it, then have the *decoder* regenerate it on
+playback from a small parameter table. Grainy films get dramatically smaller
+without the plasticky smear of just denoising them.
+
+`SVT-AV1` and `libaom` support this natively. **NVENC's AV1 encoder does not
+expose it.** So this measures the grain on the source, encodes without it, and
+writes the grain table into the output itself — which is the main reason this
+repo exists rather than being a config file.
+
+## Why hardware
+
+Quality-targeted encoding is well-trodden ground for software encoders —
+[`ab-av1`](https://github.com/alexheretic/ab-av1) does VMAF-targeted CRF search
+for SVT-AV1 and libaom, and does it well. But software AV1 at 4K is slow enough
+that a large library becomes a months-long project, and those tools target
+software encoders specifically.
+
+The trade-off is real and worth stating plainly: NVENC is less efficient per bit
+than a slow SVT-AV1 preset. You give up some compression to get a library
+finished this year rather than next.
+
+## Who this is for
+
+Probably you, if: you run Tdarr with an NVIDIA card, you have a large 4K/HDR
+library, and you've been uneasy picking one CQ for everything.
+
+Probably not, if you want plug-and-play. This is a working production setup, not
+a distributable plugin — it expects specific build artifacts (a custom FFmpeg
+with libvmaf, NVEncC, grav1synth) and is deliberately opinionated about safety.
+Read [Safe installation outline](#safe-installation-outline) first, and treat it
+as something to adapt rather than drop in.
+
+**It will not touch your originals unless a candidate passes every gate** —
+quality, worst-frame floor, banding and size — and replacement goes through a
+validator and an attested transaction. Titles that can't hit the target are left
+alone, deliberately.
+
+---
+
+## Technical detail
+
 This repository captures a production Tdarr flow that searches for
 per-title AV1 NVENC settings, measures sample quality, applies size and
 banding constraints, optionally reconstructs film grain, and learns from prior
