@@ -1,81 +1,81 @@
 # Tdarr VMAF AV1 workflow
 
-Quality-targeted AV1 encoding on an **NVIDIA GPU**, in Tdarr. Instead of picking
-one CQ for your whole library and hoping, this measures each title and picks the
-lowest bitrate that still hits a quality target you set.
+A Tdarr flow that picks AV1 CQ values per file instead of using one setting for
+everything. It runs on `av1_nvenc`, so encodes take tens of minutes rather than
+overnight.
 
-## The short version
+## What problem this solves
 
-A fixed CQ is a compromise. Set it low and grainy or dark films fall apart; set
-it high and you waste space on easy content. Software encoders have tooling to
-solve this — but they're slow, and that tooling assumes you're using them.
+There isn't a single good CQ for a mixed library. Pick a low one and grainy or
+dark films come out mushy. Pick a high one and you spend gigabytes on content
+that never needed them.
 
-This does it with `av1_nvenc`, so a film takes tens of minutes rather than
-overnight. Two real results from the library it runs on:
+So this samples each file, encodes those samples at several CQ values, scores
+them, and keeps the lowest bitrate that still passes. Two results from the
+library it runs against, both using identical settings:
 
 | Title | Source | AV1 output | Size |
 |---|---|---|---|
 | 4K HDR WEB-DL episode | 11.34 GB | 3.49 GB | 31% |
 | 4K HDR Bluray episode | 17.01 GB | 10.12 GB | 59% |
 
-Same quality target, very different outcomes — which is the entire point. The
-second title genuinely needed most of its bitrate; a fixed CQ tuned for it would
-have wasted several GB on the first.
+31% against 59% is the whole argument for doing it this way. The Bluray really
+did need that bitrate, and any fixed CQ would have been wrong for one of the two.
 
-## Three things this measures
+## What it scores
 
-**VMAF** — Netflix's perceptual quality score (0–100). Better than PSNR or SSIM
-at matching what people actually notice. The flow targets a harmonic-mean VMAF
-of 95 across samples, so one bad scene can't be hidden by easy ones.
+VMAF is Netflix's perceptual quality metric, and it tracks what people notice
+much better than PSNR or SSIM does. The flow targets a harmonic mean of 95
+across samples, so a single bad scene can't hide behind easy ones.
 
-**1%-low frame VMAF** — the worst frames, not the average. A file can average 96
-and still contain a scene that visibly falls apart. There's a per-title floor
-(around 86 for 4K HDR) that a candidate has to clear.
+Average quality isn't enough on its own though, because a file can sit at 96 and
+still contain one scene that falls apart. So there's also a floor on the 1%
+worst frames, roughly 86 on 4K HDR, that a candidate has to clear.
 
-**CAMBI** — a banding detector. Banding is the blotchy stair-stepping you see in
-skies, smoke and dark gradients. It's the artifact AV1 encoders most often trade
-away for bitrate, and VMAF barely registers it — so it gets its own limit. In
-practice it's frequently the constraint that binds.
+The third one is CAMBI, a banding detector, and it's the part worth knowing
+about. Banding is the blotchy stepping you see in skies and dark gradients. AV1
+encoders give it up for bitrate very readily and VMAF barely reacts, so it gets
+its own limit. In practice it fails candidates constantly. It is common to see
+every tested CQ rejected on banding while the VMAF numbers look fine, which is
+a good argument against targeting VMAF alone.
 
-## Film grain synthesis, and why it's here
+## Film grain synthesis
 
-AV1 has a trick: rather than spending bitrate encoding grain (which is noise,
-and compresses terribly), strip it, then have the *decoder* regenerate it on
-playback from a small parameter table. Grainy films get dramatically smaller
-without the plasticky smear of just denoising them.
+AV1 can strip grain before encoding and have the decoder paint it back during
+playback from a small parameter table. Grain is close to noise and compresses
+badly, so this is a large win on grainy sources, without the waxy look you get
+from simply denoising.
 
-`SVT-AV1` and `libaom` support this natively. **NVENC's AV1 encoder does not
-expose it.** So this measures the grain on the source, encodes without it, and
-writes the grain table into the output itself — which is the main reason this
-repo exists rather than being a config file.
+SVT-AV1 and libaom do this natively. `av1_nvenc` does not expose it at all. So
+the flow measures grain on the source, encodes clean, then writes the grain
+table into the finished file. That is most of the reason this is a repository
+rather than a flow export.
 
-## Why hardware
+## Why not just use software encoding
 
-Quality-targeted encoding is well-trodden ground for software encoders —
-[`ab-av1`](https://github.com/alexheretic/ab-av1) does VMAF-targeted CRF search
-for SVT-AV1 and libaom, and does it well. But software AV1 at 4K is slow enough
-that a large library becomes a months-long project, and those tools target
-software encoders specifically.
+[`ab-av1`](https://github.com/alexheretic/ab-av1) already does VMAF-targeted CRF
+search for SVT-AV1 and libaom, and does it well. The catch is speed: software
+AV1 at 4K turns a large library into a months-long job.
 
-The trade-off is real and worth stating plainly: NVENC is less efficient per bit
-than a slow SVT-AV1 preset. You give up some compression to get a library
-finished this year rather than next.
+NVENC is less efficient per bit than a slow SVT-AV1 preset. That's a real cost
+and worth knowing before you start. The bet here is that finishing the library
+is worth some compression.
 
-## Who this is for
+## Before you clone this
 
-Probably you, if: you run Tdarr with an NVIDIA card, you have a large 4K/HDR
-library, and you've been uneasy picking one CQ for everything.
+You want an NVIDIA card, a 4K or HDR library of some size, and a reason to care
+about per-title quality.
 
-Probably not, if you want plug-and-play. This is a working production setup, not
-a distributable plugin — it expects specific build artifacts (a custom FFmpeg
-with libvmaf, NVEncC, grav1synth) and is deliberately opinionated about safety.
-Read [Safe installation outline](#safe-installation-outline) first, and treat it
-as something to adapt rather than drop in.
+What this is not is plug-and-play. It's a running production setup rather than a
+distributable plugin, it expects build artifacts you have to provide (a custom
+FFmpeg with libvmaf, plus NVEncC and grav1synth), and it is deliberately fussy
+about safety. Read the [Safe installation outline](#safe-installation-outline)
+first and expect to adapt it.
 
-**It will not touch your originals unless a candidate passes every gate** —
-quality, worst-frame floor, banding and size — and replacement goes through a
-validator and an attested transaction. Titles that can't hit the target are left
-alone, deliberately.
+On safety: originals are only replaced once a candidate has passed quality, the
+worst-frame floor, banding and size, and the replacement itself goes through a
+validator and an attested transaction. Files that can't hit the target are left
+alone on purpose.
 
 ---
 
