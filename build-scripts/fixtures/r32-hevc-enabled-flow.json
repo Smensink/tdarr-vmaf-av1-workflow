@@ -1,0 +1,26 @@
+{
+  "_id": "YR5PZ1QaD",
+  "name": "Synthetic r32 HEVC-enabled rollback fixture",
+  "fixture_notice": "Synthetic review fixture only; contains no production Flow metadata.",
+  "flowPlugins": [
+    {
+      "id": "activateHevcFallback1",
+      "sourceRepo": "Local",
+      "pluginName": "activateHevcFallback",
+      "version": "1.0.0",
+      "inputsDB": {
+        "enabled": true
+      }
+    },
+    {
+      "id": "activateHevcPrior1",
+      "sourceRepo": "Local",
+      "pluginName": "activateHevcFallback",
+      "version": "1.0.0",
+      "inputsDB": {
+        "enabled": true
+      }
+    }
+  ],
+  "flowEdges": []
+}
