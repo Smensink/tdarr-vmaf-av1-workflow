@@ -10,6 +10,7 @@ var childProcess = require('child_process');
 var grainArtifact = require('../../_lib/grainAnalysisArtifact.js');
 var gpuPipelineLock = require('../../_lib/gpuPipelineLock.js');
 var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
+var canonicalDenoise = require('../../_lib/canonicalDenoise.js');
 
 var CALIBRATION_REPORT_SCHEMA = 3;
 var ENERGY_VALIDATION_REPORT_SCHEMA = 2;
@@ -19,7 +20,11 @@ var FIT_TABLE_IDENTITY_MODEL = 'fit-table-identity-gain1-v1';
 var POSTENCODE_CORRECTION_POLICY =
     'bounded-luma-log-affine-then-robust-global-log-median-then-fit-table-identity-v1';
 var LUMA_CURVE_TRANSFORM_ID = 'multiply-av1-scaling-curves-v1';
-var GPU_PIPELINE_LOCK_DIR = '/temp/tdarr-vmaf-gpu-pipeline.lock';
+// No lock-path constant here on purpose. TDARR_GPU_PIPELINE_LOCK_DIR is the single source of
+// truth and resolveLockDir() THROWS on any mismatch, so a hardcoded copy is not a default - it
+// is a second definition that silently rots. This file held '/temp/tdarr-vmaf-gpu-pipeline.lock'
+// until 2026-07-30, when the work-root move repointed the lock to /transcode-cache and every
+// GPU-decode lease here would have thrown.
 
 var VOLATILE_TAGS = {
     encoder: true,
@@ -41,7 +46,7 @@ var MKV_VIDEO_SEMANTIC_FLAG_OPTIONS = [
 
 var details = function () { return ({
     name: 'Synthesize Film Grain',
-    description: 'Applies the authenticated direct grav1synth table exactly once, performs one final ancillary mux, and requires a full-title AV1 decode before replacement.',
+    description: 'Applies the authenticated direct grav1synth table exactly once, performs one final ancillary mux, and validates distributed AV1 decode samples before replacement.',
     style: { borderColor: 'gold' },
     tags: 'video,av1,grain,vmaf,validation,canary',
     isStartPlugin: false,
@@ -144,12 +149,20 @@ var details = function () { return ({
             type: 'number',
             defaultValue: '240',
             inputUI: { type: 'text' },
-            tooltip: 'Per-command hard timeout for header application, probing, semantic inspection, final ancillary mux, and mandatory full-title decode validation.',
+            tooltip: 'Per-command hard timeout for header application, probing, semantic inspection, final ancillary mux, and bounded decode validation.',
+        },
+        {
+            label: 'Maximum Fallback Re-encodes',
+            name: 'maxFallbackReencodes',
+            type: 'number',
+            defaultValue: '1',
+            inputUI: { type: 'text' },
+            tooltip: 'Maximum number of original-source AV1 fallback re-encodes after grain synthesis fails. The next failure keeps the original and terminates through cleanup.',
         },
     ],
     outputs: [
         { number: 1, tooltip: 'ACTIVE: structurally validated grain output; route directly toward replacement' },
-        { number: 2, tooltip: 'CANARY: validated review artifact saved; cleanup and keep the library original' },
+        { number: 2, tooltip: 'CANARY OR EXHAUSTED FALLBACK: cleanup and keep the library original' },
         { number: 3, tooltip: 'BYPASS: grain disabled/ineligible/analysis unavailable; continue with the already-validated normal AV1 working output' },
         { number: 4, tooltip: 'FALLBACK RE-ENCODE: cleanup and rerun AV1 from the untouched original with temporal filtering disabled' },
     ],
@@ -634,11 +647,50 @@ function ineligibleError(reason) {
     return error;
 }
 
-function durationSeconds(probe) {
-    var formatDuration = finiteNumber(probe && probe.format && probe.format.duration, NaN);
-    if (Number.isFinite(formatDuration)) return formatDuration;
+function parseClockDuration(value) {
+    var text = String(value === undefined || value === null ? '' : value).trim();
+    var match = /^(\d+):([0-5]?\d):([0-5]?\d(?:\.\d+)?)$/.exec(text);
+    if (!match) return NaN;
+    var hours = Number(match[1]);
+    var minutes = Number(match[2]);
+    var seconds = Number(match[3]);
+    if (!Number.isFinite(hours) || !Number.isFinite(minutes) ||
+            !Number.isFinite(seconds)) return NaN;
+    return hours * 3600 + minutes * 60 + seconds;
+}
+
+function timeBaseSeconds(value) {
+    var parts = String(value || '').split('/');
+    if (parts.length !== 2) return NaN;
+    var numerator = Number(parts[0]);
+    var denominator = Number(parts[1]);
+    if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) return NaN;
+    return numerator / denominator;
+}
+
+function primaryVideoDurationSeconds(probe) {
     var video = primaryVideo(probe);
-    return finiteNumber(video && video.duration, NaN);
+    if (!video) return NaN;
+    var streamDuration = finiteNumber(video.duration, NaN);
+    if (Number.isFinite(streamDuration)) return streamDuration;
+    var tagDuration = parseClockDuration(video.tags &&
+        (video.tags.DURATION !== undefined ? video.tags.DURATION : video.tags.duration));
+    if (Number.isFinite(tagDuration)) return tagDuration;
+    var durationTicks = finiteNumber(video.duration_ts, NaN);
+    var timeBase = timeBaseSeconds(video.time_base);
+    if (Number.isFinite(durationTicks) && Number.isFinite(timeBase)) {
+        return durationTicks * timeBase;
+    }
+    return NaN;
+}
+
+function durationSeconds(probe) {
+    // Video transforms must compare the primary video timeline. Matroska's
+    // container duration can be extended by subtitle metadata or another
+    // ancillary stream even when the source and encoded video are frame-exact.
+    var videoDuration = primaryVideoDurationSeconds(probe);
+    if (Number.isFinite(videoDuration)) return videoDuration;
+    return finiteNumber(probe && probe.format && probe.format.duration, NaN);
 }
 
 function frameRateValue(stream) {
@@ -1227,13 +1279,23 @@ function sourceMatroskaDate(sourceProbe, sourceIdentify) {
 
 function buildMkvmergeRemuxArgs(grainedVideoPath, sourcePath, outputPath, sourceProbe, sourceIdentify,
     primaryVideoSemanticOverlay, primaryVideoCustomTagPath) {
-    var argv = ['--quiet', '--disable-track-statistics-tags', '--output', String(outputPath)];
+    // Do not pass --disable-track-statistics-tags. MKVToolNix interprets every
+    // name listed in _STATISTICS_TAGS as disposable statistics metadata. Some
+    // Blu-ray remuxes include stable provenance such as SOURCE_ID in that list,
+    // so disabling the group silently deletes SOURCE_ID while copying the
+    // untouched audio/subtitle tracks. Volatile BPS/duration/count values are
+    // already excluded by validation; retaining the source tag set is safer.
+    var argv = ['--quiet', '--output', String(outputPath)];
     var identifyTitle = sourceIdentify && sourceIdentify.container &&
         sourceIdentify.container.properties && sourceIdentify.container.properties.title;
     var sourceTitle = String(identifyTitle === undefined || identifyTitle === null
         ? getTag(sourceProbe && sourceProbe.format && sourceProbe.format.tags, 'title')
         : identifyTitle);
-    if (sourceTitle.trim()) argv.push('--title', sourceTitle);
+    // Always set the segment title, including the empty string. Without an
+    // explicit empty --title MKVToolNix may inherit the title from the first
+    // (grain-video) input, turning a lossless ancillary remux into a false
+    // metadata-preservation failure for untitled sources.
+    argv.push('--title', sourceTitle);
     var sourceDate = sourceMatroskaDate(sourceProbe, sourceIdentify);
     if (sourceDate) argv.push('--date', sourceDate);
     // These options are scoped to the following input. The calibrated grain input contributes
@@ -1318,7 +1380,12 @@ function stableMkvTrackInventory(track) {
         'codec_id', 'codec_private_data', 'uid', 'language', 'language_ietf',
         'track_name', 'default_track', 'forced_track', 'enabled_track',
         'hearing_impaired', 'visual_impaired', 'text_descriptions', 'original',
-        'commentary', 'audio_channels', 'audio_sampling_frequency', 'default_duration',
+        // default_duration is a derived Matroska timing declaration that
+        // MKVToolNix may recalculate while stream payload, codec/private data,
+        // layout, language and semantic flags remain identical. Payload hashes
+        // and duration parity are verified separately, so it is intentionally
+        // excluded from the stable ancillary identity.
+        'commentary', 'audio_channels', 'audio_sampling_frequency',
         'content_encoding_algorithms', 'codec_private_length', 'pixel_dimensions',
         'display_dimensions', 'display_unit', 'color_primaries',
         'color_transfer_characteristics', 'color_matrix_coefficients', 'color_range',
@@ -1706,6 +1773,43 @@ function makeResult(args, outputNumber, outputFileObj, status, extraVariables) {
             grainSynthesisReason: 'deferred_video_only_base_cannot_bypass: ' + bypassReason,
         });
     }
+    // Output 4 loops back to original-source extraction for one expensive fallback
+    // re-encode. It is independent of the CQ sweep/transcode retry path, so the
+    // ordinary retry counters cannot bound it. Persist a dedicated job-scoped
+    // counter and terminally keep the original after the configured allowance.
+    // Output 2 already routes directly to safe cleanup without replacement or
+    // notification side effects.
+    if (outputNumber === 4) {
+        var configuredMaximum = Number(args.inputs && args.inputs.maxFallbackReencodes);
+        var maximumFallbacks = Number.isFinite(configuredMaximum) && configuredMaximum >= 0
+            ? Math.floor(configuredMaximum) : 1;
+        var currentFallbacks = Number(args.variables.vmafGrainFallbackRetryCount);
+        currentFallbacks = Number.isFinite(currentFallbacks) && currentFallbacks >= 0
+            ? Math.floor(currentFallbacks) : 0;
+        args.variables.vmafGrainFallbackRetryCount = currentFallbacks;
+        args.variables.vmafGrainFallbackMaxRetries = maximumFallbacks;
+        var terminalReason = String(extraVariables && extraVariables.grainSynthesisReason ||
+            status || 'unspecified grain synthesis failure');
+        if (currentFallbacks >= maximumFallbacks) {
+            args.jobLog('FILM GRAIN FALLBACK EXHAUSTED: ' + currentFallbacks + ' / ' +
+                maximumFallbacks + ' fallback re-encodes already attempted (' + terminalReason +
+                '); keeping the original and terminating through cleanup.');
+            outputNumber = 2;
+            outputFileObj = keepOriginalObject(args);
+            status = 'terminal_keep_original';
+            args.variables.vmafTranscodeStatus = 'keep_original_grain_fallback_exhausted';
+            args.variables.vmafTranscodeSucceeded = false;
+            args.variables.vmafKeepOriginalReason = terminalReason;
+            args.variables.vmafGrainFallbackTerminalReason = terminalReason;
+            args.variables.vmafGrainFallbackPending = false;
+        } else {
+            currentFallbacks += 1;
+            args.variables.vmafGrainFallbackRetryCount = currentFallbacks;
+            args.variables.vmafGrainFallbackPending = true;
+            args.jobLog('FILM GRAIN FALLBACK RE-ENCODE: scheduling attempt ' + currentFallbacks +
+                ' / ' + maximumFallbacks + ' from the untouched original.');
+        }
+    }
     args.variables.grainSynthesisStatus = status;
     args.variables.grainSynthesisCompletedAt = new Date().toISOString();
     Object.keys(extraVariables || {}).forEach(function (key) { args.variables[key] = extraVariables[key]; });
@@ -1971,6 +2075,20 @@ function softwareSampleDecodeArgs(outputPath, primaryIndex, sample) {
     ];
 }
 
+function gpuSampleDecodeArgs(outputPath, primaryIndex, sample) {
+    return [
+        '-hide_banner', '-nostdin', '-loglevel', 'error',
+        '-xerror', '-err_detect', 'explode',
+        '-ss', String(sample.start_seconds),
+        '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda',
+        '-c:v', 'av1_cuvid',
+        '-i', outputPath,
+        '-map', '0:' + primaryIndex,
+        '-t', String(sample.duration_seconds),
+        '-an', '-sn', '-dn', '-f', 'null', '-',
+    ];
+}
+
 function softwareFullDecodeArgs(outputPath, primaryIndex) {
     return [
         '-hide_banner', '-nostdin', '-loglevel', 'error',
@@ -2023,7 +2141,7 @@ function flowGpuLeaseIdentity(args, lock, lockDir) {
 
 function createGpuDecodeLeaseController(args, lockOverride) {
     var lock = lockOverride || gpuPipelineLock;
-    var lockDir = lock.resolveLockDir(GPU_PIPELINE_LOCK_DIR);
+    var lockDir = lock.resolveLockDir();
     var log = args && typeof args.jobLog === 'function'
         ? function (message) { args.jobLog(message); }
         : function () {};
@@ -2162,7 +2280,105 @@ async function validateFinalAv1Decode(ffmpegPath, outputPath, outputProbe, optio
     var mode = lower(options.mode);
     var auditMode = mode === 'canary' || mode === 'audit';
     var requireFullTitle = options.requireFullTitle === true;
+    var requirePostRewriteSamples = options.requirePostRewriteSamples === true;
     var log = typeof options.log === 'function' ? options.log : function () {};
+
+    // Direct grav1synth rewrites AV1 headers after the earlier held-out decodes.
+    // Validate a bounded set of positions in the rewritten bitstream, but do not
+    // serialize this NVDEC work behind the NVENC admission lock or decode the
+    // entire feature in routine production.
+    if (!auditMode && !requireFullTitle && requirePostRewriteSamples) {
+        var rewriteSamples = distributedDecodeSamples(outputProbe, options.samplePolicy);
+        var rewriteBudgetMs = Math.min(timeoutMs, 5 * 60 * 1000);
+        var rewriteStarted = Date.now();
+        var gpuUnavailable = null;
+        for (var rewriteIndex = 0; rewriteIndex < rewriteSamples.length; rewriteIndex += 1) {
+            var gpuRemainingMs = rewriteBudgetMs - (Date.now() - rewriteStarted);
+            if (gpuRemainingMs <= 0) {
+                throw new Error('bounded distributed NVDEC validation exceeded its ' +
+                    rewriteBudgetMs + 'ms total budget');
+            }
+            var gpuSampleResult = await runDecodeCommand(
+                runner, ffmpegPath,
+                gpuSampleDecodeArgs(outputPath, primary.index, rewriteSamples[rewriteIndex]),
+                Math.min(60 * 1000, gpuRemainingMs));
+            if (gpuSampleResult.code === 0 && !gpuSampleResult.timedOut &&
+                    !gpuSampleResult.spawnError) continue;
+            if (rewriteIndex === 0 && gpuDecodeUnavailableBeforePass(gpuSampleResult)) {
+                gpuUnavailable = gpuSampleResult;
+                break;
+            }
+            throw decodeCommandFailure(
+                'distributed NVDEC AV1 sample decode ' + (rewriteIndex + 1) + '/' +
+                    rewriteSamples.length,
+                gpuSampleResult);
+        }
+        if (!gpuUnavailable) {
+            log('Final AV1 validation mode: ' + rewriteSamples.length +
+                ' distributed NVDEC samples after direct grain bitstream rewrite; no full-title decode.');
+            return {
+                schema: 1,
+                mode: mode + '_distributed_nvdec_samples_v1',
+                exhaustive: false,
+                sampled: true,
+                hardware_accelerated: true,
+                decoder: 'av1_cuvid',
+                additional_decode_commands: rewriteSamples.length,
+                sample_count: rewriteSamples.length,
+                sample_window_seconds: Math.max.apply(null, rewriteSamples.map(function (sample) {
+                    return sample.duration_seconds;
+                })),
+                sampled_media_seconds: rewriteSamples.reduce(function (total, sample) {
+                    return total + sample.duration_seconds;
+                }, 0),
+                samples: rewriteSamples,
+                gpu_preflight: { attempted: true, available: true },
+            };
+        }
+        var rewriteUnavailableReason = boundedDecodeReason(gpuUnavailable);
+        log('GPU AV1 sample decode unavailable (' + rewriteUnavailableReason +
+            '); validating distributed software samples after direct grain rewrite.');
+        for (var softwareIndex = 0; softwareIndex < rewriteSamples.length; softwareIndex += 1) {
+            var softwareRemainingMs = rewriteBudgetMs - (Date.now() - rewriteStarted);
+            if (softwareRemainingMs <= 0) {
+                throw new Error('bounded distributed software validation exceeded its ' +
+                    rewriteBudgetMs + 'ms total budget');
+            }
+            var softwareSampleResult = await runDecodeCommand(
+                runner, ffmpegPath,
+                softwareSampleDecodeArgs(outputPath, primary.index, rewriteSamples[softwareIndex]),
+                Math.min(60 * 1000, softwareRemainingMs));
+            if (softwareSampleResult.code !== 0 || softwareSampleResult.timedOut ||
+                    softwareSampleResult.spawnError) {
+                throw decodeCommandFailure(
+                    'distributed software AV1 sample decode ' + (softwareIndex + 1) + '/' +
+                        rewriteSamples.length,
+                    softwareSampleResult);
+            }
+        }
+        return {
+            schema: 1,
+            mode: mode + '_distributed_software_samples_gpu_unavailable_v1',
+            exhaustive: false,
+            sampled: true,
+            hardware_accelerated: false,
+            decoder: 'software-auto',
+            additional_decode_commands: rewriteSamples.length + 1,
+            sample_count: rewriteSamples.length,
+            sample_window_seconds: Math.max.apply(null, rewriteSamples.map(function (sample) {
+                return sample.duration_seconds;
+            })),
+            sampled_media_seconds: rewriteSamples.reduce(function (total, sample) {
+                return total + sample.duration_seconds;
+            }, 0),
+            samples: rewriteSamples,
+            gpu_preflight: {
+                attempted: true,
+                available: false,
+                reason: rewriteUnavailableReason,
+            },
+        };
+    }
 
     // The legacy calibrated active path has already passed ffprobe packet/stream/duration
     // inventory, remux payload hashes, grav1synth semantic inspection, and
@@ -2198,7 +2414,9 @@ async function validateFinalAv1Decode(ffmpegPath, outputPath, outputProbe, optio
     // the exhaustive GPU pass is authoritative and any later error fails
     // closed; it can never fall back to a sampled software success.
     var preflightTimeoutMs = Math.min(timeoutMs, 30 * 1000);
-    var gpuOutcome = await withGpuDecodeLease(options.gpuLease, async function () {
+    // NVDEC/CUVID does not consume an NVENC session. It intentionally runs concurrently with
+    // the encode protected by the sole GPU pipeline lock, just like CUDA perceptual metrics.
+    var gpuOutcome = await (async function () {
         var preflight = await runDecodeCommand(
             runner, ffmpegPath,
             gpuAv1DecodeArgs(outputPath, primary.index, true),
@@ -2235,7 +2453,7 @@ async function validateFinalAv1Decode(ffmpegPath, outputPath, outputProbe, optio
             throw decodeCommandFailure('GPU AV1 decode preflight', preflight);
         }
         return { unavailablePreflight: preflight };
-    });
+    })();
     if (gpuOutcome.validation) return gpuOutcome.validation;
 
     // The internal lease is intentionally released before any software decode.
@@ -3405,6 +3623,15 @@ async function plugin(args) {
             prepared.checked.sourceResidualRepresentability.quality_warning;
         recordQualityWarning(args, qualityWarnings, 'source-representability',
             representabilityWarning);
+        // A pinned release rotated between grain analysis and here. The tool bytes were
+        // still attested against the concrete path the analysis recorded, so this is not a
+        // failure - but never accept it silently, because it means this job is holding a
+        // superseded release open and would break outright if that release were pruned.
+        var pinDrift = prepared.checked.toolchainPinDrift;
+        if (Array.isArray(pinDrift) && pinDrift.length) {
+            args.jobLog('TOOLCHAIN PIN DRIFT: ' + pinDrift.join(', ') + ' moved since grain '
+                + 'analysis; attested against the concrete path recorded then, not the current pin.');
+        }
         if (prepared.artifact.mediaProfile !== sourceProfile.id) {
             throw new Error('prepared grain analysis color profile does not match the final source classification');
         }
@@ -3642,7 +3869,6 @@ async function plugin(args) {
             ffmpegPath, finalPartialPath, outputProbe, {
                 mode: mode,
                 timeoutMs: validationTimeoutMs,
-                gpuLease: createGpuDecodeLeaseController(args),
                 log: function (message) { args.jobLog(message); },
             });
         args.variables.grainSynthesisDecodeValidationMode = decodeValidation.mode;
@@ -3650,8 +3876,10 @@ async function plugin(args) {
 
         var baseBytes = fs.statSync(workingPath).size;
         var outputBytes = fs.statSync(finalPartialPath).size;
-        var maxSizeRatio = clamp(finiteNumber(args.inputs.maxOutputSizeRatioPct, 101), 1, 500);
-        var outputSizeAssessment = assessOutputSizeRatio(baseBytes, outputBytes, maxSizeRatio);
+        var sizeEfficiencyWarningPct = clamp(
+            finiteNumber(args.inputs.maxOutputSizeRatioPct, 101), 1, 500);
+        var outputSizeAssessment = assessOutputSizeRatio(
+            baseBytes, outputBytes, sizeEfficiencyWarningPct);
         var sizeRatioPct = outputSizeAssessment.ratioPct;
         recordQualityWarning(args, qualityWarnings, 'output-size-efficiency',
             outputSizeAssessment.qualityWarning);
@@ -3702,6 +3930,9 @@ async function plugin(args) {
             sampled_decode_validated: decodeValidation.sampled === true,
             output_size_bytes: outputBytes,
             output_size_ratio_pct_of_base: sizeRatioPct,
+            output_size_efficiency_warning_pct: sizeEfficiencyWarningPct,
+            output_size_efficiency_warning_breached:
+                outputSizeAssessment.qualityWarning !== null,
             prepared_analysis: summarizeManifest(prepared.manifest),
             adaptive_gain: adaptiveGain,
             adaptive_gain_semantics: 'deprecated-representative-telemetry-only',
@@ -3825,9 +4056,46 @@ async function runOutputCommandTwice(args, label, executable, argv, outputPath, 
     throw new Error(label + ' retry loop ended unexpectedly');
 }
 
+function buildFgsFallbackPlanningSeed(variables) {
+    variables = variables || {};
+    var selectedCq = Number(variables.vmafFinalSelectedCQ);
+    if (!Number.isFinite(selectedCq) || selectedCq < 16 || selectedCq > 51) return null;
+    var sourceReferenceContractId = String(variables.vmafReferenceContractId || '').trim();
+    if (!sourceReferenceContractId ||
+            sourceReferenceContractId === canonicalDenoise.FGS_BYPASS_REFERENCE_CONTRACT_ID) {
+        return null;
+    }
+    var priorSampleCount = Number(
+        variables.vmafSampleCount || variables.vmafAdaptiveSampleCount || 0);
+    if (!Number.isFinite(priorSampleCount) || priorSampleCount < 1) priorSampleCount = 4;
+    priorSampleCount = Math.max(1, Math.min(16, Math.round(priorSampleCount)));
+    return {
+        schema: 1,
+        role: 'cross-contract-probe-planning-only',
+        source_reference_contract_id: sourceReferenceContractId,
+        target_reference_contract_id: canonicalDenoise.FGS_BYPASS_REFERENCE_CONTRACT_ID,
+        center_cq: Math.round(selectedCq * 10) / 10,
+        radius_cq: 2,
+        prior_sample_count: priorSampleCount,
+        recommended_sample_count: Math.max(6, Math.min(8, priorSampleCount)),
+        acceptance_authority: 'fresh-target-contract-measurements-only',
+        final_cq_reuse: false,
+    };
+}
+
 function directFallbackResult(args, originalObj, reason) {
     var diagnostic = String(reason && reason.message || reason || 'film grain synthesis failed')
         .replace(/\0/g, '').trim().slice(0, grainArtifact.ANALYSIS_DIAGNOSTIC_MAX_CHARS);
+    var fallbackPlanningSeed = buildFgsFallbackPlanningSeed(args.variables);
+    if (fallbackPlanningSeed) {
+        delete args.variables.vmafFgsFallbackPlanningApplied;
+        args.variables.vmafFgsFallbackPlanningSeed = fallbackPlanningSeed;
+        args.jobLog('FGS fallback planning seed: prior denoised CQ ' +
+            fallbackPlanningSeed.center_cq + ' will center three fresh untouched-source probes; ' +
+            'it has no acceptance authority.');
+    } else {
+        delete args.variables.vmafFgsFallbackPlanningSeed;
+    }
     var analysisJobDir = String(args.variables.grainAnalysisJobDir || '');
     if (analysisJobDir) {
         try {
@@ -3929,10 +4197,23 @@ function preserveProductionReview(args, reviewDir, sourcePath, outputPath, table
     }
 }
 
+function shouldBypassFilmGrainForCodec(variables) {
+    variables = variables || {};
+    return String(variables.vmafCodecStage || '').toLowerCase() === 'hevc' ||
+        String(variables.vmafGPUEncoder || '').toLowerCase() === 'hevc_nvenc';
+}
+
 async function directPlugin(args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
     args.variables = args.variables || {};
+
+    if (shouldBypassFilmGrainForCodec(args.variables)) {
+        args.jobLog('HEVC fallback: AV1 film-grain synthesis is inapplicable; continuing with the fully muxed HEVC candidate.');
+        return makeResult(args, 3, args.inputFileObj, 'codec_bypass', {
+            grainSynthesisReason: 'hevc_fallback_codec_bypass',
+        });
+    }
 
     var mode = String(args.inputs.mode || 'disabled');
     var sourcePath = getOriginalPath(args);
@@ -4207,29 +4488,35 @@ async function directPlugin(args) {
         if (!postGrain.present) {
             throw new Error('final mux does not expose semantic AV1 film-grain headers');
         }
-        args.jobLog('Running mandatory full-title AV1 decode validation after direct grain bitstream rewrite.');
+        var directAuditMode = mode === 'canary' || mode === 'audit';
+        args.jobLog(directAuditMode
+            ? 'Running exhaustive AV1 decode validation for direct-grain audit/canary output.'
+            : 'Running bounded distributed AV1 decode validation after direct grain bitstream rewrite.');
         var directDecodeValidation = await validateFinalAv1Decode(
             ffmpegPath, finalPartialPath, outputProbe, {
                 mode: 'direct-' + mode,
-                requireFullTitle: true,
+                requireFullTitle: directAuditMode,
+                requirePostRewriteSamples: !directAuditMode,
                 timeoutMs: validationTimeoutMs,
-                gpuLease: createGpuDecodeLeaseController(args),
                 log: function (message) { args.jobLog(message); },
             });
-        if (directDecodeValidation.exhaustive !== true ||
-                directDecodeValidation.sampled !== false) {
-            throw new Error('direct grain output did not receive exhaustive full-title decode validation');
+        if (directAuditMode ? (directDecodeValidation.exhaustive !== true ||
+                directDecodeValidation.sampled !== false) :
+                (directDecodeValidation.exhaustive !== false ||
+                 directDecodeValidation.sampled !== true)) {
+            throw new Error('direct grain output did not receive its required decode validation mode');
         }
         args.variables.grainSynthesisDecodeValidationMode =
             directDecodeValidation.mode;
-        args.jobLog('Mandatory full-title AV1 decode validation completed: ' +
+        args.jobLog('Direct-grain AV1 decode validation completed: ' +
             directDecodeValidation.mode + '.');
 
         var baseBytes = fs.statSync(workingPath).size;
         var outputBytes = fs.statSync(finalPartialPath).size;
-        var maxSizeRatio = clamp(
+        var sizeEfficiencyWarningPct = clamp(
             finiteNumber(args.inputs.maxOutputSizeRatioPct, 101), 1, 500);
-        var sizeAssessment = assessOutputSizeRatio(baseBytes, outputBytes, maxSizeRatio);
+        var sizeAssessment = assessOutputSizeRatio(
+            baseBytes, outputBytes, sizeEfficiencyWarningPct);
         var qualityWarnings = [];
         recordQualityWarning(args, qualityWarnings, 'output-size-efficiency',
             sizeAssessment.qualityWarning);
@@ -4262,7 +4549,8 @@ async function directPlugin(args) {
             table_application_count: 1,
             gain_fit_performed: false,
             energy_validation_performed: false,
-            full_title_decode_validation_performed: true,
+            full_title_decode_validation_performed: directDecodeValidation.exhaustive === true,
+            sampled_decode_validation_performed: directDecodeValidation.sampled === true,
             decode_validation: directDecodeValidation,
             apply_attempts: applyAttempts,
             remux_attempts: remuxAttempts,
@@ -4277,6 +4565,9 @@ async function directPlugin(args) {
             semantic_grain_inspected: true,
             output_size_bytes: outputBytes,
             output_size_ratio_pct_of_base: sizeAssessment.ratioPct,
+            output_size_efficiency_warning_pct: sizeEfficiencyWarningPct,
+            output_size_efficiency_warning_breached:
+                sizeAssessment.qualityWarning !== null,
             quality_warnings: qualityWarnings,
             completed_at: new Date().toISOString(),
         };
@@ -4369,6 +4660,7 @@ async function directPlugin(args) {
 exports.plugin = directPlugin;
 
 exports._test = {
+    shouldBypassFilmGrainForCodec: shouldBypassFilmGrainForCodec,
     runProcess: runProcess,
     probeMedia: probeMedia,
     boolValue: boolValue,
@@ -4383,6 +4675,9 @@ exports._test = {
     normalizeAuthorizedDynamicHdrProfile: normalizeAuthorizedDynamicHdrProfile,
     profileAllowed: profileAllowed,
     isMatroska: isMatroska,
+    parseClockDuration: parseClockDuration,
+    primaryVideoDurationSeconds: primaryVideoDurationSeconds,
+    durationSeconds: durationSeconds,
     durationTolerance: durationTolerance,
     assertDurationParity: assertDurationParity,
     isVolatileMatroskaTag: isVolatileMatroskaTag,
@@ -4440,6 +4735,7 @@ exports._test = {
     assessGrainOutputAgainstOriginal: assessGrainOutputAgainstOriginal,
     grainOriginalRatioCap: grainOriginalRatioCap,
     discardRejectedDirectGrainJob: discardRejectedDirectGrainJob,
+    buildFgsFallbackPlanningSeed: buildFgsFallbackPlanningSeed,
     activeReplacementPath: activeReplacementPath,
     validateDeferredGrainBaseContract: validateDeferredGrainBaseContract,
     makeResult: makeResult,

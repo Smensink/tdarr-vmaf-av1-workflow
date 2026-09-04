@@ -14,8 +14,8 @@ const BACKUP_DISPOSITIONS = Object.freeze({
     backup_retained: true,
 });
 const REQUIRED_TARGET_REDUCTION_PCT = 30;
-const REQUIRED_MINIMUM_REDUCTION_PCT = 20;
-const REQUIRED_MAX_OUTPUT_RATIO_PCT = 80;
+const REQUIRED_MINIMUM_REDUCTION_PCT = 10;
+const REQUIRED_MAX_OUTPUT_RATIO_PCT = 90;
 const FLOAT_TOLERANCE = 0.000000001;
 
 function pathKey(filePath) {
@@ -64,6 +64,33 @@ function requireContentIdentity(identity, label) {
     };
 }
 
+function requireGrainSynthesisEvidence(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+        !Array.isArray(value.quality_warnings) ||
+        typeof value.size_efficiency_warning_breached !== 'boolean') {
+        throw new Error('delivery finalization grain warning evidence is missing');
+    }
+    const ratio = value.output_size_ratio_pct_of_base;
+    const threshold = value.size_efficiency_warning_pct;
+    const hasRatio = typeof ratio === 'number' && Number.isFinite(ratio);
+    const hasThreshold = typeof threshold === 'number' && Number.isFinite(threshold);
+    if (hasRatio !== hasThreshold ||
+        (ratio !== null && ratio !== undefined && !hasRatio) ||
+        (threshold !== null && threshold !== undefined && !hasThreshold)) {
+        throw new Error('delivery finalization grain ratio/threshold evidence is invalid');
+    }
+    if (hasRatio && value.size_efficiency_warning_breached !== (ratio > threshold)) {
+        throw new Error('delivery finalization grain warning breach is inconsistent');
+    }
+    if (value.size_efficiency_warning_breached &&
+        !value.quality_warnings.some((warning) => warning &&
+            warning.advisory === true &&
+            String(warning.stage || '') === 'output-size-efficiency')) {
+        throw new Error('delivery finalization grain breach lacks an advisory warning');
+    }
+    return JSON.parse(JSON.stringify(value));
+}
+
 function requireExactPolicy(policy) {
     if (!policy || policy.version !== deliveryPolicy.POLICY_VERSION ||
         typeof policy.targetReductionPct !== 'number' ||
@@ -72,7 +99,7 @@ function requireExactPolicy(policy) {
         policy.minimumReductionPct !== REQUIRED_MINIMUM_REDUCTION_PCT ||
         typeof policy.maxFinalOutputRatioPct !== 'number' ||
         policy.maxFinalOutputRatioPct !== REQUIRED_MAX_OUTPUT_RATIO_PCT) {
-        throw new Error('delivery finalization requires the exact current 30/20/80 size policy');
+        throw new Error('delivery finalization requires the exact current 30/10/90 size policy');
     }
     return policy;
 }
@@ -173,6 +200,7 @@ function validateOrThrow(evidence, context) {
         maxFinalOutputRatioPct: finiteNumber(evidence.max_final_output_ratio_pct,
             'delivery finalization maximum output ratio'),
     });
+    requireGrainSynthesisEvidence(evidence.grain_synthesis);
     const installed = postReplaceAttestation.inspectInstalledFile(inputPath);
     requireInstalledIdentity(evidence.installed_identity, installed.identity);
     const sourceSize = positiveSafeInteger(
@@ -313,6 +341,8 @@ function create(input) {
         installed_path: installed.path,
         installed_identity: Object.assign({}, installed.identity),
         candidate_validation_schema: String(input.candidateValidationSchema || ''),
+        grain_synthesis: requireGrainSynthesisEvidence(
+            input.candidateValidation && input.candidateValidation.grain_synthesis),
         replacement_attestation_schema: replacement && replacement.schema,
         replacement_attestation_version: replacement && replacement.version,
         replacement_attestation_contract: replacement && replacementContract(replacement),
@@ -442,6 +472,19 @@ function assertDatabaseRow(evidence, row) {
     if (row.skip_reason !== null) {
         throw new Error('delivered finalization DB skip_reason is not NULL');
     }
+    const grain = requireGrainSynthesisEvidence(evidence.grain_synthesis);
+    const expectedGrainWarnings = JSON.stringify(grain.quality_warnings);
+    const expectedGrainRatio = grain.output_size_ratio_pct_of_base === undefined
+        ? null : grain.output_size_ratio_pct_of_base;
+    const expectedGrainThreshold = grain.size_efficiency_warning_pct === undefined
+        ? null : grain.size_efficiency_warning_pct;
+    if (row.grain_output_size_ratio_pct_of_base !== expectedGrainRatio ||
+        row.grain_size_efficiency_warning_pct !== expectedGrainThreshold ||
+        row.grain_size_efficiency_warning_breached !==
+            (grain.size_efficiency_warning_breached ? 1 : 0) ||
+        row.grain_synthesis_quality_warnings_json !== expectedGrainWarnings) {
+        throw new Error('delivered finalization DB grain warning evidence differs');
+    }
     const numeric = {
         final_output_size_mb: evidence.final_output_size_mb,
         final_output_ratio_pct: evidence.final_output_ratio_pct,
@@ -492,4 +535,5 @@ module.exports = {
     validateDatabaseRow,
     replacementContract,
     exactPathExists,
+    requireGrainSynthesisEvidence,
 };

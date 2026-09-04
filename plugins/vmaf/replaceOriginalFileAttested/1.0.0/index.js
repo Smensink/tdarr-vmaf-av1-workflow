@@ -162,10 +162,10 @@ function requireExactPolicy(variables, pending, validation) {
     const policy = deliveryPolicy.resolve(variables);
     if (policy.version !== deliveryPolicy.POLICY_VERSION ||
         policy.targetReductionPct !== 30 ||
-        policy.minimumReductionPct !== 20 ||
-        policy.maxFinalOutputRatioPct !== 80) {
+        policy.minimumReductionPct !== 10 ||
+        policy.maxFinalOutputRatioPct !== 90) {
         throw new Error(
-            'replacement requires the exact current 30/20/80 delivery policy');
+            'replacement requires the exact current 30/10/90 delivery policy');
     }
     for (const [label, evidence, versionKey] of [
         ['pending proof', pending, 'size_policy_version'],
@@ -180,7 +180,7 @@ function requireExactPolicy(variables, pending, validation) {
             Number(evidence.max_final_output_ratio_pct) !==
                 policy.maxFinalOutputRatioPct) {
             throw new Error(
-                `${label} differs from the exact current 30/20/80 policy`);
+                `${label} differs from the exact current 30/10/90 policy`);
         }
     }
     return policy;
@@ -389,7 +389,7 @@ function requireCanonicalRow(row, proof) {
             proof.policy.maxFinalOutputRatioPct ||
         row.size_policy_version !== proof.policy.version) {
         throw new Error(
-            'canonical VMAF delivery row has the wrong 30/20/80 policy');
+            'canonical VMAF delivery row has the wrong 30/10/90 policy');
     }
 }
 
@@ -602,7 +602,7 @@ function fsyncDirectory(directory) {
 }
 
 function exclusiveLinkOrCopy(
-    source, destination, onCreated, label) {
+    source, destination, onCreated, label, authenticatedSource) {
     let method = 'hard_link';
     try {
         fs.linkSync(source, destination);
@@ -622,15 +622,57 @@ function exclusiveLinkOrCopy(
     }
     fsyncFile(destination);
     fsyncDirectory(path.dirname(destination));
+    if (method === 'hard_link' && authenticatedSource) {
+        postReplaceAttestation.carryForwardHardLinkHash(
+            destination, authenticatedSource);
+    }
     return method;
 }
 
-function stageCandidate(source, destination, onCreated) {
-    fs.copyFileSync(
-        source, destination, fs.constants.COPYFILE_EXCL);
+/**
+ * Reserve the delivery candidate under its staged path.
+ *
+ * Hard-link first, copy only if the filesystem refuses. `temp` is `current + STAGE_SUFFIX`,
+ * i.e. a SIBLING of the candidate in the same work directory - so the copy this used to do
+ * duplicated the whole artifact within one filesystem for no benefit. On Avatar (2025) that
+ * was 18.5 GB written at ~21 MB/s: about 13 minutes, and it looked from outside exactly like
+ * a stall between the backup and the install. The install copy that follows (work root ->
+ * media, C: -> D:) is genuinely cross-filesystem and still has to copy.
+ *
+ * A link is also a STRONGER reservation than a copy, not a weaker one: same inode means the
+ * staged bytes are the candidate bytes by construction, so `assertContent`'s size + full
+ * SHA-256 check cannot be satisfied by a silently truncated copy. Nothing asserts a distinct
+ * inode for the staged path. If the candidate is later cleaned up, the link keeps the data
+ * alive until every link is gone.
+ *
+ * Same fallback set as exclusiveLinkOrCopy: EXDEV for a cross-device staged path, and the
+ * permission/support codes for filesystems that cannot hard-link at all.
+ */
+function stageCandidate(source, destination, onCreated, authenticatedSource) {
+    let method = 'hard_link';
+    try {
+        fs.linkSync(source, destination);
+    } catch (error) {
+        if (error && error.code === 'EEXIST') {
+            throw new Error(
+                'staged delivery candidate already exists; refusing to overwrite it');
+        }
+        const fallbackCodes = new Set([
+            'EACCES', 'EMLINK', 'ENOSYS', 'ENOTSUP',
+            'EOPNOTSUPP', 'EPERM', 'EXDEV',
+        ]);
+        if (!error || !fallbackCodes.has(error.code)) throw error;
+        method = 'exclusive_copy';
+        fs.copyFileSync(
+            source, destination, fs.constants.COPYFILE_EXCL);
+    }
     onCreated();
     fsyncFile(destination);
     fsyncDirectory(path.dirname(destination));
+    if (method === 'hard_link' && authenticatedSource) {
+        postReplaceAttestation.carryForwardHardLinkHash(
+            destination, authenticatedSource);
+    }
     return inspect(destination);
 }
 
@@ -887,7 +929,12 @@ function classifyReservedFilesystem(paths, journal) {
     const temp = inspectOptional(paths.temp);
     const installTemp = inspectInstallTemporary(paths.installTemp);
     const backup = inspectOptional(paths.backup);
-    if (!fullIdentityMatches(journal.candidate, current)) {
+    // A candidate can acquire a new inode/ctime when Tdarr or the cache volume safely
+    // rematerializes the exact validated bytes.  Those metadata fields are not content
+    // identity and made an accepted candidate fail between validation and replacement.
+    // Keep the canonical path binding, full SHA-256 and byte count authoritative here.
+    if (!current || !samePath(journal.candidate.path, current.path) ||
+        !contentMatches(journal.candidate, current)) {
         throw new Error(
             'reserved transaction candidate is missing or changed');
     }
@@ -1028,6 +1075,8 @@ async function replaceOriginal(args, dependencies) {
     let journal;
     let db;
     let paths;
+    const hashStatsBefore = postReplaceAttestation.hashCacheStats();
+    const checkpointHashStatsBefore = postEncodeCheckpoint.hashCacheStats();
     try {
         proof = requireCanonicalProof(args);
         journal = getExistingJournal(proof);
@@ -1054,7 +1103,7 @@ async function replaceOriginal(args, dependencies) {
         const vmafdb = dependencies.vmafdb ||
             (!dependencies.db
                 ? require(
-                    '/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js')
+                    '/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafdb.js')
                 : null);
         db = dependencies.db || vmafdb.openDb();
 
@@ -1149,6 +1198,7 @@ async function replaceOriginal(args, dependencies) {
                 paths.current,
                 paths.temp,
                 () => { state.stageCreated = true; },
+                journal.candidate,
             );
             assertContent(
                 journal.candidate, staged.identity,
@@ -1168,7 +1218,7 @@ async function replaceOriginal(args, dependencies) {
                 ((source, destination, onCreated) =>
                     exclusiveLinkOrCopy(
                         source, destination, onCreated,
-                        'exact original backup'));
+                        'exact original backup', journal.source));
             backupOperation(
                 paths.original,
                 paths.backup,
@@ -1279,6 +1329,22 @@ async function replaceOriginal(args, dependencies) {
         args.jobLog(
             'Replacement phase 1 committed: installed candidate and exact ' +
             '.partial.old backup are attested; finalizer must retire the backup.');
+        const hashStatsAfter = postReplaceAttestation.hashCacheStats();
+        const checkpointHashStatsAfter = postEncodeCheckpoint.hashCacheStats();
+        args.jobLog('Replacement integrity hashing: ' +
+            (hashStatsAfter.misses - hashStatsBefore.misses) +
+            ' fresh pass(es), ' +
+            (hashStatsAfter.hits - hashStatsBefore.hits) +
+            ' unchanged-identity reuse(s), ' +
+            ((hashStatsAfter.hashed_bytes - hashStatsBefore.hashed_bytes) /
+                (1024 * 1024 * 1024)).toFixed(2) + ' GiB freshly hashed.');
+        args.jobLog('Checkpoint authentication hashing: ' +
+            (checkpointHashStatsAfter.misses - checkpointHashStatsBefore.misses) +
+            ' fresh pass(es), ' +
+            (checkpointHashStatsAfter.hits - checkpointHashStatsBefore.hits) +
+            ' unchanged-identity reuse(s), ' +
+            ((checkpointHashStatsAfter.hashed_bytes - checkpointHashStatsBefore.hashed_bytes) /
+                (1024 * 1024 * 1024)).toFixed(2) + ' GiB freshly hashed.');
         return {
             outputFileObj: { _id: paths.target },
             outputNumber: 2,
@@ -1379,7 +1445,7 @@ async function replaceOriginal(args, dependencies) {
 const details = () => ({
     name: 'Replace Original File (Attested Phase 1)',
     description: [
-        'Authenticates the candidate-ready DB row, protected checkpoint, and exact 30/20/80 proof.',
+        'Authenticates the candidate-ready DB row, protected checkpoint, and exact 30/10/90 proof.',
         'Installs at the canonical original path with exclusive filesystem operations.',
         'Always retains and attests the exact .partial.old backup for the finalizer.',
     ].join(' '),

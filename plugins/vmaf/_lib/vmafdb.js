@@ -8,7 +8,7 @@
  * can never misalign the way the positional/header-drift CSV writers did.
  *
  * Required from the bundled Tdarr plugins by absolute (bind-mounted) path:
- *   var vmafdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+ *   var vmafdb = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafdb.js');
  *
  * Two tables:
  *   jobs         - one row per transcode job (source facts + decision + final outcome)
@@ -19,7 +19,7 @@
 var DEFAULT_DB_PATH = '/app/configs/vmaf_training.db';
 var metricContracts = require('./vmafMetricContract.js');
 
-var SCHEMA_VERSION = 17;
+var SCHEMA_VERSION = 20;
 var LEGACY_REFERENCE_CONTRACT_ID = 'legacy-original-tf4-v1';
 var LEGACY_METRIC_CONTRACT_ID = metricContracts.LEGACY_METRIC_CONTRACT_ID;
 var LEGACY_ENCODER_PROFILE_ID = metricContracts.LEGACY_ENCODER_PROFILE_ID;
@@ -44,7 +44,10 @@ var JOB_COLUMNS = [
   'max_final_output_ratio_pct', 'size_policy_version',
   'outcome_stage', 'delivered_at', 'replacement_attestation_version',
   'replacement_backup_retained', 'delivery_transaction_id',
-  'delivery_checkpoint_key',
+  'delivery_checkpoint_key', 'grain_output_size_ratio_pct_of_base',
+  'grain_size_efficiency_warning_pct',
+  'grain_size_efficiency_warning_breached',
+  'grain_synthesis_quality_warnings_json',
   'transcode_succeeded', 'met_vmaf_target', 'met_size_target',
   'actual_size_reduction_pct', 'total_retries', 'transcode_retry_count',
   'holdout_encode_time_sec', 'holdout_vmaf_time_sec',
@@ -62,6 +65,9 @@ var SWEEP_COLUMNS = [
   'avg_size_mb', 'sample_count',
   'clip_vmafs', 'clip_vmaf_means', 'clip_vmaf_p1s', 'clip_cambis',
   'clip_sample_indices', 'clip_time_starts', 'clip_durations',
+  'xpsnr_min', 'xpsnr_weighted', 'psnr_avg',
+  'ssimulacra2', 'ssimulacra2_p5', 'butteraugli_norm_inf', 'butteraugli_norm3', 'cvvdp',
+  'gpu_perceptual_contract_id',
   'encode_time_sec', 'vmaf_time_sec', 'cambi_time_sec', 'ssim_time_sec',
   'measured_work_time_sec', 'measured_clip_count', 'measured_clip_seconds', 'timing_source',
   'measurement_disposition'
@@ -632,6 +638,167 @@ function _migrate(db) {
       ") BEGIN SELECT RAISE(ABORT, 'delivered outcome is immutable'); END;"
     );
   });
+  if (v < 18) _runMigrationStep(db, 18, function () {
+    // Persist the auxiliary and GPU perceptual metrics that now BIND in selection.
+    //
+    // Without these columns every one of them is computed, used to accept or reject a CQ,
+    // and then discarded - so a corpus could never accumulate and the thresholds could never
+    // be refined from evidence rather than from one title's ladder. This data is NOT
+    // recoverable retroactively: any job that runs before this migration lands loses its
+    // metrics permanently, which is why it went in before restarting rather than after.
+    //
+    // xpsnr/psnr come from the shared-decode CPU pass; ssimulacra2/butteraugli/cvvdp from the
+    // per-CQ concatenated FFVship pass. Butteraugli is stored as BOTH norms because the gate
+    // uses INF-Norm while Av1an's other published target is the 3-Norm, and a future
+    // recalibration will want to compare them on the same rows.
+    var _v18Cols = {};
+    var _v18Ti = db.prepare('PRAGMA table_info(sweep_points)').all();
+    for (var _v18i = 0; _v18i < _v18Ti.length; _v18i++) _v18Cols[_v18Ti[_v18i].name] = true;
+    var _v18Add = [
+      'xpsnr_min REAL', 'xpsnr_weighted REAL', 'psnr_avg REAL',
+      'ssimulacra2 REAL', 'ssimulacra2_p5 REAL',
+      'butteraugli_norm_inf REAL', 'butteraugli_norm3 REAL',
+      'cvvdp REAL',
+      'gpu_perceptual_contract_id TEXT'
+    ];
+    for (var _v18a = 0; _v18a < _v18Add.length; _v18a++) {
+      var _v18Name = _v18Add[_v18a].split(' ')[0];
+      if (!_v18Cols[_v18Name]) db.exec('ALTER TABLE sweep_points ADD COLUMN ' + _v18Add[_v18a] + ';');
+    }
+  });
+  if (v < 19) _runMigrationStep(db, 19, function () {
+    // The delivery guard is now a 90% output/source ceiling (10% minimum
+    // reduction). Replace the v17 triggers atomically so candidate, committing,
+    // and delivered rows all attest the same versioned 30/10/90 policy.
+    var _v19GuardTriggers = [
+      'trg_jobs_candidate_ready_insert_guard',
+      'trg_jobs_candidate_ready_update_guard',
+      'trg_jobs_delivery_committing_insert_guard',
+      'trg_jobs_delivery_committing_update_guard',
+      'trg_jobs_delivered_insert_guard',
+      'trg_jobs_delivered_update_guard'
+    ];
+    for (var _v19t = 0; _v19t < _v19GuardTriggers.length; _v19t++) {
+      db.exec('DROP TRIGGER IF EXISTS ' + _v19GuardTriggers[_v19t] + ';');
+    }
+    var _v19PolicyGuard =
+      " OR NEW.size_policy_version IS NOT 'delivered-minimum-reduction-v2'" +
+      ' OR NEW.target_size_reduction_pct IS NOT 30' +
+      ' OR NEW.minimum_size_reduction_pct IS NOT 10' +
+      ' OR NEW.max_final_output_ratio_pct IS NOT 90';
+    var _v19CandidateGuard =
+      "NEW.outcome_stage = 'candidate_ready' AND (" +
+      ' NEW.delivery_checkpoint_key IS NULL OR length(NEW.delivery_checkpoint_key) <> 64' +
+      " OR lower(NEW.delivery_checkpoint_key) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.delivery_transaction_id IS NOT NULL' +
+      ' OR NEW.transcode_succeeded IS NOT NULL OR NEW.met_vmaf_target IS NOT NULL' +
+      ' OR NEW.met_size_target IS NOT NULL OR NEW.final_output_size_mb IS NOT NULL' +
+      ' OR NEW.final_output_ratio_pct IS NOT NULL OR NEW.actual_size_reduction_pct IS NOT NULL' +
+      " OR NEW.size_target_status IS NOT 'pending_delivery'" +
+      _v19PolicyGuard + ')';
+    var _v19CommittingGuard =
+      "NEW.outcome_stage IN ('replacement_committing','delivery_committing') AND (" +
+      ' NEW.delivery_transaction_id IS NULL OR length(NEW.delivery_transaction_id) <> 64' +
+      " OR lower(NEW.delivery_transaction_id) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.delivery_checkpoint_key IS NULL OR length(NEW.delivery_checkpoint_key) <> 64' +
+      " OR lower(NEW.delivery_checkpoint_key) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.transcode_succeeded IS NOT NULL OR NEW.met_vmaf_target IS NOT NULL' +
+      ' OR NEW.met_size_target IS NOT NULL OR NEW.final_output_size_mb IS NOT NULL' +
+      ' OR NEW.final_output_ratio_pct IS NOT NULL OR NEW.actual_size_reduction_pct IS NOT NULL' +
+      ' OR NEW.delivered_at IS NOT NULL OR NEW.replacement_attestation_version IS NOT NULL' +
+      " OR NEW.size_target_status IS NOT 'pending_delivery'" +
+      _v19PolicyGuard + ')';
+    var _v19DeliveredGuard =
+      "NEW.outcome_stage = 'delivered' AND (" +
+      ' NEW.delivery_transaction_id IS NULL OR length(NEW.delivery_transaction_id) <> 64' +
+      " OR lower(NEW.delivery_transaction_id) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.delivery_checkpoint_key IS NULL OR length(NEW.delivery_checkpoint_key) <> 64' +
+      " OR lower(NEW.delivery_checkpoint_key) GLOB '*[^0-9a-f]*'" +
+      ' OR NEW.transcode_succeeded IS NOT 1 OR NEW.met_vmaf_target IS NOT 1' +
+      ' OR NEW.met_size_target IS NOT 1' +
+      " OR NEW.size_target_status IS NOT 'met'" +
+      ' OR NEW.final_output_size_mb IS NULL OR NEW.final_output_size_mb <= 0' +
+      ' OR NEW.final_output_size_mb > 1.7976931348623157e308' +
+      ' OR NEW.final_output_ratio_pct IS NULL OR NEW.final_output_ratio_pct <= 0' +
+      ' OR NEW.final_output_ratio_pct > 90' +
+      ' OR NEW.actual_size_reduction_pct IS NULL' +
+      ' OR abs((100 - NEW.final_output_ratio_pct) - NEW.actual_size_reduction_pct) > 0.000000001' +
+      _v19PolicyGuard +
+      " OR NEW.delivered_at IS NULL OR NEW.delivered_at = ''" +
+      " OR NEW.replacement_attestation_version IS NULL OR NEW.replacement_attestation_version = ''" +
+      ' OR (NEW.replacement_backup_retained IS NOT 0' +
+      ' AND NEW.replacement_backup_retained IS NOT 1)' +
+      ' OR NEW.skip_reason IS NOT NULL' +
+      ')';
+    db.exec('CREATE TRIGGER trg_jobs_candidate_ready_insert_guard BEFORE INSERT ON jobs WHEN ' +
+      _v19CandidateGuard + " BEGIN SELECT RAISE(ABORT, 'invalid candidate-ready delivery state'); END;");
+    db.exec('CREATE TRIGGER trg_jobs_candidate_ready_update_guard BEFORE UPDATE ON jobs WHEN ' +
+      _v19CandidateGuard + " BEGIN SELECT RAISE(ABORT, 'invalid candidate-ready delivery state'); END;");
+    db.exec('CREATE TRIGGER trg_jobs_delivery_committing_insert_guard BEFORE INSERT ON jobs WHEN ' +
+      _v19CommittingGuard + " BEGIN SELECT RAISE(ABORT, 'invalid committing delivery state'); END;");
+    db.exec('CREATE TRIGGER trg_jobs_delivery_committing_update_guard BEFORE UPDATE ON jobs WHEN ' +
+      _v19CommittingGuard + " BEGIN SELECT RAISE(ABORT, 'invalid committing delivery state'); END;");
+    db.exec('CREATE TRIGGER trg_jobs_delivered_insert_guard BEFORE INSERT ON jobs WHEN ' +
+      _v19DeliveredGuard + " BEGIN SELECT RAISE(ABORT, 'invalid delivered state'); END;");
+    db.exec('CREATE TRIGGER trg_jobs_delivered_update_guard BEFORE UPDATE ON jobs WHEN ' +
+      _v19DeliveredGuard + " BEGIN SELECT RAISE(ABORT, 'invalid delivered state'); END;");
+  });
+  if (v < 20) _runMigrationStep(db, 20, function () {
+    // Delivery-authoritative film-grain warning telemetry. Historical rows stay
+    // NULL because their job logs cannot prove the exact warning payload.
+    var _v20JobCols = {};
+    var _v20Jti = db.prepare('PRAGMA table_info(jobs)').all();
+    for (var _v20Ji = 0; _v20Ji < _v20Jti.length; _v20Ji++) {
+      _v20JobCols[_v20Jti[_v20Ji].name] = true;
+    }
+    var _v20JobAdd = [
+      'grain_output_size_ratio_pct_of_base REAL',
+      'grain_size_efficiency_warning_pct REAL',
+      'grain_size_efficiency_warning_breached INTEGER',
+      'grain_synthesis_quality_warnings_json TEXT'
+    ];
+    for (var _v20Ja = 0; _v20Ja < _v20JobAdd.length; _v20Ja++) {
+      var _v20JName = _v20JobAdd[_v20Ja].split(' ')[0];
+      if (!_v20JobCols[_v20JName]) {
+        db.exec('ALTER TABLE jobs ADD COLUMN ' + _v20JobAdd[_v20Ja] + ';');
+      }
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_grain_size_warning_breached ' +
+      'ON jobs(grain_size_efficiency_warning_breached)');
+    db.exec(
+      "CREATE TRIGGER IF NOT EXISTS trg_jobs_delivered_grain_observability_guard " +
+      "BEFORE INSERT ON jobs WHEN NEW.outcome_stage = 'delivered' AND (" +
+      ' NEW.grain_size_efficiency_warning_breached IS NULL' +
+      ' OR NEW.grain_size_efficiency_warning_breached NOT IN (0, 1)' +
+      ' OR NEW.grain_synthesis_quality_warnings_json IS NULL' +
+      ' OR (NEW.grain_size_efficiency_warning_breached = 1 AND (' +
+      ' NEW.grain_output_size_ratio_pct_of_base IS NULL' +
+      ' OR NEW.grain_size_efficiency_warning_pct IS NULL' +
+      ' OR NEW.grain_output_size_ratio_pct_of_base <= NEW.grain_size_efficiency_warning_pct))' +
+      ") BEGIN SELECT RAISE(ABORT, 'invalid delivered grain warning observability'); END;"
+    );
+    db.exec(
+      "CREATE TRIGGER IF NOT EXISTS trg_jobs_delivered_grain_observability_update_guard " +
+      "BEFORE UPDATE ON jobs WHEN NEW.outcome_stage = 'delivered' AND (" +
+      ' NEW.grain_size_efficiency_warning_breached IS NULL' +
+      ' OR NEW.grain_size_efficiency_warning_breached NOT IN (0, 1)' +
+      ' OR NEW.grain_synthesis_quality_warnings_json IS NULL' +
+      ' OR (NEW.grain_size_efficiency_warning_breached = 1 AND (' +
+      ' NEW.grain_output_size_ratio_pct_of_base IS NULL' +
+      ' OR NEW.grain_size_efficiency_warning_pct IS NULL' +
+      ' OR NEW.grain_output_size_ratio_pct_of_base <= NEW.grain_size_efficiency_warning_pct))' +
+      ") BEGIN SELECT RAISE(ABORT, 'invalid delivered grain warning observability'); END;"
+    );
+    db.exec(
+      "CREATE TRIGGER IF NOT EXISTS trg_jobs_delivered_grain_observability_immutable " +
+      "BEFORE UPDATE ON jobs WHEN OLD.outcome_stage = 'delivered' AND (" +
+      ' NEW.grain_output_size_ratio_pct_of_base IS NOT OLD.grain_output_size_ratio_pct_of_base' +
+      ' OR NEW.grain_size_efficiency_warning_pct IS NOT OLD.grain_size_efficiency_warning_pct' +
+      ' OR NEW.grain_size_efficiency_warning_breached IS NOT OLD.grain_size_efficiency_warning_breached' +
+      ' OR NEW.grain_synthesis_quality_warnings_json IS NOT OLD.grain_synthesis_quality_warnings_json' +
+      ") BEGIN SELECT RAISE(ABORT, 'delivered grain warning observability is immutable'); END;"
+    );
+  });
 }
 
 function _coerce(v) {
@@ -799,26 +966,44 @@ function insertSweepPoints(db, jobId, points) {
     insertCols.map(function () { return '?'; }).join(', ') + ')';
   var stmt = db.prepare(sql);
 
+  // Flow retries can replay the complete accumulated vmafAggregatedResults array.
+  // Compare through SQLite itself so column affinity is authoritative: plugin retries
+  // may express the same REAL/INTEGER value as either a number or numeric text. An
+  // application-level typed string key would treat those as different even though
+  // SQLite persists both identically. Every writer column participates; created_at is
+  // deliberately absent, so any genuinely changed persisted value remains evidence.
+  var existsSql = 'SELECT 1 AS present FROM sweep_points WHERE ' +
+    insertCols.map(function (column) { return column + ' IS ?'; }).join(' AND ') +
+    ' LIMIT 1';
+  var existsStmt = db.prepare(existsSql);
+
+  function valuesFor(row) {
+    var vals = [];
+    for (var i = 0; i < insertCols.length; i++) {
+      var c = insertCols[i];
+      var v = (c === 'job_id') ? jobId : row[c];
+      if ((v === undefined || v === null || String(v).trim() === '') &&
+          c === 'metric_contract_id' && jobMetricContract === LEGACY_METRIC_CONTRACT_ID) {
+        v = LEGACY_METRIC_CONTRACT_ID;
+      }
+      if ((v === undefined || v === null || String(v).trim() === '') &&
+          c === 'encoder_profile_id' && jobEncoderProfile === LEGACY_ENCODER_PROFILE_ID) {
+        v = LEGACY_ENCODER_PROFILE_ID;
+      }
+      vals.push(_coerce(v === undefined ? null : v));
+    }
+    return vals;
+  }
+
   var n = 0;
-  db.exec('BEGIN');
+  db.exec('BEGIN IMMEDIATE');
   try {
     for (var p = 0; p < points.length; p++) {
-      var row = points[p] || {};
-      var vals = [];
-      for (var i = 0; i < insertCols.length; i++) {
-        var c = insertCols[i];
-        var v = (c === 'job_id') ? jobId : row[c];
-        if ((v === undefined || v === null || String(v).trim() === '') &&
-            c === 'metric_contract_id' && jobMetricContract === LEGACY_METRIC_CONTRACT_ID) {
-          v = LEGACY_METRIC_CONTRACT_ID;
-        }
-        if ((v === undefined || v === null || String(v).trim() === '') &&
-            c === 'encoder_profile_id' && jobEncoderProfile === LEGACY_ENCODER_PROFILE_ID) {
-          v = LEGACY_ENCODER_PROFILE_ID;
-        }
-        vals.push(_coerce(v === undefined ? null : v));
-      }
+      var vals = valuesFor(points[p] || {});
+      if (existsStmt.get.apply(existsStmt, vals)) continue;
       stmt.run.apply(stmt, vals);
+      // The inserted row is immediately visible in this transaction, so the same
+      // existence query also suppresses affinity-equivalent repeats later in the batch.
       n++;
     }
     db.exec('COMMIT');

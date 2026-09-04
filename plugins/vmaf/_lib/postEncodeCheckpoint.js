@@ -20,10 +20,12 @@ const REUSE_REQUIRED_ROOT_SENTINEL = '.root-contract.json';
 const REUSE_REQUIRED_ANCHOR_SCHEMA = 1;
 const REUSE_REQUIRED_ANCHOR_CONTRACT_ID = 'vmaf-postencode-reuse-required-anchor-v1';
 const REUSE_REQUIRED_ANCHOR_NAME = '.vmaf-postencode-reuse-required-active-v1.json';
-const PINNED_CHECKPOINT_ROOT = '/temp/.vmaf-postencode-checkpoints-v1';
+const PINNED_CHECKPOINT_ROOT = path.resolve(
+    process.env.VMAF_POSTENCODE_CHECKPOINT_ROOT || '/temp/.vmaf-postencode-checkpoints-v1');
 const PINNED_REUSE_REQUIRED_ROOT = '/app/configs/vmaf-postencode-reuse-required-v1';
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
+const HASH_CACHE_MAX_ENTRIES = 128;
 const CONFIRMED_INVALID = 'confirmed_invalid';
 const RETRYABLE_VALIDATION = 'retryable_validation';
 const RETIREMENT_INVENTORY_SCHEMA =
@@ -36,6 +38,8 @@ const RETIREMENT_FIXED_SIDE_FILES = Object.freeze([
 ]);
 const RETIREMENT_QUARANTINE_SUFFIX =
     /\.invalid-\d+-\d+-[0-9a-f]{12}$/;
+const fullHashCache = new Map();
+const fullHashStats = { hits: 0, misses: 0, hashed_bytes: 0 };
 
 function checkpointError(message, disposition, cause) {
     const error = new Error(String(message));
@@ -93,7 +97,7 @@ function sha256Text(value) {
     return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
 }
 
-function sha256FileSync(filePath) {
+function sha256FileRawSync(filePath) {
     const hash = crypto.createHash('sha256');
     const buffer = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
     const handle = fs.openSync(filePath, 'r');
@@ -109,6 +113,66 @@ function sha256FileSync(filePath) {
         fs.closeSync(handle);
     }
     return hash.digest('hex');
+}
+
+function hashIdentity(filePath) {
+    const stat = fs.statSync(filePath, { bigint: true });
+    return {
+        dev: String(stat.dev),
+        ino: String(stat.ino),
+        size_bytes: Number(stat.size),
+        mtime_ns: String(stat.mtimeNs),
+        ctime_ns: String(stat.ctimeNs),
+    };
+}
+
+function hashIdentityKey(identity) {
+    return [identity.dev, identity.ino, identity.size_bytes,
+        identity.mtime_ns, identity.ctime_ns].map(String).join('\u0000');
+}
+
+function rememberFullHash(key, digest) {
+    if (fullHashCache.has(key)) fullHashCache.delete(key);
+    fullHashCache.set(key, digest);
+    while (fullHashCache.size > HASH_CACHE_MAX_ENTRIES) {
+        fullHashCache.delete(fullHashCache.keys().next().value);
+    }
+}
+
+function sha256FileSync(filePath) {
+    const before = hashIdentity(filePath);
+    const key = hashIdentityKey(before);
+    if (fullHashCache.has(key)) {
+        const digest = fullHashCache.get(key);
+        rememberFullHash(key, digest);
+        fullHashStats.hits += 1;
+        return digest;
+    }
+    const digest = sha256FileRawSync(filePath);
+    const after = hashIdentity(filePath);
+    if (hashIdentityKey(before) !== hashIdentityKey(after)) {
+        throw new Error('checkpoint file changed while full SHA-256 was being calculated');
+    }
+    fullHashStats.misses += 1;
+    fullHashStats.hashed_bytes += Number(before.size_bytes);
+    rememberFullHash(key, digest);
+    return digest;
+}
+
+function hashCacheStats() {
+    return {
+        hits: fullHashStats.hits,
+        misses: fullHashStats.misses,
+        hashed_bytes: fullHashStats.hashed_bytes,
+        entries: fullHashCache.size,
+    };
+}
+
+function resetHashCacheForTests() {
+    fullHashCache.clear();
+    fullHashStats.hits = 0;
+    fullHashStats.misses = 0;
+    fullHashStats.hashed_bytes = 0;
 }
 
 function sourceScopeKey(sourceFingerprint) {
@@ -243,7 +307,7 @@ function assertNvenccPipelineEncodeContract(contract) {
     }
     const pipelineFields = [
         'schema', 'contract_id', 'denoise_id', 'reference_contract_id',
-        'nvencc_path', 'coordinator_path', 'output_depth', 'pixel_transport',
+        'nvencc_path', 'coordinator_path', 'output_depth', 'decode', 'pixel_transport',
         'knn_settings', 'producer_argv',
     ];
     const pipeline = contract.pipeline;
@@ -252,6 +316,7 @@ function assertNvenccPipelineEncodeContract(contract) {
         pipeline.contract_id !== nvenccKnn.CONTRACT_ID ||
         pipeline.denoise_id !== nvenccKnn.DENOISE_ID ||
         pipeline.reference_contract_id !== nvenccKnn.REFERENCE_CONTRACT_ID ||
+        pipeline.decode !== 'nvdec-avhw' ||
         pipeline.pixel_transport !== 'raw-yuv420-nut-stdout' ||
         pipeline.knn_settings !== nvenccKnn.KNN_SETTINGS ||
         ![8, 10].includes(Number(pipeline.output_depth)) ||
@@ -336,13 +401,72 @@ function assertNvenccPipelineEncodeContract(contract) {
     }
 }
 
+function assertNvenccDirectEncodeContract(contract) {
+    const topLevelFields = [
+        'schema', 'executable', 'executable_identity', 'argv', 'pipeline',
+    ];
+    if (!exactObjectFields(contract, topLevelFields) ||
+        !Array.isArray(contract.argv) || contract.argv.length === 0 ||
+        !path.isAbsolute(String(contract.executable || ''))) {
+        throw new Error('post-encode checkpoint requires a complete exact direct NVEncC contract');
+    }
+    const pipelineFields = [
+        'schema', 'contract_id', 'decode', 'encode', 'denoise_id',
+        'reference_contract_id', 'knn_settings', 'argv',
+    ];
+    const pipeline = contract.pipeline;
+    if (!exactObjectFields(pipeline, pipelineFields) ||
+        Number(pipeline.schema) !== 1 ||
+        pipeline.contract_id !== nvenccKnn.DIRECT_CONTRACT_ID ||
+        pipeline.decode !== 'nvdec-avhw' ||
+        pipeline.encode !== 'av1-nvenc-p7-uhq-2pass-full-spaq10-weightp' ||
+        pipeline.denoise_id !== nvenccKnn.DENOISE_ID ||
+        pipeline.reference_contract_id !== nvenccKnn.REFERENCE_CONTRACT_ID ||
+        pipeline.knn_settings !== nvenccKnn.KNN_SETTINGS ||
+        !Array.isArray(pipeline.argv)) {
+        throw new Error('post-encode checkpoint direct NVEncC descriptor mismatch');
+    }
+    assertExecutableIdentity(
+        contract.executable_identity, contract.executable,
+        'post-encode direct NVEncC');
+
+    const argv = contract.argv.map(String);
+    if (canonicalJson(argv) !== canonicalJson(pipeline.argv.map(String))) {
+        throw new Error('post-encode direct NVEncC argv differs from its pipeline descriptor');
+    }
+    const requiredValues = [
+        ['-i', '<SOURCE>'],
+        ['-o', '<OUTPUT>'],
+        ['--vpp-knn', nvenccKnn.KNN_SETTINGS],
+        ['--codec', 'av1'],
+        ['--preset', 'p7'],
+        ['--tune', 'uhq'],
+        ['--multipass', '2pass-full'],
+        ['--tf-level', '0'],
+        ['--output-format', 'matroska'],
+    ];
+    requiredValues.forEach(([option, expected]) => {
+        if (optionValueExactlyOnce(argv, option,
+            'post-encode direct NVEncC argv') !== expected) {
+            throw new Error(`post-encode direct NVEncC ${option} contract mismatch`);
+        }
+    });
+    if (argv.filter((value) => value === '--avhw').length !== 1 ||
+        argv.includes('--avsw')) {
+        throw new Error('post-encode direct NVEncC must use exactly one NVDEC input path');
+    }
+    optionValueExactlyOnce(argv, '--vbr-quality',
+        'post-encode direct NVEncC argv');
+}
+
 function assertEncodeContract(contract) {
-    if (!contract || ![1, 2].includes(contract.schema) ||
+    if (!contract || ![1, 2, 3].includes(contract.schema) ||
         !Array.isArray(contract.argv) || contract.argv.length === 0 ||
         !String(contract.executable || '').trim()) {
         throw new Error('post-encode checkpoint requires a complete exact encode contract');
     }
     if (contract.schema === 2) assertNvenccPipelineEncodeContract(contract);
+    if (contract.schema === 3) assertNvenccDirectEncodeContract(contract);
     const normalized = canonicalValue(contract);
     const serialized = canonicalJson(normalized);
     if (serialized.indexOf('<OUTPUT>') === -1 || serialized.indexOf('<SOURCE>') === -1) {
@@ -1266,20 +1390,85 @@ function importRetained(plan, retainedPath, validateArtifact, options) {
     }
 }
 
+function existingPlanPaths(plan) {
+    const fields = [
+        'encodePath',
+        'manifestPath',
+        'pendingManifestPath',
+        'artifactPath',
+        'candidatePath',
+        'candidateManifestPath',
+        'candidatePendingManifestPath',
+    ];
+    const existing = [];
+    for (const field of fields) {
+        const filePath = String(plan && plan[field] || '');
+        if (!filePath) continue;
+        try {
+            fs.lstatSync(filePath);
+            existing.push({ field, path: filePath });
+        } catch (error) {
+            if (!error || error.code !== 'ENOENT') throw error;
+        }
+    }
+    return existing;
+}
+
 function abandon(plan) {
-    if (!plan || !plan.encodePath) return;
-    // Once the exit-0 artifact has an authenticated pending manifest it is a
-    // durable recovery candidate, not disposable encoder scratch.
-    if (plan.pendingCandidate || plan.candidateStaged ||
-        fs.existsSync(plan.candidateManifestPath || '') ||
-        fs.existsSync(plan.candidatePendingManifestPath || '')) return;
+    if (!plan || !plan.encodePath) {
+        return { abandoned: false, retained: true, reason: 'invalid_plan' };
+    }
+    if (plan.reused === true) {
+        return { abandoned: false, retained: true, reason: 'committed_plan_reused' };
+    }
+    // Once an exit-0 artifact or manifest exists, the generation is durable or
+    // ambiguous recovery evidence rather than disposable encoder scratch.
+    if (plan.pendingCandidate || plan.candidateStaged) {
+        return { abandoned: false, retained: true, reason: 'durable_candidate_state' };
+    }
+    const before = existingPlanPaths(plan).filter((item) => item.field !== 'encodePath');
+    if (before.length) {
+        return {
+            abandoned: false,
+            retained: true,
+            reason: 'checkpoint_paths_remain',
+            remaining: before,
+        };
+    }
     try { fs.unlinkSync(plan.encodePath); } catch (error) {
         if (!error || error.code !== 'ENOENT') throw error;
     }
+    // Prove that neither the partial nor a concurrently-published durable path
+    // remains before the caller is allowed to retract its public checkpoint record.
+    const after = existingPlanPaths(plan);
+    if (after.length) {
+        return {
+            abandoned: false,
+            retained: true,
+            reason: 'checkpoint_paths_remain',
+            remaining: after,
+        };
+    }
+    return { abandoned: true, retained: false, reason: 'uncommitted_plan_abandoned' };
 }
 
-function materialize(plan, destination, allowedRoot) {
+function abandonFailedPublishedPlan(plan, variables) {
+    variables = variables || {};
+    const result = abandon(plan);
+    if (!result.abandoned || result.retained) return result;
+    delete variables.vmafPostEncodeCheckpoint;
+    delete variables.vmafPostEncodeCheckpointPath;
+    delete variables.vmafPostEncodeCheckpointManifestPath;
+    delete variables.vmafPostEncodeReuseRequired;
+    delete variables.vmafPostEncodeReuseRequiredMarker;
+    variables.vmafPostEncodeCheckpointStatus = 'abandoned_uncommitted';
+    return result;
+}
+
+function materialize(plan, destination, allowedRoot, options) {
     if (!plan || !plan.manifest) throw new Error('cannot materialize an uncommitted checkpoint');
+    options = options || {};
+    const mutable = options.mutable === true;
     const source = path.resolve(plan.artifactPath);
     const target = path.resolve(String(destination || ''));
     const root = path.resolve(String(allowedRoot || ''));
@@ -1289,7 +1478,23 @@ function materialize(plan, destination, allowedRoot) {
     const sourceStat = regularFileStat(source, 'committed checkpoint artifact');
     const partial = `${target}.checkpoint-partial-${randomToken()}`;
     try {
-        fs.copyFileSync(source, partial, fs.constants.COPYFILE_FICLONE);
+        // The default immutable materialization can share the authenticated inode
+        // in O(1). Callers which will run an in-place mutator (for example
+        // mkvpropedit HDR metadata preservation) must request a private COW/copy;
+        // otherwise that later write silently changes the protected checkpoint
+        // through the hard link and invalidates its committed manifest.
+        if (mutable) {
+            fs.copyFileSync(source, partial, fs.constants.COPYFILE_FICLONE);
+        } else {
+            try {
+                fs.linkSync(source, partial);
+            } catch (linkError) {
+                if (!linkError || !['EXDEV', 'EPERM', 'EACCES', 'EMLINK', 'ENOTSUP'].includes(linkError.code)) {
+                    throw linkError;
+                }
+                fs.copyFileSync(source, partial, fs.constants.COPYFILE_FICLONE);
+            }
+        }
         const copied = regularFileStat(partial, 'materialized checkpoint artifact');
         if (copied.size !== sourceStat.size) throw new Error('checkpoint materialization size mismatch');
         fsyncFile(partial);
@@ -1361,8 +1566,30 @@ function authenticateRecord(record) {
     const root = located.root;
     const reuseRequiredRoot = located.reuseRequiredRoot;
     const manifest = readManifest(manifestPath);
+    const sourceFingerprint = assertFingerprint(manifest.source_fingerprint);
+    if (!manifest.encode_contract || typeof manifest.encode_contract !== 'object' ||
+        Array.isArray(manifest.encode_contract) ||
+        ![1, 2, 3].includes(manifest.encode_contract.schema) ||
+        !Array.isArray(manifest.encode_contract.argv) ||
+        manifest.encode_contract.argv.length === 0 ||
+        !String(manifest.encode_contract.executable || '').trim()) {
+        throw new Error('checkpoint record has an invalid stored encode contract');
+    }
+    // Retirement must remain possible after an executable upgrade, so bind the
+    // stored contract cryptographically without revalidating binaries currently
+    // installed in the container.
+    const storedEncodeContract = canonicalValue(manifest.encode_contract);
+    const derivedEncodeContractSha256 =
+        sha256Text(canonicalJson(storedEncodeContract));
+    const derivedCheckpointKey = sha256Text(canonicalJson({
+        contract_id: CONTRACT_ID,
+        source_fingerprint: sourceFingerprint,
+        encode_contract_sha256: derivedEncodeContractSha256,
+    }));
     if (manifest.schema !== SCHEMA || manifest.contract_id !== CONTRACT_ID ||
-        manifest.checkpoint_key !== key || !manifest.artifact ||
+        manifest.checkpoint_key !== key ||
+        manifest.encode_contract_sha256 !== derivedEncodeContractSha256 ||
+        derivedCheckpointKey !== key || !manifest.artifact ||
         path.basename(artifactPath) !== manifest.artifact.relative_path) {
         throw new Error('checkpoint record has mismatched committed identity');
     }
@@ -1373,8 +1600,8 @@ function authenticateRecord(record) {
         requireInitializedReuseRequiredRoot:
             located.requireInitializedReuseRequiredRoot,
         checkpointKey: key,
-        sourceFingerprint: manifest.source_fingerprint,
-        encodeContractSha256: manifest.encode_contract_sha256,
+        sourceFingerprint,
+        encodeContractSha256: derivedEncodeContractSha256,
     };
     const reuseMarker = readReuseRequiredMarker(retirementPlan);
     if (reuseMarker.required &&
@@ -1777,6 +2004,216 @@ function retire(record, inventory, options) {
     return result;
 }
 
+function retireCommittedSourceSiblings(deliveredRecord, authenticatedSourceFingerprint, options) {
+    const deliveredLocation = retirementLocation(deliveredRecord);
+    const expectedFingerprint = canonicalJson(
+        assertFingerprint(authenticatedSourceFingerprint));
+    const reuseRequiredRoot = path.resolve(String(
+        deliveredRecord.reuse_required_root || deliveredLocation.reuseRequiredRoot));
+    const excluded = new Set([deliveredLocation.key].concat(
+        (options && options.excludeKeys) || []).map(String));
+    const retired = [];
+    const skippedBoundary = [];
+    const skippedDifferentSource = [];
+    const failures = [];
+
+    for (const bucketName of fs.readdirSync(deliveredLocation.root).sort()) {
+        if (!/^[0-9a-f]{2}$/.test(bucketName)) continue;
+        const bucketDir = path.join(deliveredLocation.root, bucketName);
+        let bucketStat;
+        try { bucketStat = fs.lstatSync(bucketDir); }
+        catch (error) {
+            failures.push({ path: bucketDir, reason: error.message });
+            continue;
+        }
+        if (!bucketStat.isDirectory() || bucketStat.isSymbolicLink() ||
+            path.resolve(fs.realpathSync(bucketDir)) !== path.resolve(bucketDir)) {
+            failures.push({ path: bucketDir, reason: 'checkpoint bucket is not a canonical real directory' });
+            continue;
+        }
+        for (const key of fs.readdirSync(bucketDir).sort()) {
+            if (!/^[0-9a-f]{64}$/.test(key) || key.slice(0, 2) !== bucketName ||
+                excluded.has(key)) continue;
+            const entryDir = path.join(bucketDir, key);
+            const manifestPath = path.join(entryDir, MANIFEST_NAME);
+            try {
+                const entryStat = fs.lstatSync(entryDir);
+                if (!entryStat.isDirectory() || entryStat.isSymbolicLink() ||
+                    path.resolve(fs.realpathSync(entryDir)) !== path.resolve(entryDir)) {
+                    throw new Error('checkpoint entry is not a canonical real directory');
+                }
+                if (['delivery-transaction-v1.json', 'delivery-retirement-v1.json',
+                    'delivery-transaction-v1.lock'].some((name) =>
+                    fs.existsSync(path.join(entryDir, name)))) {
+                    skippedBoundary.push(key);
+                    continue;
+                }
+                if (!fs.existsSync(manifestPath)) continue;
+                const manifest = readManifest(manifestPath);
+                if (manifest.checkpoint_key !== key ||
+                    canonicalJson(assertFingerprint(manifest.source_fingerprint)) !== expectedFingerprint) {
+                    skippedDifferentSource.push(key);
+                    continue;
+                }
+                const artifactPath = path.join(entryDir, manifest.artifact.relative_path);
+                const siblingRecord = {
+                    schema: SCHEMA,
+                    contract_id: CONTRACT_ID,
+                    checkpoint_key: key,
+                    artifact_path: artifactPath,
+                    manifest_path: manifestPath,
+                    reuse_required_root: reuseRequiredRoot,
+                };
+                const siblingIdentity = authenticateRecord(siblingRecord);
+                if (canonicalJson(siblingIdentity.manifest.source_fingerprint) !==
+                    expectedFingerprint) {
+                    throw new Error(
+                        'authenticated sibling source fingerprint changed after prefilter');
+                }
+                const result = retire(siblingRecord);
+                retired.push({
+                    checkpoint_key: key,
+                    artifact_size_bytes: Number(manifest.artifact.size_bytes),
+                    removed: result.removed,
+                });
+            } catch (error) {
+                failures.push({ checkpoint_key: key, path: entryDir, reason: error.message });
+            }
+        }
+    }
+    return {
+        retired,
+        skippedBoundary,
+        skippedDifferentSource,
+        failures,
+        retiredBytes: retired.reduce((sum, item) => sum + item.artifact_size_bytes, 0),
+    };
+}
+
+function sweepInvalidQuarantine(options) {
+    const settings = options || {};
+    const root = path.resolve(String(settings.checkpointRoot ||
+        PINNED_CHECKPOINT_ROOT));
+    const minimumAgeHours = Number(settings.minimumAgeHours === undefined
+        ? 24 : settings.minimumAgeHours);
+    const maxFiles = Number(settings.maxFiles === undefined
+        ? 8 : settings.maxFiles);
+    const maxBytes = Number(settings.maxBytes === undefined
+        ? 16 * 1024 * 1024 * 1024 : settings.maxBytes);
+    const nowMs = Number(settings.nowMs === undefined
+        ? Date.now() : settings.nowMs);
+    if (!Number.isFinite(minimumAgeHours) || minimumAgeHours < 1 ||
+        !Number.isSafeInteger(maxFiles) || maxFiles < 1 || maxFiles > 100 ||
+        !Number.isSafeInteger(maxBytes) || maxBytes < 1 ||
+        !Number.isFinite(nowMs) || nowMs <= 0 ||
+        root === path.parse(root).root) {
+        throw new Error('invalid bounded checkpoint quarantine sweep settings');
+    }
+    const rootStat = fs.lstatSync(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() ||
+        path.resolve(fs.realpathSync(root)) !== root) {
+        throw new Error('checkpoint quarantine root is not a canonical real directory');
+    }
+    const cutoffMs = nowMs - minimumAgeHours * 60 * 60 * 1000;
+    const eligible = [];
+    const skippedFresh = [];
+    const skippedUnsafe = [];
+    const failures = [];
+    for (const bucketName of fs.readdirSync(root).sort()) {
+        if (!/^[0-9a-f]{2}$/.test(bucketName)) continue;
+        const bucketDir = path.join(root, bucketName);
+        let bucketStat;
+        try { bucketStat = fs.lstatSync(bucketDir); } catch (_) { continue; }
+        if (!bucketStat.isDirectory() || bucketStat.isSymbolicLink() ||
+            path.resolve(fs.realpathSync(bucketDir)) !== bucketDir) {
+            skippedUnsafe.push(bucketDir);
+            continue;
+        }
+        for (const key of fs.readdirSync(bucketDir).sort()) {
+            if (!/^[0-9a-f]{64}$/.test(key) || key.slice(0, 2) !== bucketName) {
+                continue;
+            }
+            const entryDir = path.join(bucketDir, key);
+            let entryStat;
+            try { entryStat = fs.lstatSync(entryDir); } catch (_) { continue; }
+            if (!entryStat.isDirectory() || entryStat.isSymbolicLink() ||
+                path.resolve(fs.realpathSync(entryDir)) !== entryDir) {
+                skippedUnsafe.push(entryDir);
+                continue;
+            }
+            for (const name of fs.readdirSync(entryDir).sort()) {
+                if (path.basename(name) !== name ||
+                    !RETIREMENT_QUARANTINE_SUFFIX.test(name)) continue;
+                const filePath = path.join(entryDir, name);
+                try {
+                    const stat = fs.lstatSync(filePath, { bigint: true });
+                    if (!stat.isFile() || stat.isSymbolicLink() ||
+                        Number(stat.size) <= 0 || Number(stat.nlink) !== 1 ||
+                        path.resolve(fs.realpathSync(filePath)) !== filePath) {
+                        skippedUnsafe.push(filePath);
+                        continue;
+                    }
+                    const item = {
+                        checkpoint_key: key,
+                        path: filePath,
+                        size_bytes: Number(stat.size),
+                        mtime_ms: Number(stat.mtimeMs),
+                        dev: String(stat.dev),
+                        ino: String(stat.ino),
+                    };
+                    if (item.mtime_ms > cutoffMs) skippedFresh.push(item);
+                    else eligible.push(item);
+                } catch (error) {
+                    failures.push({ path: filePath, reason: error.message });
+                }
+            }
+        }
+    }
+    eligible.sort((left, right) =>
+        left.mtime_ms - right.mtime_ms || left.path.localeCompare(right.path));
+    const deleted = [];
+    const skippedBudget = [];
+    let deletedBytes = 0;
+    for (const item of eligible) {
+        if (deleted.length >= maxFiles ||
+            deletedBytes + item.size_bytes > maxBytes) {
+            skippedBudget.push(item);
+            continue;
+        }
+        try {
+            const stat = fs.lstatSync(item.path, { bigint: true });
+            if (!stat.isFile() || stat.isSymbolicLink() ||
+                String(stat.dev) !== item.dev || String(stat.ino) !== item.ino ||
+                Number(stat.size) !== item.size_bytes ||
+                Number(stat.mtimeMs) !== item.mtime_ms ||
+                path.resolve(fs.realpathSync(item.path)) !== item.path ||
+                !RETIREMENT_QUARANTINE_SUFFIX.test(path.basename(item.path))) {
+                throw new Error('checkpoint quarantine changed before deletion');
+            }
+            fs.unlinkSync(item.path);
+            if (fs.existsSync(item.path)) {
+                throw new Error('checkpoint quarantine still exists after unlink');
+            }
+            deleted.push(item);
+            deletedBytes += item.size_bytes;
+        } catch (error) {
+            failures.push({ path: item.path, reason: error.message });
+        }
+    }
+    return {
+        root,
+        minimumAgeHours,
+        maxFiles,
+        maxBytes,
+        deleted,
+        deletedBytes,
+        skippedFresh,
+        skippedBudget,
+        skippedUnsafe,
+        failures,
+    };
+}
+
 module.exports = {
     SCHEMA,
     CONTRACT_ID,
@@ -1793,7 +2230,10 @@ module.exports = {
     REUSE_REQUIRED_ANCHOR_NAME,
     canonicalJson,
     sha256FileSync,
+    hashCacheStats,
+    resetHashCacheForTests,
     assertEncodeContract,
+    assertFingerprint,
     confirmedInvalidError,
     isConfirmedInvalidError,
     isRetryableValidationError,
@@ -1811,6 +2251,7 @@ module.exports = {
     enforceReuseRequired,
     importRetained,
     abandon,
+    abandonFailedPublishedPlan,
     materialize,
     retirementLocation,
     authenticateRecord,
@@ -1820,4 +2261,6 @@ module.exports = {
     validateRetirementInventory,
     retireInventory,
     retire,
+    retireCommittedSourceSiblings,
+    sweepInvalidQuarantine,
 };

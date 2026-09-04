@@ -9,10 +9,13 @@ const VERSION = 2;
 const BACKUP_SUFFIX = '.partial.old';
 const BACKUP_DELETE_ATTEMPTS = 3;
 const BACKUP_DELETE_DELAYS_MS = Object.freeze([100, 250]);
+const HASH_CACHE_MAX_ENTRIES = 64;
 const COMPLETED_OUTCOMES = Object.freeze({
     installed_verified: true,
     backup_retained: true,
 });
+const fullHashCache = new Map();
+const fullHashStats = { hits: 0, misses: 0, hashed_bytes: 0 };
 
 async function fsyncDirectory(directory) {
     if (process.platform === 'win32') return;
@@ -57,6 +60,95 @@ function sha256FileSync(filePath) {
     return hash.digest('hex');
 }
 
+function fullIdentityKey(identity) {
+    return [
+        identity.dev,
+        identity.ino,
+        identity.size_bytes,
+        identity.mtime_ns,
+        identity.ctime_ns,
+    ].map(String).join('\u0000');
+}
+
+function sameStatIdentity(left, right) {
+    return fullIdentityKey(left) === fullIdentityKey(right);
+}
+
+function rememberFullHash(key, sha256) {
+    if (fullHashCache.has(key)) fullHashCache.delete(key);
+    fullHashCache.set(key, sha256);
+    while (fullHashCache.size > HASH_CACHE_MAX_ENTRIES) {
+        fullHashCache.delete(fullHashCache.keys().next().value);
+    }
+}
+
+function fullHashForStableIdentity(filePath, identity) {
+    const key = fullIdentityKey(identity);
+    if (fullHashCache.has(key)) {
+        const value = fullHashCache.get(key);
+        // Refresh LRU order. The cache key includes ctime_ns, which callers cannot
+        // restore after a content mutation; same-size rewrites therefore miss.
+        rememberFullHash(key, value);
+        fullHashStats.hits += 1;
+        return value;
+    }
+    const sha256 = sha256FileSync(filePath);
+    const after = statIdentity(fs.lstatSync(filePath, { bigint: true }));
+    if (!sameStatIdentity(identity, after)) {
+        throw new Error('replacement file changed while full SHA-256 was being calculated');
+    }
+    fullHashStats.misses += 1;
+    fullHashStats.hashed_bytes += Number(identity.size_bytes);
+    rememberFullHash(key, sha256);
+    return sha256;
+}
+
+function hashCacheStats() {
+    return {
+        hits: fullHashStats.hits,
+        misses: fullHashStats.misses,
+        hashed_bytes: fullHashStats.hashed_bytes,
+        entries: fullHashCache.size,
+    };
+}
+
+// A successful hard-link operation changes ctime/link-count but cannot change
+// the inode's bytes. Carry an already authenticated full hash to the new stat
+// identity only when dev, inode, size and mtime_ns remain exact. Copies and
+// renames to a different inode deliberately cannot use this shortcut.
+function carryForwardHardLinkHash(filePath, previousIdentity) {
+    if (!previousIdentity || !/^[0-9a-f]{64}$/.test(
+        String(previousIdentity.sha256_full || ''))) {
+        throw new Error('hard-link hash carry-forward requires an authenticated full hash');
+    }
+    const requested = String(filePath || '').trim();
+    if (!requested || !path.isAbsolute(requested)) {
+        throw new Error('hard-link hash carry-forward path must be absolute');
+    }
+    const resolved = path.resolve(requested);
+    const stat = fs.lstatSync(resolved, { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0n) {
+        throw new Error('hard-link hash carry-forward target is not a regular file');
+    }
+    const identity = statIdentity(stat);
+    for (const key of ['dev', 'ino', 'size_bytes', 'mtime_ns']) {
+        if (String(identity[key]) !== String(previousIdentity[key])) {
+            throw new Error(`hard-link hash carry-forward ${key} changed`);
+        }
+    }
+    rememberFullHash(fullIdentityKey(identity), previousIdentity.sha256_full);
+    return Object.assign({}, identity, {
+        sha256_full: previousIdentity.sha256_full,
+    });
+}
+
+function resetHashCacheForTests() {
+    fullHashCache.clear();
+    fullHashStats.hits = 0;
+    fullHashStats.misses = 0;
+    fullHashStats.hashed_bytes = 0;
+}
+
 function assertIdentityMatches(expected, actual, label) {
     if (!expected || typeof expected !== 'object') {
         throw new Error(`${label} identity is missing`);
@@ -99,7 +191,7 @@ function inspectInstalledFile(filePath) {
         throw new Error('replacement target contains a symlinked path component');
     }
     const identity = statIdentity(stat);
-    identity.sha256_full = sha256FileSync(canonical);
+    identity.sha256_full = fullHashForStableIdentity(canonical, identity);
     return { path: canonical, stat, identity };
 }
 
@@ -272,4 +364,7 @@ module.exports = {
     assertIdentityMatches,
     exactBackupPath,
     retireRetainedBackup,
+    hashCacheStats,
+    carryForwardHardLinkHash,
+    resetHashCacheForTests,
 };

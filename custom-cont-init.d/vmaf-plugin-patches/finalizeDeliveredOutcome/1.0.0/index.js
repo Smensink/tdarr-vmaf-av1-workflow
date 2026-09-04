@@ -11,8 +11,8 @@ const deliveryTransaction = require('../../_lib/deliveryTransaction.js');
 const PENDING_SCHEMA = 'vmaf-delivery-outcome-pending/v1';
 const VALIDATION_SCHEMA = 'vmaf-delivery-candidate-validation/v1';
 const REQUIRED_TARGET_REDUCTION_PCT = 30;
-const REQUIRED_MINIMUM_REDUCTION_PCT = 20;
-const REQUIRED_MAX_OUTPUT_RATIO_PCT = 80;
+const REQUIRED_MINIMUM_REDUCTION_PCT = 10;
+const REQUIRED_MAX_OUTPUT_RATIO_PCT = 90;
 const FLOAT_TOLERANCE = 0.000000001;
 const DB_RETRY_DELAYS_MS = Object.freeze([50, 150]);
 const JOB_SELECT = [
@@ -22,7 +22,10 @@ const JOB_SELECT = [
     'minimum_size_reduction_pct, max_final_output_ratio_pct, size_policy_version,',
     'outcome_stage, delivered_at, replacement_attestation_version,',
     'replacement_backup_retained, delivery_transaction_id,',
-    'delivery_checkpoint_key, skip_reason',
+    'delivery_checkpoint_key, grain_output_size_ratio_pct_of_base,',
+    'grain_size_efficiency_warning_pct,',
+    'grain_size_efficiency_warning_breached,',
+    'grain_synthesis_quality_warnings_json, skip_reason',
     'FROM jobs WHERE job_id = ?',
 ].join(' ');
 
@@ -75,7 +78,7 @@ function requireExactPolicy(variables, pending, validation) {
         policy.targetReductionPct !== REQUIRED_TARGET_REDUCTION_PCT ||
         policy.minimumReductionPct !== REQUIRED_MINIMUM_REDUCTION_PCT ||
         policy.maxFinalOutputRatioPct !== REQUIRED_MAX_OUTPUT_RATIO_PCT) {
-        throw new Error('delivery finalization requires the exact current 30/20/80 size policy');
+        throw new Error('delivery finalization requires the exact current 30/10/90 size policy');
     }
     for (const [label, evidence] of [
         ['pending delivery proof', pending],
@@ -95,7 +98,7 @@ function requireExactPolicy(variables, pending, validation) {
                 `${label} minimum reduction`) !== policy.minimumReductionPct ||
             finiteNumber(evidence.max_final_output_ratio_pct,
                 `${label} maximum output ratio`) !== policy.maxFinalOutputRatioPct) {
-            throw new Error(`${label} differs from the exact current 30/20/80 policy`);
+            throw new Error(`${label} differs from the exact current 30/10/90 policy`);
         }
     }
     return policy;
@@ -351,6 +354,36 @@ function requireFiniteEqual(actual, expected, label) {
     }
 }
 
+function grainDeliveryFields(validation) {
+    const grain = validation && validation.grain_synthesis || {};
+    const warnings = Array.isArray(grain.quality_warnings)
+        ? JSON.parse(JSON.stringify(grain.quality_warnings)) : [];
+    const ratio = typeof grain.output_size_ratio_pct_of_base === 'number' &&
+        Number.isFinite(grain.output_size_ratio_pct_of_base)
+        ? grain.output_size_ratio_pct_of_base : null;
+    const threshold = typeof grain.size_efficiency_warning_pct === 'number' &&
+        Number.isFinite(grain.size_efficiency_warning_pct)
+        ? grain.size_efficiency_warning_pct : null;
+    const breached = grain.size_efficiency_warning_breached === true;
+    if ((ratio === null) !== (threshold === null)) {
+        throw new Error('grain size-efficiency ratio/threshold evidence is incomplete');
+    }
+    if (ratio !== null && breached !== (ratio > threshold)) {
+        throw new Error('grain size-efficiency warning evidence is inconsistent');
+    }
+    if (breached && !warnings.some((warning) =>
+        warning && warning.advisory === true &&
+        String(warning.stage || '') === 'output-size-efficiency')) {
+        throw new Error('grain size-efficiency breach lacks its advisory warning payload');
+    }
+    return {
+        grain_output_size_ratio_pct_of_base: ratio,
+        grain_size_efficiency_warning_pct: threshold,
+        grain_size_efficiency_warning_breached: breached ? 1 : 0,
+        grain_synthesis_quality_warnings_json: JSON.stringify(warnings),
+    };
+}
+
 function requireCanonicalRow(row, proof) {
     if (!row || String(row.job_id || '') !== proof.jobId) {
         throw new Error(`canonical VMAF job row is missing: ${proof.jobId}`);
@@ -383,6 +416,10 @@ const PRETERMINAL_NULL_FIELDS = Object.freeze([
     'delivered_at',
     'replacement_attestation_version',
     'replacement_backup_retained',
+    'grain_output_size_ratio_pct_of_base',
+    'grain_size_efficiency_warning_pct',
+    'grain_size_efficiency_warning_breached',
+    'grain_synthesis_quality_warnings_json',
     'skip_reason',
 ]);
 
@@ -398,7 +435,7 @@ function requirePreterminalRow(row, proof, stage) {
 }
 
 function deliveredFields(proof, deliveredAt, backupRetained) {
-    return {
+    return Object.assign({
         job_id: proof.jobId,
         transcode_succeeded: 1,
         met_vmaf_target: 1,
@@ -419,7 +456,7 @@ function deliveredFields(proof, deliveredAt, backupRetained) {
         delivery_transaction_id: proof.transactionId,
         delivery_checkpoint_key: proof.checkpointKey,
         skip_reason: null,
-    };
+    }, grainDeliveryFields(proof.validation));
 }
 
 function assertDeliveredRow(row, proof, expected) {
@@ -429,6 +466,7 @@ function assertDeliveredRow(row, proof, expected) {
         'size_target_status', 'size_policy_version', 'outcome_stage', 'delivered_at',
         'replacement_attestation_version', 'replacement_backup_retained',
         'delivery_transaction_id', 'delivery_checkpoint_key',
+        'grain_size_efficiency_warning_breached',
     ];
     for (const field of exactFields) {
         if (row[field] !== expected[field]) {
@@ -446,6 +484,15 @@ function assertDeliveredRow(row, proof, expected) {
         requireFiniteEqual(row[field], expected[field],
             `delivered outcome DB ${field}`);
     }
+    const grainExpected = grainDeliveryFields(proof.validation);
+    if (row.grain_output_size_ratio_pct_of_base !==
+            grainExpected.grain_output_size_ratio_pct_of_base ||
+        row.grain_size_efficiency_warning_pct !==
+            grainExpected.grain_size_efficiency_warning_pct ||
+        row.grain_synthesis_quality_warnings_json !==
+            grainExpected.grain_synthesis_quality_warnings_json) {
+        throw new Error('delivered outcome DB grain warning evidence mismatch');
+    }
     return row;
 }
 
@@ -457,7 +504,10 @@ function casCommittingToDelivered(db, expected) {
         'target_size_reduction_pct = ?, minimum_size_reduction_pct = ?, ' +
         'max_final_output_ratio_pct = ?, size_policy_version = ?, outcome_stage = ?, ' +
         'delivered_at = ?, replacement_attestation_version = ?, ' +
-        'replacement_backup_retained = ?, skip_reason = NULL, updated_at = ? ' +
+        'replacement_backup_retained = ?, grain_output_size_ratio_pct_of_base = ?, ' +
+        'grain_size_efficiency_warning_pct = ?, ' +
+        'grain_size_efficiency_warning_breached = ?, ' +
+        'grain_synthesis_quality_warnings_json = ?, skip_reason = NULL, updated_at = ? ' +
         "WHERE job_id = ? AND outcome_stage = 'delivery_committing' " +
         'AND delivery_transaction_id = ? AND delivery_checkpoint_key = ? ' +
         "AND size_target_status = 'pending_delivery' " +
@@ -465,7 +515,11 @@ function casCommittingToDelivered(db, expected) {
         'AND final_output_size_mb IS NULL AND final_output_ratio_pct IS NULL ' +
         'AND actual_size_reduction_pct IS NULL AND met_size_target IS NULL ' +
         'AND delivered_at IS NULL AND replacement_attestation_version IS NULL ' +
-        'AND replacement_backup_retained IS NULL AND skip_reason IS NULL'
+        'AND replacement_backup_retained IS NULL ' +
+        'AND grain_output_size_ratio_pct_of_base IS NULL ' +
+        'AND grain_size_efficiency_warning_pct IS NULL ' +
+        'AND grain_size_efficiency_warning_breached IS NULL ' +
+        'AND grain_synthesis_quality_warnings_json IS NULL AND skip_reason IS NULL'
     ).run(
         expected.transcode_succeeded,
         expected.met_vmaf_target,
@@ -482,6 +536,10 @@ function casCommittingToDelivered(db, expected) {
         expected.delivered_at,
         expected.replacement_attestation_version,
         expected.replacement_backup_retained,
+        expected.grain_output_size_ratio_pct_of_base,
+        expected.grain_size_efficiency_warning_pct,
+        expected.grain_size_efficiency_warning_breached,
+        expected.grain_synthesis_quality_warnings_json,
         expected.delivered_at,
         expected.job_id,
         expected.delivery_transaction_id,
@@ -513,6 +571,7 @@ function createFinalization(proof, deliveredAt, backupDisposition) {
         checkpointRecord: proof.checkpoint,
         backupDisposition,
         databaseRecorded: true,
+        candidateValidation: proof.validation,
     });
 }
 
@@ -609,7 +668,7 @@ async function finalizeDeliveredOutcome(args, dependencies) {
     try {
         const proof = requireDeliveryJournal(validateEvidence(args), dependencies);
         const vmafdb = dependencies && dependencies.vmafdb ||
-            require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+            require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafdb.js');
         const db = dependencies && dependencies.db || vmafdb.openDb();
         let row = await withDbRetries(
             () => readJobRow(db, proof.jobId), dependencies, 'delivery DB read');
@@ -740,6 +799,7 @@ exports._test = {
     withDbRetries,
     readJobRow,
     requireFiniteEqual,
+    grainDeliveryFields,
     requireCanonicalRow,
     requirePreterminalRow,
     deliveredFields,
