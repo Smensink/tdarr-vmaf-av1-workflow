@@ -123,12 +123,12 @@ var details = function () { return ({
             tooltip: 'Explicit opt-in. Copies one full source and grain output into a two-slot private review area. Disabled by default because the copies are large and contain production media.',
         },
         {
-            label: 'Maximum Output Size Ratio %',
+            label: 'Grain Size Efficiency Warning % (Advisory)',
             name: 'maxOutputSizeRatioPct',
             type: 'number',
             defaultValue: '101',
             inputUI: { type: 'text' },
-            tooltip: 'Warn if the fully remuxed grain output exceeds this percentage of the completed AV1 base. Structural and integrity validation still determine acceptance.',
+            tooltip: 'Advisory only: warn if the fully remuxed grain output exceeds this percentage of the completed AV1 base. This does not reject the grain output; structural/integrity gates and the separate original-file delivery cap determine acceptance.',
         },
         {
             label: 'Duration Tolerance Seconds',
@@ -1763,6 +1763,10 @@ function recordQualityWarning(args, warnings, stage, warning) {
         failures: Array.isArray(warning.failures) ? warning.failures.slice() : [],
         reason_code: warning.reason_code || null,
         message: warning.message || null,
+        ratio_pct_of_base: Number.isFinite(warning.ratio_pct_of_base)
+            ? warning.ratio_pct_of_base : null,
+        warning_threshold_pct: Number.isFinite(warning.warning_threshold_pct)
+            ? warning.warning_threshold_pct : null,
     };
     warnings.push(entry);
     args.variables.grainSynthesisQualityWarnings = warnings.map(function (item) {
@@ -1790,11 +1794,13 @@ function assessOutputSizeRatio(baseBytes, outputBytes, maximumRatioPct) {
     return {
         ratioPct: ratioPct,
         qualityWarning: ratioPct > maximumRatioPct ? {
-            code: 'grain-output-size-ratio-above-policy',
+            code: 'grain-output-size-efficiency-warning',
             advisory: true,
+            ratio_pct_of_base: ratioPct,
+            warning_threshold_pct: maximumRatioPct,
             failures: [
                 'output is ' + ratioPct.toFixed(3) + '% of completed base, above the ' +
-                    maximumRatioPct.toFixed(3) + '% advisory limit',
+                    maximumRatioPct.toFixed(3) + '% advisory warning threshold',
             ],
         } : null,
     };

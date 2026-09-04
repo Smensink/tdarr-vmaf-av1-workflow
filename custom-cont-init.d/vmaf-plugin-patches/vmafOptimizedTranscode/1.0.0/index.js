@@ -38,13 +38,14 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.plugin = exports.details = void 0;
 var cliUtils_1 = require("../../../../FlowHelpers/1.0.0/cliUtils");
-var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
 var nvencTemporalFilter = require('../../_lib/nvencTemporalFilter.js');
 var canonicalDenoise = require('../../_lib/canonicalDenoise.js');
 var nvenccKnn = require('../../_lib/nvenccKnn.js');
+var pixelFormatContract = require('../../_lib/pixelFormatContract.js');
 var grainArtifact = require('../../_lib/grainAnalysisArtifact.js');
 var grainVmafContract = require('../../_lib/grainVmafContract.js');
 var postEncodeCheckpoint = require('../../_lib/postEncodeCheckpoint.js');
+var liveSizeGuard = require('../../_lib/liveSizeGuard.js');
 var CONSERVATIVE_RETAINED_SUBSTITUTION_CONTRACT_ID =
     'vmaf-conservative-postencode-cq-substitution-v1';
 var MAX_RETAINED_RECOVERY_JSON_BYTES = 64 * 1024;
@@ -52,6 +53,35 @@ var POSTENCODE_ROUTINE_VALIDATOR = 'ffprobe-demux-plus-distributed-decode-v2';
 var POSTENCODE_EXHAUSTIVE_VALIDATOR = 'ffprobe-demux-plus-full-decode-v1';
 var POSTENCODE_SAMPLE_SECONDS = 1;
 var POSTENCODE_SAMPLE_TIMEOUT_MS = 90000;
+
+function releaseOwnedGpuPipelineLockAfterEncode(args, lockImplementation) {
+    var variables = args && args.variables || {};
+    if (variables.vmafGpuPipelineLockAcquired !== true) {
+        return { released: false, reason: 'not_owned' };
+    }
+    var lockInfo = variables.vmafGpuPipelineLock || {};
+    if (!lockInfo.token) {
+        throw new Error('cannot release the NVENC lock after encode: owned lease token is missing');
+    }
+    var lock = lockImplementation || require('../../_lib/gpuPipelineLock.js');
+    var lockDir = lock.resolveLockDir(lockInfo.lockDir || undefined);
+    var result = lock.release(lockDir, lockInfo.token, {
+        force: false,
+        expectedGeneration: lockInfo.leaseGeneration || null,
+    });
+    if (!result.released && result.reason !== 'no lock owner found') {
+        throw new Error('cannot release the NVENC lock after encode: ' + result.reason);
+    }
+    variables.vmafGpuPipelineLockReleased = true;
+    variables.vmafGpuPipelineLockAcquired = false;
+    variables.vmafGpuPipelineLockReleasedAfterEncode = true;
+    variables.vmafGpuPipelineLockReleasedAfterEncodeAt = new Date().toISOString();
+    if (args && typeof args.jobLog === 'function') {
+        args.jobLog('NVENC lock released immediately after the protected video encode; ' +
+            'checkpoint validation, ancillary remux, and delivery checks continue unlocked.');
+    }
+    return { released: true, reason: result.released ? 'released' : 'already_absent' };
+}
 var POSTENCODE_EXHAUSTIVE_TIMEOUT_MS = 14400000;
 var FINAL_TRANSCODE_WATCHDOG_MIN_SECONDS = 12 * 60 * 60;
 var FINAL_TRANSCODE_WATCHDOG_MAX_SECONDS = 72 * 60 * 60;
@@ -75,11 +105,17 @@ function finalTranscodeWatchdogPolicy(sourceDurationSeconds, variables, selected
     var sampleDuration = Number(variables.vmafSegmentDuration);
     if (!isFinite(sampleDuration) || sampleDuration <= 0) sampleDuration = null;
     var selectedId = String(selectedParameterSetId || '').trim();
-    var matchingTimes = (Array.isArray(variables.vmafTestResults)
-        ? variables.vmafTestResults : []).filter(function (result) {
+    var timingRows = variables.vmafEncodingTimeSecondsByParameterSet &&
+        Array.isArray(variables.vmafEncodingTimeSecondsByParameterSet[selectedId])
+        ? variables.vmafEncodingTimeSecondsByParameterSet[selectedId]
+        : (Array.isArray(variables.vmafTestResults) ? variables.vmafTestResults : []);
+    var matchingTimes = timingRows.filter(function (result) {
+        if (typeof result === 'number') return isFinite(result) && result > 0;
         if (!result || !selectedId || String(result.parameterSetId || '') !== selectedId) return false;
         return isFinite(Number(result.encodingTimeSeconds)) && Number(result.encodingTimeSeconds) > 0;
-    }).map(function (result) { return Number(result.encodingTimeSeconds); });
+    }).map(function (result) {
+        return Number(typeof result === 'number' ? result : result.encodingTimeSeconds);
+    });
     var medianSampleEncodeSeconds = medianPositive(matchingTimes);
     var projectedSeconds = duration && sampleDuration && medianSampleEncodeSeconds
         ? duration * (medianSampleEncodeSeconds / sampleDuration)
@@ -123,13 +159,24 @@ function finalTranscodeWatchdogPolicy(sourceDurationSeconds, variables, selected
 }
 
 function evaluateFinalOutputSizeGate(outputBytes, sourceBytes, configuredMaxRatioPct) {
-    var policy = deliveryPolicy.requireCurrentPolicy({
-        version: deliveryPolicy.POLICY_VERSION,
-        targetReductionPct: deliveryPolicy.DEFAULT_TARGET_REDUCTION_PCT,
-        minimumReductionPct: deliveryPolicy.DEFAULT_MINIMUM_REDUCTION_PCT,
-        maxFinalOutputRatioPct: Number(configuredMaxRatioPct),
-    });
-    return deliveryPolicy.evaluateBytes(outputBytes, sourceBytes, policy);
+    var output = Number(outputBytes);
+    var source = Number(sourceBytes);
+    if (!isFinite(output) || output <= 0) {
+        throw new Error('post-encode size gate requires a positive output byte count');
+    }
+    if (!isFinite(source) || source <= 0) {
+        throw new Error('post-encode size gate requires a positive source byte count');
+    }
+    var cap = Number(configuredMaxRatioPct);
+    if (!isFinite(cap) || cap <= 0) cap = 100;
+    var ratio = (output / source) * 100;
+    return {
+        outputBytes: output,
+        sourceBytes: source,
+        ratioPct: ratio,
+        capPct: cap,
+        rejected: ratio > cap,
+    };
 }
 
 function retireRejectedPostEncodeCheckpoint(variables, checkpointModule, jobLog, now) {
@@ -487,7 +534,10 @@ function shouldUseMatroskaAncillaryBypass(originalFile, outputContainer, ffProbe
 }
 
 function buildMkvmergeAncillaryArgs(videoOnlyPath, originalFile, partialOutputPath, sourceTitle) {
-    var argv = ['--quiet', '--disable-track-statistics-tags', '--output', String(partialOutputPath)];
+    // Retain the original track tag sets. SOURCE_ID is stable provenance, but
+    // Blu-ray remuxers commonly list it alongside BPS/count fields in
+    // _STATISTICS_TAGS; --disable-track-statistics-tags deletes it.
+    var argv = ['--quiet', '--output', String(partialOutputPath)];
     if (String(sourceTitle || '').trim()) argv.push('--title', String(sourceTitle));
     // Input-scoped options must precede the input they apply to. The first input contributes
     // only the new primary video and its track metadata. The original contributes everything
@@ -747,11 +797,21 @@ function preserveMatroskaAncillaryWithMkvmerge(videoOnlyPath, originalFile, outp
     var merge = spawnSync('mkvmerge', mergeArgs, {
         encoding: 'utf8', timeout: 1800000, maxBuffer: 32 * 1024 * 1024
     });
-    if (merge.error || merge.status !== 0) {
+    if (merge.error || (merge.status !== 0 && merge.status !== 1)) {
         try { fs.unlinkSync(partialOutputPath); } catch (_cleanupError) {}
         throw new Error(merge.error ? merge.error.message :
             'mkvmerge exited ' + merge.status + ': ' +
             String(merge.stderr || merge.stdout || '').trim().split(/\r?\n/).slice(-1)[0]);
+    }
+    var mergeWarning = null;
+    if (merge.status === 1) {
+        mergeWarning = String(merge.stderr || merge.stdout || '').trim()
+            .split(/\r?\n/).filter(Boolean).slice(-4).join(' | ');
+        if (!fs.existsSync(partialOutputPath)) {
+            throw new Error('mkvmerge exited 1 without producing a candidate: ' + mergeWarning);
+        }
+        jobLog('MKVToolNix completed with warning status 1; authenticating the candidate before acceptance: ' +
+            mergeWarning);
     }
     var outputIdentify;
     try {
@@ -762,7 +822,7 @@ function preserveMatroskaAncillaryWithMkvmerge(videoOnlyPath, originalFile, outp
             if (!staleOutputError || staleOutputError.code !== 'ENOENT') throw staleOutputError;
         }
         fs.renameSync(partialOutputPath, outputPath);
-        return { inventory: inventory, mergeArgs: mergeArgs };
+        return { inventory: inventory, mergeArgs: mergeArgs, warning: mergeWarning };
     } catch (verifyError) {
         try { fs.unlinkSync(partialOutputPath); } catch (_verifyCleanupError) {}
         throw verifyError;
@@ -773,7 +833,9 @@ function buildFinalTranscodeArgs(options) {
     options = options || {};
     var bestParams = options.bestParams || {};
     var encoder = String(bestParams.encoder || '');
-    var isAv1Nvenc = bestParams.isGPU && encoder.indexOf('av1_nvenc') !== -1;
+    var isNvenc = bestParams.isGPU && encoder.indexOf('_nvenc') !== -1;
+    var isAv1Nvenc = isNvenc && encoder.indexOf('av1_nvenc') !== -1;
+    var isHevcNvenc = isNvenc && encoder.indexOf('hevc_nvenc') !== -1;
     var canonicalInput = options.canonicalDenoise === true;
     var temporalPolicy = options.temporalPolicy || (canonicalInput
         ? nvencTemporalFilter.CANONICAL_POLICY : nvencTemporalFilter.LEGACY_POLICY);
@@ -789,25 +851,28 @@ function buildFinalTranscodeArgs(options) {
             argv.push('-i', String(options.originalFile));
         }
     } else {
-        if (isAv1Nvenc) argv.push('-hwaccel', 'cuda');
+        if (isNvenc) argv.push('-hwaccel', 'cuda');
         argv.push('-i', String(options.originalFile));
     }
     argv.push('-c:v', encoder);
-    if (isAv1Nvenc) {
+    if (isNvenc) {
         argv.push('-pix_fmt', String(options.pixFmt));
         argv.push('-rc', 'vbr', '-cq', String(options.useCQ), '-b:v', '0');
         argv.push('-preset', String(bestParams.preset));
         nvencTemporalFilter.appendValidatedQualityFlags(argv,
             options.nvencFlagArgs || nvencTemporalFilter.qualityFlags(temporalPolicy, false),
             temporalPolicy,
-            'final AV1 production transcode');
+            'final NVENC production transcode');
+        if (isHevcNvenc) argv.push('-profile:v', 'main10');
         argv.push('-g', '96', '-forced-idr', '1');
         argv.push('-color_primaries', String(options.colorPrimaries));
         argv.push('-color_trc', String(options.colorTrc));
         argv.push('-colorspace', String(options.colorspace));
-        var av1Meta = av1ColorMetadataArgs(options.colorPrimaries, options.colorTrc, options.colorspace);
-        // AV1 metadata is valid only for the encoded primary, never MJPEG/PNG cover art.
-        argv.push('-bsf:v:0', av1Meta.bsf);
+        if (isAv1Nvenc) {
+            var av1Meta = av1ColorMetadataArgs(options.colorPrimaries, options.colorTrc, options.colorspace);
+            // AV1 metadata is valid only for the encoded primary, never MJPEG/PNG cover art.
+            argv.push('-bsf:v:0', av1Meta.bsf);
+        }
         argv.push('-metadata:s:v:0', 'COLOR_PRIMARIES=' + options.colorPrimaries);
         argv.push('-metadata:s:v:0', 'COLOR_TRANSFER=' + options.colorTrc);
         argv.push('-metadata:s:v:0', 'COLOR_SPACE=' + options.colorspace);
@@ -837,10 +902,21 @@ function buildFinalTranscodeArgs(options) {
         argv.push('-c:a', 'copy', '-c:s', 'copy', '-c:t', 'copy');
     }
     argv.push('-y', String(options.outputPath));
-    nvencTemporalFilter.assertAv1NvencCommand(argv, temporalPolicy, 'final AV1 production transcode');
-    if (canonicalInput) canonicalDenoise.assertCanonicalExactlyOnce(argv, 'final AV1 production transcode');
-    else canonicalDenoise.assertAbsent(argv, 'original-source final AV1 production transcode');
+    nvencTemporalFilter.assertNvencCommand(argv, temporalPolicy, 'final NVENC production transcode');
+    if (canonicalInput) canonicalDenoise.assertCanonicalExactlyOnce(argv, 'final NVENC production transcode');
+    else canonicalDenoise.assertAbsent(argv, 'original-source final NVENC production transcode');
     return argv;
+}
+
+function expectedCodecForEncoder(encoder) {
+    var value = String(encoder || '').toLowerCase();
+    if (value.indexOf('hevc') !== -1 || value.indexOf('h265') !== -1) return 'hevc';
+    if (value.indexOf('av1') !== -1) return 'av1';
+    throw new Error('unsupported final encoder codec identity: ' + encoder);
+}
+
+function shouldUseDirectNvenccFinal(encoder, directSetting) {
+    return expectedCodecForEncoder(encoder) === 'av1' && String(directSetting || '1') !== '0';
 }
 
 function resolveFinalTranscodeCQ(bestParams, variables) {
@@ -980,7 +1056,7 @@ function buildPostEncodeContract(executable, argv, sourcePath, outputPath, pipel
     var producerLog = pipelineTools && pipelineTools.producerLog
         ? String(pipelineTools.producerLog) : null;
     var contract = {
-        schema: pipelineTools ? 2 : 1,
+        schema: pipelineTools ? (pipelineTools.direct === true ? 3 : 2) : 1,
         executable: String(executable),
         executable_identity: resolveExecutableIdentity(executable),
         argv: (argv || []).map(function (item) {
@@ -993,8 +1069,10 @@ function buildPostEncodeContract(executable, argv, sourcePath, outputPath, pipel
     };
     if (pipelineTools) {
         contract.pipeline = pipelineTools.pipeline;
-        contract.producer_identity = resolveExecutableIdentity(pipelineTools.producer);
-        contract.consumer_identity = resolveExecutableIdentity(pipelineTools.consumer);
+        if (pipelineTools.direct !== true) {
+            contract.producer_identity = resolveExecutableIdentity(pipelineTools.producer);
+            contract.consumer_identity = resolveExecutableIdentity(pipelineTools.consumer);
+        }
     }
     return contract;
 }
@@ -1147,20 +1225,34 @@ function validatePostEncodeMedia(ffprobePath, ffmpegPath, filePath, sourceProbe,
     var spawnSync = require('child_process').spawnSync;
     validationOptions = validationOptions || {};
     var validationMode = validationOptions.mode === 'exhaustive' ? 'exhaustive' : 'routine';
+    var expectedCodec = String(validationOptions.expectedCodec || 'av1').toLowerCase();
+    if (expectedCodec !== 'av1' && expectedCodec !== 'hevc') {
+        throw new Error('unsupported post-encode codec contract: ' + expectedCodec);
+    }
+    var codecLabel = expectedCodec.toUpperCase();
     var stat = fs.lstatSync(filePath);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0) {
         throw postEncodeCheckpoint.confirmedInvalidError(
-            'post-encode AV1 is not a non-empty regular file');
+            'post-encode ' + codecLabel + ' is not a non-empty regular file');
     }
-    var probeResult = spawnSync(String(ffprobePath || 'ffprobe'), [
-        '-v', 'error', '-count_packets', '-show_streams', '-show_format', '-of', 'json', String(filePath)
-    ], { encoding: 'utf8', timeout: 3600000, maxBuffer: 32 * 1024 * 1024 });
+    // Routine validation must remain bounded. A complete demux of both the
+    // source and output adds two full-title reads after every successful encode
+    // while duplicating the duration check, FFmpeg exit status, and distributed
+    // decode samples below. Preserve packet-for-packet coverage only for the
+    // explicitly requested exhaustive attestation path.
+    var probeArgs = ['-v', 'error'];
+    if (validationMode === 'exhaustive') probeArgs.push('-count_packets');
+    probeArgs = probeArgs.concat([
+        '-show_streams', '-show_format', '-of', 'json', String(filePath)
+    ]);
+    var probeResult = spawnSync(String(ffprobePath || 'ffprobe'), probeArgs,
+        { encoding: 'utf8', timeout: 3600000, maxBuffer: 32 * 1024 * 1024 });
     if (probeResult.error) {
-        throw new Error('post-encode AV1 demux validation failed: ' +
+        throw new Error('post-encode ' + codecLabel + ' demux validation failed: ' +
             probeResult.error.message);
     }
     if (probeResult.status !== 0) {
-        var probeFailure = 'post-encode AV1 demux validation failed: ' +
+        var probeFailure = 'post-encode ' + codecLabel + ' demux validation failed: ' +
             String(probeResult.stderr || '').trim();
         if (hasConfirmedMediaCorruption(probeResult.stderr)) {
             throw postEncodeCheckpoint.confirmedInvalidError(probeFailure);
@@ -1188,13 +1280,25 @@ function validatePostEncodeMedia(ffprobePath, ffmpegPath, filePath, sourceProbe,
             parsed.streams.length);
     }
     var primary = ordinaryVideos[0];
-    if (String(primary.codec_name || '').toLowerCase() !== 'av1') {
-        throw postEncodeCheckpoint.confirmedInvalidError('post-encode primary video is not AV1');
-    }
-    var packetCount = Number(primary.nb_read_packets);
-    if (!Number.isSafeInteger(packetCount) || packetCount <= 0) {
+    if (String(primary.codec_name || '').toLowerCase() !== expectedCodec) {
         throw postEncodeCheckpoint.confirmedInvalidError(
-            'post-encode AV1 has no complete demuxed packet count');
+            'post-encode primary video is not ' + codecLabel);
+    }
+    var pixelFormatValidation;
+    try {
+        pixelFormatValidation = pixelFormatContract.assertEncodedPixelFormat(
+            validationOptions.requestedPixFmt, primary.pix_fmt);
+    } catch (pixelFormatError) {
+        throw postEncodeCheckpoint.confirmedInvalidError(
+            'post-encode ' + codecLabel + ' pixel format contract failed: ' +
+            pixelFormatError.message);
+    }
+    var packetCount = validationMode === 'exhaustive'
+        ? Number(primary.nb_read_packets) : null;
+    if (validationMode === 'exhaustive' &&
+        (!Number.isSafeInteger(packetCount) || packetCount <= 0)) {
+        throw postEncodeCheckpoint.confirmedInvalidError(
+            'post-encode ' + codecLabel + ' has no complete demuxed packet count');
     }
     expectedGeometry = expectedGeometry || {};
     ['width', 'height'].forEach(function (key) {
@@ -1204,39 +1308,43 @@ function validatePostEncodeMedia(ffprobePath, ffmpegPath, filePath, sourceProbe,
         var actual = Number(primary[key]);
         if (isFinite(expected) && expected > 0 && actual !== expected) {
             throw postEncodeCheckpoint.confirmedInvalidError(
-                'post-encode AV1 ' + key + ' changed from ' + expected + ' to ' + actual);
+                'post-encode ' + codecLabel + ' ' + key + ' changed from ' + expected + ' to ' + actual);
         }
     });
     var sourceDuration = mediaDurationSeconds(sourceProbe);
     var outputDuration = mediaDurationSeconds(parsed);
     if (!(outputDuration > 0)) {
         throw postEncodeCheckpoint.confirmedInvalidError(
-            'post-encode AV1 has no finite positive duration');
+            'post-encode ' + codecLabel + ' has no finite positive duration');
     }
     if (sourceDuration > 0) {
         var durationTolerance = Math.max(1, Math.min(5, sourceDuration * 0.001));
         if (Math.abs(sourceDuration - outputDuration) > durationTolerance) {
             throw postEncodeCheckpoint.confirmedInvalidError(
-                'post-encode AV1 duration differs from source by ' +
+                'post-encode ' + codecLabel + ' duration differs from source by ' +
                 Math.abs(sourceDuration - outputDuration).toFixed(3) + ' seconds');
         }
     }
-    // Container duration multiplied by nominal frame rate is not a measured
-    // frame count. Sparse, VFR, or damaged-but-decodable Matroska sources can
-    // legitimately carry fewer packets (and stale NUMBER_OF_FRAMES tags).
-    // Compare two demuxed packet counts instead; inability to authenticate the
-    // source count is retryable and must not condemn a completed candidate.
-    var sourcePacketCount = measuredSourcePacketCount(
-        ffprobePath, validationOptions.sourcePath, sourceProbe);
-    var sourceFrameRate = parseFrameRate(
-        (sourceProbe && sourceProbe.streams && sourceProbe.streams[0] &&
-            (sourceProbe.streams[0].avg_frame_rate || sourceProbe.streams[0].r_frame_rate)) ||
-        primary.avg_frame_rate || primary.r_frame_rate);
-    var packetTolerance = Math.max(2, Math.ceil((sourceFrameRate || 24) * 2));
-    if (sourcePacketCount >= 100 && packetCount + packetTolerance < sourcePacketCount) {
-        throw postEncodeCheckpoint.confirmedInvalidError(
-            'post-encode AV1 packet coverage is incomplete: source=' +
-            sourcePacketCount + ', output=' + packetCount + ', tolerance=' + packetTolerance);
+    var sourcePacketCount = null;
+    var packetTolerance = null;
+    if (validationMode === 'exhaustive') {
+        // Container duration multiplied by nominal frame rate is not a measured
+        // frame count. Sparse, VFR, or damaged-but-decodable Matroska sources can
+        // legitimately carry fewer packets (and stale NUMBER_OF_FRAMES tags).
+        // Explicit exhaustive attestation therefore compares two complete
+        // demuxed packet counts in addition to its full decode.
+        sourcePacketCount = measuredSourcePacketCount(
+            ffprobePath, validationOptions.sourcePath, sourceProbe);
+        var sourceFrameRate = parseFrameRate(
+            (sourceProbe && sourceProbe.streams && sourceProbe.streams[0] &&
+                (sourceProbe.streams[0].avg_frame_rate || sourceProbe.streams[0].r_frame_rate)) ||
+            primary.avg_frame_rate || primary.r_frame_rate);
+        packetTolerance = Math.max(2, Math.ceil((sourceFrameRate || 24) * 2));
+        if (sourcePacketCount >= 100 && packetCount + packetTolerance < sourcePacketCount) {
+            throw postEncodeCheckpoint.confirmedInvalidError(
+                'post-encode ' + codecLabel + ' packet coverage is incomplete: source=' +
+                sourcePacketCount + ', output=' + packetCount + ', tolerance=' + packetTolerance);
+        }
     }
     var decodeBackends = [];
     var decodeOffsets = [];
@@ -1262,16 +1370,22 @@ function validatePostEncodeMedia(ffprobePath, ffmpegPath, filePath, sourceProbe,
         stream_count: parsed.streams.length,
         ordinary_video_streams: ordinaryVideos.length,
         primary: {
-            codec_name: 'av1',
+            codec_name: expectedCodec,
             width: Number(primary.width) || null,
             height: Number(primary.height) || null,
             pix_fmt: String(primary.pix_fmt || ''),
+            requested_pix_fmt: pixelFormatValidation.requestedPixelFormat,
+            bit_depth: pixelFormatValidation.bitDepth,
             avg_frame_rate: String(primary.avg_frame_rate || ''),
             packet_count: packetCount,
             source_packet_count: sourcePacketCount,
-            packet_count_delta: packetCount - sourcePacketCount,
+            packet_count_delta: validationMode === 'exhaustive'
+                ? packetCount - sourcePacketCount : null,
             packet_tolerance: packetTolerance,
         },
+        packet_coverage: validationMode === 'exhaustive'
+            ? 'complete-source-and-output-demux'
+            : 'bounded-duration-and-distributed-decode',
         full_primary_video_decode: validationMode === 'exhaustive',
         decode_policy: validationMode === 'exhaustive'
             ? {
@@ -1352,6 +1466,25 @@ function assertCqOnlyConservativeContractDelta(requestedContract, retainedContra
     for (var keyIndex = 0; keyIndex < requestedKeys.length; keyIndex += 1) {
         var key = requestedKeys[keyIndex];
         if (key === 'argv') continue;
+        if (key === 'pipeline' && Number(requestedContract.schema) === 3 &&
+                Number(retainedContract.schema) === 3) {
+            if (!requestedContract.pipeline || !retainedContract.pipeline ||
+                    postEncodeCheckpoint.canonicalJson(requestedContract.pipeline.argv) !==
+                        postEncodeCheckpoint.canonicalJson(requestedContract.argv) ||
+                    postEncodeCheckpoint.canonicalJson(retainedContract.pipeline.argv) !==
+                        postEncodeCheckpoint.canonicalJson(retainedContract.argv)) {
+                throw new Error('direct NVEncC pipeline argv is not bound to its encode contract');
+            }
+            var requestedPipeline = Object.assign({}, requestedContract.pipeline);
+            var retainedPipeline = Object.assign({}, retainedContract.pipeline);
+            delete requestedPipeline.argv;
+            delete retainedPipeline.argv;
+            if (postEncodeCheckpoint.canonicalJson(requestedPipeline) !==
+                    postEncodeCheckpoint.canonicalJson(retainedPipeline)) {
+                throw new Error('retained direct NVEncC contract differs outside CQ at pipeline');
+            }
+            continue;
+        }
         if (postEncodeCheckpoint.canonicalJson(requestedContract[key]) !==
             postEncodeCheckpoint.canonicalJson(retainedContract[key])) {
             throw new Error('retained encode contract differs outside CQ at ' + key);
@@ -1364,11 +1497,17 @@ function assertCqOnlyConservativeContractDelta(requestedContract, retainedContra
     var requestedCqIndexes = [];
     var retainedCqIndexes = [];
     for (var i = 0; i < requestedContract.argv.length; i += 1) {
-        if (String(requestedContract.argv[i]) === '-cq') requestedCqIndexes.push(i);
-        if (String(retainedContract.argv[i]) === '-cq') retainedCqIndexes.push(i);
+        if (['-cq', '--vbr-quality'].indexOf(String(requestedContract.argv[i])) !== -1) {
+            requestedCqIndexes.push(i);
+        }
+        if (['-cq', '--vbr-quality'].indexOf(String(retainedContract.argv[i])) !== -1) {
+            retainedCqIndexes.push(i);
+        }
     }
     if (requestedCqIndexes.length !== 1 || retainedCqIndexes.length !== 1 ||
         requestedCqIndexes[0] !== retainedCqIndexes[0] ||
+        String(requestedContract.argv[requestedCqIndexes[0]]) !==
+            String(retainedContract.argv[retainedCqIndexes[0]]) ||
         requestedCqIndexes[0] + 1 >= requestedContract.argv.length) {
         throw new Error('encode contracts do not contain one aligned CQ field');
     }
@@ -1570,6 +1709,7 @@ function buildProtectedPostEncodePlan(options) {
     var spawnArgs;
     var spawnExecutable = options.ffmpegPath;
     var pipelineTools = null;
+    var directNvencc = false;
     try {
         var ffmpegConsumerArgs = buildFinalTranscodeArgs({
             bestParams: options.bestParams,
@@ -1600,7 +1740,10 @@ function buildProtectedPostEncodePlan(options) {
             if (!primaryStream) {
                 throw new Error('canonical KNN final transcode requires a primary source video stream');
             }
-            var outputDepth = nvenccKnn.outputDepthForStream(primaryStream);
+            // The selected output format, not the source stream, owns delivery
+            // depth. This keeps the FFmpeg consumer and direct NVEncC paths in
+            // the exact bit-depth domain measured by the CQ sweep.
+            var outputDepth = nvenccKnn.outputDepthForPixelFormat(options.pixFmt);
             var nvenccPath = String(process.env.TDARR_NVENCC ||
                 canonicalDenoise.NVENCC_PATH);
             var coordinatorPath = String(process.env.TDARR_NVENCC_COORDINATOR ||
@@ -1615,14 +1758,46 @@ function buildProtectedPostEncodePlan(options) {
                 ffmpegPath: coordinatorFfmpegPath,
                 ffmpegArgs: ffmpegConsumerArgs,
             };
-            spawnExecutable = coordinatorPath;
-            spawnArgs = nvenccKnn.buildCoordinatorArgs(coordinatorOptions);
-            pipelineTools = {
-                producer: nvenccPath,
-                consumer: coordinatorFfmpegPath,
-                producerLog: producerLog,
-                pipeline: nvenccKnn.contractDescriptor(coordinatorOptions),
-            };
+            // The direct NVEncC final path has an AV1-only command/descriptor contract.
+            // HEVC retains canonical KNN by using the raw NUT producer plus the
+            // codec-aware FFmpeg consumer, so command, checkpoint and validator agree.
+            var directEnabled = shouldUseDirectNvenccFinal(
+                options.bestParams && options.bestParams.encoder,
+                process.env.TDARR_NVENCC_DIRECT_FINAL
+            );
+            if (directEnabled) {
+                var directOptions = {
+                    sourcePath: options.originalFile,
+                    outputPath: options.contractOutputPath,
+                    pixFmt: options.pixFmt,
+                    cq: options.useCQ,
+                    preset: options.bestParams && options.bestParams.preset || 'p7',
+                    tfLevel: Number(nvencTemporalFilter.CANONICAL_TEMPORAL_FILTER_LEVEL),
+                    gopLength: 96,
+                    sourceStream: primaryStream,
+                    colorPrimaries: options.colorPrimaries,
+                    colorTrc: options.colorTrc,
+                    colorspace: options.colorspace,
+                    masterDisplay: options.variables && options.variables.hdr_master_display,
+                    maxCll: options.variables && options.variables.hdr_max_cll,
+                };
+                spawnExecutable = nvenccPath;
+                spawnArgs = nvenccKnn.buildDirectEncodeArgs(directOptions);
+                pipelineTools = {
+                    direct: true,
+                    pipeline: nvenccKnn.directContractDescriptor(directOptions),
+                };
+                directNvencc = true;
+            } else {
+                spawnExecutable = coordinatorPath;
+                spawnArgs = nvenccKnn.buildCoordinatorArgs(coordinatorOptions);
+                pipelineTools = {
+                    producer: nvenccPath,
+                    consumer: coordinatorFfmpegPath,
+                    producerLog: producerLog,
+                    pipeline: nvenccKnn.contractDescriptor(coordinatorOptions),
+                };
+            }
         } else {
             spawnArgs = ffmpegConsumerArgs;
         }
@@ -1637,6 +1812,8 @@ function buildProtectedPostEncodePlan(options) {
             expectedOutputGeometry, options.useMatroskaAncillaryBypass, {
                 mode: options.postEncodeValidationMode,
                 sourcePath: options.originalFile,
+                expectedCodec: expectedCodecForEncoder(options.bestParams && options.bestParams.encoder),
+                requestedPixFmt: options.pixFmt,
             });
     };
     var sourceFingerprint = grainArtifact.sampledSourceFingerprint(options.originalFile);
@@ -1668,6 +1845,7 @@ function buildProtectedPostEncodePlan(options) {
         encodeContract: encodeContract,
         expectedOutputGeometry: expectedOutputGeometry,
         contractOutputPath: options.contractOutputPath,
+        directNvencc: directNvencc,
         plan: plan,
     };
 }
@@ -1786,7 +1964,8 @@ function buildRetainedRecoveryPlan(request) {
     protectedPlan.useCanonicalDenoise = useCanonicalDenoise;
     protectedPlan.useMatroskaAncillaryBypass = useMatroskaAncillaryBypass;
     protectedPlan.deferMatroskaAncillaryForGrain = useMatroskaAncillaryBypass &&
-        canonicalDisposition === 'prepared';
+        canonicalDisposition === 'prepared' &&
+        expectedCodecForEncoder(bestParams && bestParams.encoder) === 'av1';
     protectedPlan.useCQ = useCQ;
     return protectedPlan;
 }
@@ -1801,6 +1980,17 @@ var plugin = async function (args) {
                     args.inputs = lib.loadDefaultValues(args.inputs, details);
                     path = require('path');
                     bestParams = args.variables.vmafBestParameters;
+                    var selectionHandoff = args.variables.vmafSelectionHandoff;
+                    if (!bestParams && selectionHandoff &&
+                        selectionHandoff.schema === 'vmaf-selection-handoff/v1' &&
+                        selectionHandoff.parameterSet &&
+                        Number(selectionHandoff.selectedCQ) === Number(args.variables.vmafFinalSelectedCQ) &&
+                        String(selectionHandoff.parameterSetId || '') ===
+                            String(args.variables.vmafSelectedParameterSetId || '')) {
+                        bestParams = Object.assign({}, selectionHandoff.parameterSet);
+                        args.variables.vmafBestParameters = bestParams;
+                        args.jobLog('Recovered the validated parameter set from the durable selection handoff.');
+                    }
                     originalFile = args.variables.vmafOriginalFile || args.inputFileObj._id;
                     cacheDir = args.workDir || '/temp';
                     fileName = path.basename(originalFile, path.extname(originalFile));
@@ -1842,7 +2032,12 @@ var plugin = async function (args) {
                     }
 
                     if (!bestParams) {
-                        args.jobLog('Error: No optimal parameters found. Run Select Best Parameters first.');
+                        args.jobLog(args.variables.vmafSelectionStatus === 'no_feasible_parameters'
+                            ? 'No feasible transcode parameters: Select Best Parameters ran, but every measured CQ failed the quality contract.'
+                            : 'No validated parameter selection is available; preserving the original.');
+                        if (args.variables.vmafNoFeasibleParametersReason) {
+                            args.jobLog('Selection rejection summary: ' + args.variables.vmafNoFeasibleParametersReason);
+                        }
                         args.variables.vmafTranscodeStatus = 'keep_original_no_parameters';
                         args.variables.vmafTranscodeFailureReason = 'no_optimal_parameters';
                         args.variables.vmafTranscodeCompletedAt = new Date().toISOString();
@@ -1910,7 +2105,8 @@ var plugin = async function (args) {
                     useMatroskaAncillaryBypass = shouldUseMatroskaAncillaryBypass(
                         originalFile, container, inputProbeData);
                     deferMatroskaAncillaryForGrain = useMatroskaAncillaryBypass &&
-                        canonicalDisposition === 'prepared';
+                        canonicalDisposition === 'prepared' &&
+                        expectedCodecForEncoder(bestParams && bestParams.encoder) === 'av1';
                     ffmpegOutputPath = useMatroskaAncillaryBypass
                         ? cacheDir + '/' + fileName + '_vmaf_primary_video_only.mkv'
                         : outputPath;
@@ -1973,29 +2169,27 @@ var plugin = async function (args) {
                     args.jobLog('GPU final encode required: ' + ((args.variables.vmafFinalTranscodeGpuRequired !== false) ? 'Yes' : 'No'));
                     args.jobLog('Preset: ' + bestParams.preset);
                     args.jobLog('Quality (CQ): ' + useCQ + (isRetry ? ' (retry)' : ''));
-                    args.jobLog('Pixel Format: ' + pixFmt + (args.variables.vmafRecommendedPixFmt ? ' (VMAF recommended)' : ''));
+                    args.jobLog('Requested Pixel Format: ' + pixFmt +
+                        (args.variables.vmafRecommendedPixFmt ? ' (VMAF recommended)' : ''));
                     args.jobLog('Color: ' + colorPrimaries + '/' + colorTrc + '/' + colorspace);
                     if (args.variables.hdr_dynamic_metadata_warning) {
                         args.jobLog('⚠ ' + args.variables.hdr_dynamic_metadata_warning);
                     }
-                    if (pixFmt === 'p010le') {
-                        args.jobLog('10-bit encoding enabled' + (args.variables.isHDR ? ' (HDR content)' : ' (VMAF analysis showed quality benefit)'));
-                    }
+                    args.jobLog('Requested output bit depth: ' +
+                        nvenccKnn.outputDepthForPixelFormat(pixFmt) +
+                        '-bit (verified from ffprobe before the candidate can be accepted)');
                     args.jobLog('Output: ' + outputPath);
                     args.jobLog('');
 
-                    // Size/quality policy is advisory after candidate selection. A noisy live
-                    // extrapolation must never kill a technically healthy title encode: doing so
-                    // discards the only result and guarantees another expensive encode. Keep the
-                    // policy object for downstream telemetry, but explicitly disable cancellation.
-                    args.variables.liveSizeCompare = {
-                        enabled: false,
-                        compareMethod: 'estimatedFinalSize',
-                        thresholdPerc: 100,
-                        checkDelaySeconds: 600,
-                        advisoryOnly: true,
-                        error: false,
-                    };
+                    // Current output bytes only increase. Once the video-only partial exceeds
+                    // the complete delivered-file allowance, no amount of later encoding or
+                    // remuxing can bring it back under the cap. This is therefore a deterministic
+                    // abort, not the noisy final-size extrapolation that was retired previously.
+                    args.variables.liveSizeCompare = liveSizeGuard.buildMonotonicLiveSizeGuard(
+                        args.variables.vmafMaxFinalOutputRatioPct);
+                    args.jobLog('Monotonic live size guard armed: abort when current output bytes exceed '
+                        + Number(args.variables.liveSizeCompare.thresholdPerc).toFixed(1)
+                        + '% of source; no final-size extrapolation is used.');
 
                     // Build the exact command used by first attempts and retry CQs.
                     // Shared policy rejects stacked NVENC temporal filtering; the
@@ -2197,13 +2391,17 @@ var plugin = async function (args) {
                         }
                     }
                     if (bestParams.isGPU && bestParams.encoder.indexOf('av1_nvenc') !== -1 &&
-                            (hdrMasterDisplay || hdrMaxCll)) {
+                            (hdrMasterDisplay || hdrMaxCll) && !_protectedPlanContext.directNvencc) {
                         args.jobLog('⚠ Static HDR mastering/CLL metadata detected but av1_nvenc in this FFmpeg build does not support -master_display/-max_cll. Preserving HDR color primaries/TRC/matrix only.');
                     }
 
+                    // The protected video encode has not started yet. Keep the NVENC lock until
+                    // cli.runCli() resolves; releasing here would allow another worker to start
+                    // sample or title encodes concurrently with this full-title encode.
                     if (!postEncodePlan.reused) {
-                        args.jobLog((useCanonicalDenoise
-                            ? 'NVEncC KNN -> FFmpeg command: ' : 'FFmpeg command: ') +
+                        args.jobLog((_protectedPlanContext.directNvencc
+                            ? 'NVEncC direct NVDEC + KNN + AV1 p7 command: '
+                            : (useCanonicalDenoise ? 'NVEncC KNN -> FFmpeg command: ' : 'FFmpeg command: ')) +
                             spawnExecutable + ' ' + spawnArgs.join(' '));
                     }
 
@@ -2249,11 +2447,70 @@ var plugin = async function (args) {
                         });
                     args.variables.vmafTranscodeStatus = 'running';
 
+                    // Tdarr's generic CLI only evaluates liveSizeCompare from parsed FFmpeg
+                    // progress. Direct NVEncC output does not enter that parser, so the guard was
+                    // armed but never sampled (Kill Bill Vol. 2 completed at 88.8% despite the then-80%
+                    // cap). Poll the exact protected partial independently and use CLI.killThread(),
+                    // which owns the real child process and preserves its normal cleanup semantics.
+                    var _directSizeGuardTimer = null;
+                    if (!postEncodePlan.reused && _protectedPlanContext.directNvencc) {
+                        try {
+                            _directSizeGuardTimer = liveSizeGuard.armDirectNvenccSizeGuard({
+                                sourcePath: originalFile,
+                                outputPath: ffmpegOutputPath,
+                                capPct: args.variables.vmafMaxFinalOutputRatioPct,
+                                liveState: args.variables.liveSizeCompare,
+                                cli: cli,
+                                jobLog: args.jobLog,
+                            });
+                        } catch (_guardSetupError) {
+                            args.jobLog('Direct NVEncC size guard setup failed; final byte gate remains authoritative: ' +
+                                _guardSetupError.message);
+                        }
+                    }
+
                     return [4 /*yield*/, cli.runCli()];
                 case 1:
                     res = _a.sent();
+                    if (_directSizeGuardTimer) clearInterval(_directSizeGuardTimer);
+                    // FFmpeg/NVENC has now exited (or a protected checkpoint was reused). Nothing
+                    // below this point encodes video: checkpoint validation uses unlocked
+                    // NVDEC/software decode, while mkvmerge and delivery checks are I/O/CPU.
+                    releaseOwnedGpuPipelineLockAfterEncode(args);
                     if (res.cliExitCode !== 0) {
-                        try { postEncodeCheckpoint.abandon(postEncodePlan); } catch (_) {}
+                        var _abandonResult;
+                        try {
+                            _abandonResult = postEncodeCheckpoint.abandonFailedPublishedPlan(
+                                postEncodePlan, args.variables);
+                        } catch (_abandonError) {
+                            args.jobLog('ERROR: Failed encode checkpoint abandonment failed closed: ' +
+                                _abandonError.message);
+                            args.variables.vmafTranscodeStatus = 'technical_failure';
+                            args.variables.vmafTranscodeFailureReason =
+                                'postencode_checkpoint_abandon_failed: ' + _abandonError.message;
+                            args.variables.vmafTranscodeCompletedAt = new Date().toISOString();
+                            return [2 /*return*/, {
+                                outputFileObj: args.inputFileObj,
+                                outputNumber: 2,
+                                variables: args.variables,
+                            }];
+                        }
+                        if (!_abandonResult.abandoned || _abandonResult.retained) {
+                            args.jobLog('ERROR: Failed encode left durable or ambiguous checkpoint evidence; ' +
+                                'retaining it for recovery: ' + _abandonResult.reason);
+                            args.variables.vmafTranscodeStatus = 'technical_failure';
+                            args.variables.vmafTranscodeFailureReason =
+                                'postencode_checkpoint_retained_after_failed_encode: ' +
+                                _abandonResult.reason;
+                            args.variables.vmafTranscodeCompletedAt = new Date().toISOString();
+                            return [2 /*return*/, {
+                                outputFileObj: args.inputFileObj,
+                                outputNumber: 2,
+                                variables: args.variables,
+                            }];
+                        }
+                        args.jobLog('Abandoned uncommitted protected encode partial; no checkpoint ' +
+                            'manifest, artifact, or candidate was published.');
                         args.jobLog('Transcode failed with exit code: ' + res.cliExitCode);
                         var _liveFailed = args.variables.liveSizeCompare && args.variables.liveSizeCompare.error === true;
                         args.variables.vmafTranscodeStatus = _liveFailed ? 'size_failed' : 'technical_failure';
@@ -2275,8 +2532,87 @@ var plugin = async function (args) {
                             postEncodePlan.artifactPath);
                     }
                     ffmpegOutputPath = postEncodePlan.artifactPath;
+
+                    // Reject an oversized video-only checkpoint before copying/linking it,
+                    // remuxing ancillary streams, or hashing a materialized alias. The final
+                    // delivered-size gate below remains authoritative because audio/subtitles
+                    // can increase the ratio, but a video stream already at the cap can never
+                    // become feasible. Kill Bill Vol. 2 exposed the old ordering: its 88.8%
+                    // artifact spent eight minutes being copied and then was hashed again before
+                    // the then-80% rejection ran.
+                    try {
+                        var _checkpointBytes = require('fs').statSync(ffmpegOutputPath).size;
+                        var _sourceBytes = require('fs').statSync(originalFile).size;
+                        var _checkpointSizeGate = evaluateFinalOutputSizeGate(
+                            _checkpointBytes, _sourceBytes,
+                            args.variables.vmafMaxFinalOutputRatioPct);
+                        if (_checkpointSizeGate.rejected) {
+                            args.jobLog('ERROR: Video-only checkpoint is ' +
+                                _checkpointSizeGate.ratioPct.toFixed(2) + '% of source (cap ' +
+                                _checkpointSizeGate.capPct.toFixed(2) +
+                                '%); rejecting before materialization/remux and preserving the original.');
+                            args.variables.vmafFinalOutputSizeMB = _checkpointBytes / (1024 * 1024);
+                            args.variables.vmafFinalOutputRatioPct = _checkpointSizeGate.ratioPct;
+                            args.variables.vmafFinalOutputSizeAdvisory = false;
+                            args.variables.vmafFinalOutputSizeRejected = true;
+                            args.variables.vmafTranscodeSucceeded = false;
+                            args.variables.vmafTranscodeStatus = 'size_failed';
+                            args.variables.vmafTranscodeFailureReason =
+                                'video_checkpoint_not_smaller_than_source_cap';
+                            args.variables.vmafTranscodeCompletedAt = new Date().toISOString();
+                            args.variables.vmafTranscodeQualityWarnings =
+                                Array.isArray(args.variables.vmafTranscodeQualityWarnings)
+                                    ? args.variables.vmafTranscodeQualityWarnings : [];
+                            args.variables.vmafTranscodeQualityWarnings.push({
+                                code: 'video-checkpoint-larger-than-cap',
+                                stage: 'post-encode-checkpoint-size',
+                                ratio_pct: _checkpointSizeGate.ratioPct,
+                                output_size_bytes: _checkpointBytes,
+                                source_size_bytes: _sourceBytes,
+                                cap_pct: _checkpointSizeGate.capPct,
+                                advisory: false,
+                            });
+                            args.variables.liveSizeCompare = args.variables.liveSizeCompare || {};
+                            args.variables.liveSizeCompare.enabled = false;
+                            args.variables.liveSizeCompare.error = true;
+                            args.variables.liveSizeCompare.errorType = 'upperThreshold';
+                            args.variables.liveSizeCompare.advisoryOnly = false;
+                            args.variables.liveSizeCompare.finalOutputRatioPct =
+                                _checkpointSizeGate.ratioPct;
+                            args.variables.liveSizeCompare.finalOutputSizeMB =
+                                _checkpointBytes / (1024 * 1024);
+                            retireRejectedPostEncodeCheckpoint(
+                                args.variables, postEncodeCheckpoint, args.jobLog);
+                            return [2 /*return*/, {
+                                outputFileObj: args.inputFileObj,
+                                outputNumber: 2,
+                                variables: args.variables,
+                            }];
+                        }
+                    } catch (_checkpointSizeError) {
+                        args.jobLog('ERROR: Video-only checkpoint size check failed closed: ' +
+                            _checkpointSizeError.message);
+                        args.variables.vmafTranscodeSucceeded = false;
+                        args.variables.vmafTranscodeStatus = 'technical_failure';
+                        args.variables.vmafTranscodeFailureReason =
+                            'checkpoint_size_verification_failed';
+                        args.variables.vmafTranscodeCompletedAt = new Date().toISOString();
+                        return [2 /*return*/, {
+                            outputFileObj: args.inputFileObj,
+                            outputNumber: 2,
+                            variables: args.variables,
+                        }];
+                    }
+                    var _checkpointMaterializationOptions = {
+                        // applyHdrColorMetadata() runs mkvpropedit in-place below. HDR
+                        // outputs therefore need a private inode; a hard-linked working
+                        // file would mutate the authenticated checkpoint itself.
+                        mutable: !!(colorPrimaries && colorPrimaries !== 'bt709'),
+                    };
                     if (deferMatroskaAncillaryForGrain) {
-                        postEncodeCheckpoint.materialize(postEncodePlan, outputPath, cacheDir);
+                        postEncodeCheckpoint.materialize(
+                            postEncodePlan, outputPath, cacheDir,
+                            _checkpointMaterializationOptions);
                         args.variables.vmafAncillaryPreservationMethod = 'deferred-to-grain-synthesis-v1';
                         args.variables.vmafAncillaryRemuxDeferred = true;
                         args.jobLog('Prepared grain flow: materialized the protected video-only AV1 checkpoint; ' +
@@ -2288,6 +2624,11 @@ var plugin = async function (args) {
                                 ffmpegOutputPath, originalFile, outputPath, args.jobLog);
                             args.variables.vmafAncillaryPreservationMethod = 'mkvmerge-source-no-video-v1';
                             args.variables.vmafAncillaryInventory = _mkvPreservation.inventory;
+                            if (_mkvPreservation.warning) {
+                                args.variables.vmafAncillaryPreservationWarning = _mkvPreservation.warning;
+                            } else {
+                                delete args.variables.vmafAncillaryPreservationWarning;
+                            }
                         } catch (mkvmergeError) {
                             args.jobLog('ERROR: Matroska ancillary preservation failed closed: ' + mkvmergeError.message);
                             args.variables.vmafTranscodeSucceeded = false;
@@ -2302,7 +2643,9 @@ var plugin = async function (args) {
                             }];
                         }
                     } else {
-                        postEncodeCheckpoint.materialize(postEncodePlan, outputPath, cacheDir);
+                        postEncodeCheckpoint.materialize(
+                            postEncodePlan, outputPath, cacheDir,
+                            _checkpointMaterializationOptions);
                         args.variables.vmafAncillaryPreservationMethod = 'ffmpeg-scoped-stream-copy-v1';
                         args.variables.vmafAncillaryRemuxDeferred = false;
                     }
@@ -2323,9 +2666,8 @@ var plugin = async function (args) {
                             var _fszMb = Number(args.inputFileObj && args.inputFileObj.file_size) || 0;
                             inBytes = _fszMb > 1024 * 1024 ? _fszMb : _fszMb * 1024 * 1024;
                         }
-                        var resolvedDeliveryPolicy = deliveryPolicy.resolve(args.variables);
                         var finalSizeGate = evaluateFinalOutputSizeGate(
-                            outBytes, inBytes, resolvedDeliveryPolicy.maxFinalOutputRatioPct);
+                            outBytes, inBytes, args.variables.vmafMaxFinalOutputRatioPct);
                         var finalRatio = finalSizeGate.ratioPct;
                         var _maxFinalRatio = finalSizeGate.capPct;
                         args.variables.vmafFinalOutputSizeMB = outBytes / (1024 * 1024);
@@ -2344,8 +2686,8 @@ var plugin = async function (args) {
                         // fails open when the projection is null (projections are only computed
                         // for candidates that were not already rejected), and film-grain
                         // synthesis measures its own input rather than the original source. An
-                        // output above the delivered cap misses the minimum reduction,
-                        // so the source must be kept. Equality is accepted.
+                        // output at or above the cap has no size benefit, so re-encoding is
+                        // all-cost-no-benefit and the source must be kept.
                         if (finalSizeGate.rejected) {
                             args.jobLog('ERROR: Final output is ' + finalRatio.toFixed(2)
                                 + '% of source (cap ' + _maxFinalRatio.toFixed(2)
@@ -2366,8 +2708,7 @@ var plugin = async function (args) {
                             args.variables.vmafFinalOutputSizeRejected = true;
                             args.variables.vmafTranscodeSucceeded = false;
                             args.variables.vmafTranscodeStatus = 'size_failed';
-                            args.variables.vmafTranscodeFailureReason =
-                                'final_output_exceeds_minimum_reduction_cap';
+                            args.variables.vmafTranscodeFailureReason = 'final_output_not_smaller_than_source';
                             args.variables.vmafTranscodeCompletedAt = new Date().toISOString();
                             args.variables.liveSizeCompare = args.variables.liveSizeCompare || {};
                             args.variables.liveSizeCompare.enabled = false;
@@ -2455,7 +2796,21 @@ var plugin = async function (args) {
                     }];
                 case 2:
                     err = _a.sent();
-                    try { postEncodeCheckpoint.abandon(postEncodePlan); } catch (_) {}
+                    if (_directSizeGuardTimer) clearInterval(_directSizeGuardTimer);
+                    try {
+                        var _caughtAbandonResult = postEncodeCheckpoint.abandonFailedPublishedPlan(
+                            postEncodePlan, args.variables);
+                        if (_caughtAbandonResult.abandoned) {
+                            args.jobLog('Abandoned uncommitted protected encode partial after transcode exception; ' +
+                                'no checkpoint manifest, artifact, or candidate was published.');
+                        } else {
+                            args.jobLog('Transcode exception left durable or ambiguous checkpoint evidence; ' +
+                                'retaining it for recovery: ' + _caughtAbandonResult.reason);
+                        }
+                    } catch (_caughtAbandonError) {
+                        args.jobLog('ERROR: Transcode exception checkpoint abandonment failed closed; ' +
+                            'retaining its public record: ' + _caughtAbandonError.message);
+                    }
                     args.jobLog('Transcode failed: ' + err.message);
                     args.variables.vmafTranscodeSucceeded = false;
                     args.variables.vmafTranscodeStatus = 'technical_failure';
@@ -2492,8 +2847,10 @@ exports.recovery = {
     importRetainedCheckpoint: postEncodeCheckpoint.importRetained,
 };
 exports._test = {
+    releaseOwnedGpuPipelineLockAfterEncode: releaseOwnedGpuPipelineLockAfterEncode,
     finalTranscodeWatchdogPolicy: finalTranscodeWatchdogPolicy,
     evaluateFinalOutputSizeGate: evaluateFinalOutputSizeGate,
+    buildMonotonicLiveSizeGuard: liveSizeGuard.buildMonotonicLiveSizeGuard,
     retireRejectedPostEncodeCheckpoint: retireRejectedPostEncodeCheckpoint,
     parseHdrMasterDisplay: parseHdrMasterDisplay,
     parseHdrMaxCll: parseHdrMaxCll,
@@ -2510,6 +2867,8 @@ exports._test = {
     verifyMkvmergeAncillaryInventory: verifyMkvmergeAncillaryInventory,
     preserveMatroskaAncillaryWithMkvmerge: preserveMatroskaAncillaryWithMkvmerge,
     buildFinalTranscodeArgs: buildFinalTranscodeArgs,
+    expectedCodecForEncoder: expectedCodecForEncoder,
+    shouldUseDirectNvenccFinal: shouldUseDirectNvenccFinal,
     resolveExecutablePath: resolveExecutablePath,
     resolveFinalTranscodeCQ: resolveFinalTranscodeCQ,
     absoluteShellExecTarget: absoluteShellExecTarget,

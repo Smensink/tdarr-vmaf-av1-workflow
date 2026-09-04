@@ -71,7 +71,7 @@ assert.match(grainPlugin.details().inputs.find((item) =>
     item.name === 'preserveProductionReview').tooltip, /Explicit opt-in/);
 assert.strictEqual(inputDefault('maxOutputSizeRatioPct'), '101');
 assert.match(grainPlugin.details().inputs.find((item) =>
-    item.name === 'maxOutputSizeRatioPct').tooltip, /Warn/);
+    item.name === 'maxOutputSizeRatioPct').tooltip, /warn/i);
 assert.strictEqual(grainPlugin.details().outputs.length, 4);
 assert.match(grainPlugin.details().outputs[2].tooltip, /BYPASS/);
 
@@ -1196,9 +1196,11 @@ assert.deepStrictEqual(test.assessOutputSizeRatio(1000, 1000, 101), {
 const sizeWarning = test.assessOutputSizeRatio(1000, 1020, 101);
 assert.strictEqual(sizeWarning.ratioPct, 102);
 assert.deepStrictEqual(sizeWarning.qualityWarning, {
-    code: 'grain-output-size-ratio-above-policy',
+    code: 'grain-output-size-efficiency-warning',
     advisory: true,
-    failures: ['output is 102.000% of completed base, above the 101.000% advisory limit'],
+    ratio_pct_of_base: 102,
+    warning_threshold_pct: 101,
+    failures: ['output is 102.000% of completed base, above the 101.000% advisory warning threshold'],
 });
 assert.throws(() => test.assessOutputSizeRatio(0, 1020, 101), /size evidence/);
 const qualityLogs = [];

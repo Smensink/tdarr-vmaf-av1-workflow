@@ -12,6 +12,88 @@ var vmafV1Cpu = require('../../_lib/vmafV1Cpu.js');
 var preFgsCambi = require('../../_lib/preFgsCambi.js');
 var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
 var adaptiveFrameFloorLib = require('../../_lib/adaptiveFrameFloor.js');
+var pixelFormatContract = require('../../_lib/pixelFormatContract.js');
+
+function buildOriginalSourceSampleSizeMap(variables, fsModule) {
+    variables = variables || {};
+    var paths = Array.isArray(variables.vmafOriginalSourceSamples)
+        ? variables.vmafOriginalSourceSamples : [];
+    var sizeMap = {};
+    for (var index = 0; index < paths.length; index++) {
+        var samplePath = String(paths[index] || '').trim();
+        if (!samplePath) continue;
+        try {
+            var bytes = Number(fsModule.statSync(samplePath).size);
+            if (isFinite(bytes) && bytes > 0) sizeMap[index] = bytes / (1024 * 1024);
+        } catch (_) {}
+    }
+    return sizeMap;
+}
+
+function estimateCandidateSizeMetrics(candidate, policy) {
+    var sampleMB = Number(candidate.avgFileSizeMB || 0);
+
+    // Prefer the AV1/original-source byte ratio for the same clip indices. On the
+    // canonical-denoise path, candidate.originalSamplePath points at a lossless FFV1
+    // reference and can be more than ten times larger than the source clip. It is a
+    // quality reference, never a compression denominator. The extractor's dedicated
+    // vmafOriginalSourceSamples array is the only accepted source-size authority.
+    var projectedMB = 0;
+    try {
+        var originalMap = policy.originalSampleMBByIndex || null;
+        if (originalMap && sampleMB > 0 && policy.sourceSizeMB > 0) {
+            var matchedIndices = (candidate.clipSampleIndices || []).filter(function (value) {
+                return originalMap[value] != null;
+            });
+            var originalSum = 0;
+            var originalCount = 0;
+            if (matchedIndices.length > 0) {
+                for (var index = 0; index < matchedIndices.length; index++) {
+                    originalSum += originalMap[matchedIndices[index]];
+                    originalCount++;
+                }
+            } else {
+                // Unaligned fallback for revived rows: use all authenticated source clips.
+                // Hardness-first sampling makes this conservative rather than permissive.
+                for (var key in originalMap) {
+                    originalSum += originalMap[key];
+                    originalCount++;
+                }
+            }
+            if (originalCount > 0 && originalSum > 0) {
+                projectedMB = (sampleMB / (originalSum / originalCount)) * policy.sourceSizeMB;
+            }
+        }
+    } catch (_) { projectedMB = 0; }
+
+    // If the authenticated source clips are unavailable, extrapolate the encoded
+    // bytes over their configured duration. This is conservative for hardness-first
+    // sampling and cannot accidentally use a lossless reference as source evidence.
+    if (!(projectedMB > 0)) {
+        projectedMB = (policy.duration > 0 && policy.sampleDuration > 0)
+            ? sampleMB * (policy.duration / policy.sampleDuration) : 0;
+    }
+
+    var outputMbps = projectedMB > 0 && policy.duration > 0
+        ? projectedMB * 1024 * 1024 * 8 / policy.duration / 1000000 : 0;
+    var outputBpp = outputMbps > 0 && policy.width > 0 && policy.height > 0 && policy.fps > 0
+        ? outputMbps * 1000000 / (policy.width * policy.height * policy.fps) : 0;
+    var projectedRatioPct = projectedMB > 0 && policy.sourceSizeMB > 0
+        ? projectedMB / policy.sourceSizeMB * 100 : 0;
+    return {
+        projectedMB: projectedMB,
+        outputMbps: outputMbps,
+        outputBpp: outputBpp,
+        projectedRatioPct: projectedRatioPct,
+    };
+}
+
+function decoderForEncoder(encoder) {
+    var value = String(encoder || '').toLowerCase();
+    if (value.indexOf('hevc') !== -1 || value.indexOf('h265') !== -1) return 'hevc_cuvid';
+    if (value.indexOf('av1') !== -1) return 'av1_cuvid';
+    return null;
+}
 
 function buildHoldoutVmafArgs(options) {
     options = options || {};
@@ -29,9 +111,10 @@ function buildHoldoutVmafArgs(options) {
         '-filter_hw_device', 'cuda0',
         '-hwaccel', 'cuda',
         '-hwaccel_device', '0',
-        '-c:v', 'av1_cuvid',
-        '-i', String(options.distortedPath),
     ];
+    var distortedDecoder = options.distortedDecoder || decoderForEncoder(options.encoder);
+    if (distortedDecoder) argv.push('-c:v', String(distortedDecoder));
+    argv.push('-i', String(options.distortedPath));
     if (options.referenceCuvid) {
         argv.push('-hwaccel', 'cuda', '-hwaccel_device', '0',
             '-c:v', String(options.referenceCuvid));
@@ -44,18 +127,21 @@ function buildHoldoutVmafArgs(options) {
     return argv;
 }
 
-function buildXpsnrArgs(distortedPath, referencePath) {
-    return [
+function buildXpsnrArgs(distortedPath, referencePath, encoder) {
+    var argv = [
         '-hide_banner',
         '-hwaccel', 'nvdec',
         '-hwaccel_device', '0',
-        '-c:v', 'av1_cuvid',
+    ];
+    var decoder = decoderForEncoder(encoder);
+    if (decoder) argv.push('-c:v', decoder);
+    return argv.concat([
         '-i', String(distortedPath),
         '-i', String(referencePath),
         '-filter_complex',
         '[0:v]settb=1/1000,setpts=N[d];[1:v]settb=1/1000,setpts=N[r];[d][r]xpsnr',
         '-f', 'null', '-',
-    ];
+    ]);
 }
 
 function resolveMeasuredSweepContract(args, policy) {
@@ -179,6 +265,7 @@ function buildHoldoutEncodeArgs(options) {
     options = options || {};
     var encoder = String(options.encoder || 'av1_nvenc');
     var isAv1Nvenc = encoder.indexOf('av1_nvenc') !== -1;
+    var isHevcNvenc = encoder.indexOf('hevc_nvenc') !== -1;
     var isNvenc = encoder.indexOf('_nvenc') !== -1;
     var canonicalInput = options.canonicalInput === true;
     var temporalPolicy = options.temporalPolicy || (canonicalInput
@@ -196,6 +283,7 @@ function buildHoldoutEncodeArgs(options) {
             options.nvencFlagArgs || nvencTemporalFilter.qualityFlags(temporalPolicy, false),
             temporalPolicy,
             'VMAF holdout encode');
+        if (isHevcNvenc) argv.push('-profile:v', 'main10');
         argv.push('-g', '96', '-forced-idr', '1');
         argv.push('-color_primaries', String(options.colorPrimaries || 'bt709'),
             '-color_trc', String(options.colorTrc || 'bt709'),
@@ -207,7 +295,7 @@ function buildHoldoutEncodeArgs(options) {
         argv.push('-max_muxing_queue_size', '4096');
     }
     argv.push('-an', '-sn', '-dn', String(options.outputPath));
-    nvencTemporalFilter.assertAv1NvencCommand(argv, temporalPolicy, 'VMAF holdout encode');
+    nvencTemporalFilter.assertNvencCommand(argv, temporalPolicy, 'VMAF holdout encode');
     canonicalDenoise.assertAbsent(argv, 'VMAF holdout encode from canonical denoised FFV1 sample');
     return argv;
 }
@@ -335,7 +423,37 @@ function publishFinalSelection(variables, bestParams, validatedSelection) {
     variables.vmafBestParameters = bestParams.parameterSet;
     variables.vmafFinalSelectedCQ = selection.cq;
     variables.vmafSelectedParameterSetId = selection.parameterSetId;
+    variables.vmafSelectionHandoff = {
+        schema: 'vmaf-selection-handoff/v1',
+        selectedCQ: selection.cq,
+        parameterSetId: selection.parameterSetId,
+        parameterSet: Object.assign({}, bestParams.parameterSet),
+        publishedAt: new Date().toISOString()
+    };
+    variables.vmafSelectionStatus = 'selected';
     return selection;
+}
+
+function publishEncoderDomainBridge(variables, parameterSet, measuredPixFmt,
+        recommendedPixFmt, selectedCQ) {
+    if (!variables) throw new Error('cannot publish encoder-domain bridge without variables');
+    if (String(parameterSet && parameterSet.encoder || '').toLowerCase().indexOf('av1') === -1) {
+        delete variables.vmafEncoderDomainBridge;
+        return null;
+    }
+    var measuredDepth = pixelFormatContract.outputDepthForPixelFormat(measuredPixFmt);
+    var deliveryDepth = pixelFormatContract.outputDepthForPixelFormat(recommendedPixFmt);
+    if (measuredDepth !== deliveryDepth) {
+        throw new Error('cannot publish encoder-domain bridge across different bit depths');
+    }
+    var bridge = pixelFormatContract.av1EncoderDomainBridge();
+    bridge.measurement_pixel_format = String(measuredPixFmt).toLowerCase();
+    bridge.delivery_pixel_format = String(recommendedPixFmt).toLowerCase();
+    bridge.measurement_cq = Number(selectedCQ);
+    bridge.delivery_cq = Number(selectedCQ);
+    variables.vmafEncoderDomainBridge = bridge;
+    variables.vmafPixelFormatContractId = pixelFormatContract.CONTRACT_ID;
+    return bridge;
 }
 
 function markConstraintAwareHoldoutTechnicalFailure(variables, preSelectParams, error) {
@@ -378,8 +496,12 @@ function classifyToleranceRejection(reason) {
     if (/emergency cutoff|legacy cap|insufficient size benefit|projectedoutputratiopct.*at or above/.test(text)) {
         return 'oversize';
     }
+    // A CAMBI fallback is permitted only when CAMBI/banding is the sole quality miss.
+    // Shared-feasibility reasons are compound strings, so classify every binding image
+    // quality metric before looking for CAMBI. Otherwise a reason such as
+    // "cambiRisk ...; ssimulacra2 ..." is mislabeled cambi_only and resurrected.
+    if (/vmaf|frame|ssim|xpsnr|ssimulacra|butteraugli|cvvdp|quality/.test(text)) return 'quality';
     if (/cambi|banding/.test(text)) return 'cambi';
-    if (/vmaf|frame|quality/.test(text)) return 'quality';
     return 'other_tolerance';
 }
 
@@ -407,10 +529,11 @@ function measuredQualityPasses(result, targetVmaf, frameFloor) {
 /*
  * Select a measured CQ when policy/model tolerances cannot be satisfied. The
  * caller only invokes the general quality fallback after the retry search is
- * exhausted; CAMBI-only and upper-size-model misses are safe to resolve
- * immediately because another descent cannot make their prescribed limit an
- * integrity property. Missing/incomplete measurements are deliberately
- * excluded: this is never a technical-failure bypass.
+ * exhausted. CAMBI-only misses may be resolved immediately because the source
+ * itself can exceed the prescribed CAMBI tolerance. Upper-size misses are not
+ * advisory: a candidate rejected by the emergency cutoff can never be promoted
+ * here. Missing/incomplete measurements are deliberately excluded: this is
+ * never a technical-failure bypass.
  */
 function chooseMeasuredToleranceFallback(results, options) {
     options = options || {};
@@ -475,12 +598,6 @@ function chooseMeasuredToleranceFallback(results, options) {
         });
         return { result: qualityPassing[0], mode: 'cambi_only', reason: rejectionFor(qualityPassing[0]).reason };
     }
-    if (allRejectedAs(qualityPassing, 'oversize')) {
-        qualityPassing.sort(function (a, b) {
-            return (Number(a.avgFileSizeMB) - Number(b.avgFileSizeMB)) || cqDesc(a, b) || vmafDesc(a, b);
-        });
-        return { result: qualityPassing[0], mode: 'oversize_only', reason: rejectionFor(qualityPassing[0]).reason };
-    }
     if (options.terminal !== true) return null;
 
     // A real VMAF/frame-floor miss is NOT a reason to encode anyway.
@@ -500,11 +617,10 @@ function chooseMeasuredToleranceFallback(results, options) {
     // validResults empty so the existing "No parameter sets met quality
     // thresholds" give-up path runs and the source is preserved.
     //
-    // Note the size gates cannot be relied on to catch this downstream: the
-    // projected-ratio emergency gate fails open when the projection is null
-    // (chronically 20-70% of jobs), the flow's "Compare File Size Ratio Live"
-    // node wires its pass and fail branches to the same target, and film-grain
-    // synthesis measures its own input rather than the original source.
+    // The exact post-encode and grain-vs-original gates remain downstream
+    // backstops, while the final encoder also has a monotonic current-byte
+    // guard. None of them justify launching an encode whose measured samples
+    // have already crossed the selector's emergency cutoff.
     return null;
 }
 
@@ -624,7 +740,7 @@ var details = function () { return ({
 
             type: 'number',
 
-            defaultValue: '20',
+            defaultValue: '10',
 
             inputUI: {
 
@@ -632,7 +748,7 @@ var details = function () { return ({
 
             },
 
-            tooltip: 'Fixed current delivered minimum: 20% compared with the original (80% output/source cap). Values other than 20 fail closed.',
+            tooltip: 'Fixed current delivered minimum: 10% compared with the original (90% output/source cap). Values other than 10 fail closed.',
 
         },
 
@@ -727,6 +843,100 @@ function shouldApplyFractionalOverride(predictedCq, measuredCq, holdoutAvailable
         && holdoutAvailable === true;
 }
 
+// The sweep clips are selected for compression difficulty, not sampled randomly from
+// the title. This bound is therefore an uncertainty heuristic, not a population CI.
+// It may require an independent holdout or more measurement, but must not silently
+// override a candidate that passed every authoritative measured constraint.
+function measuredCandidateUncertainty(candidate, targetVmaf) {
+    var n = Math.max(1, Number(candidate && candidate.sampleCount) || 1);
+    var sd = finiteNumber(candidate && candidate.vmafStdDev);
+    if (sd === null || sd <= 0) sd = 0.8;
+    var se = Math.max(0.3, sd / Math.sqrt(n));
+    var harmonic = finiteNumber(candidate && candidate.avgVMAF);
+    var lcb = harmonic === null ? null : harmonic - 1.28 * se;
+    return {
+        sampleCount: n,
+        standardDeviation: sd,
+        standardError: se,
+        lcb: lcb,
+        clearsTarget: lcb !== null && lcb >= Number(targetVmaf),
+        role: 'diagnostic_require_independent_validation_when_uncertain',
+    };
+}
+
+function rankMeasuredCandidatesByCompression(candidates) {
+    return (candidates || []).filter(function(candidate) {
+        return candidate.parameterSet &&
+            isFinite(Number(candidate.parameterSet.quality));
+    }).slice().sort(function(a, b) {
+        return Number(b.parameterSet.quality) - Number(a.parameterSet.quality);
+    });
+}
+
+function measuredConstraintBracket(aggregated, policy, evaluator) {
+    var evaluate = evaluator || require('../../_lib/feasibility.js').evaluate;
+    var strictPolicy = Object.assign({}, policy || {}, { requireAuxMetrics: true });
+    var feasible = [];
+    var infeasible = [];
+    for (var i = 0; i < (aggregated || []).length; i++) {
+        var row = aggregated[i];
+        var cq = measuredCandidateCQ(row);
+        if (cq === null) continue;
+        var assessment = evaluate(row, strictPolicy);
+        if (assessment && assessment.feasible === true &&
+                !row.vmafLowerPlausibilityRejection &&
+                !(row.sizeGateDecision && row.sizeGateDecision.action === 'reject')) {
+            feasible.push(cq);
+        } else {
+            infeasible.push(cq);
+        }
+    }
+    feasible.sort(function(a, b) { return a - b; });
+    infeasible.sort(function(a, b) { return a - b; });
+    var highestFeasible = feasible.length ? feasible[feasible.length - 1] : null;
+    var firstRejectedAbove = null;
+    if (highestFeasible !== null) {
+        for (var j = 0; j < infeasible.length; j++) {
+            if (infeasible[j] > highestFeasible) {
+                firstRejectedAbove = infeasible[j];
+                break;
+            }
+        }
+    }
+    return {
+        highestFeasible: highestFeasible,
+        firstRejectedAbove: firstRejectedAbove,
+    };
+}
+
+// A VMAF/CAMBI-only holdout cannot authenticate SSIMULACRA2, Butteraugli, CVVDP,
+// SSIM, or XPSNR. Therefore a harder CQ may only become authoritative when that exact
+// CQ already has a complete measured row passing every enabled binding constraint.
+// The damped secant loop normally creates that row; prediction remains telemetry.
+function assessMeasuredBindingAuthority(aggregated, proposedCq, policy, evaluator) {
+    var proposed = finiteNumber(proposedCq);
+    if (proposed === null) return { allowed: false, reason: 'proposed CQ is non-finite' };
+    var exact = null;
+    for (var i = 0; i < (aggregated || []).length; i++) {
+        var cq = measuredCandidateCQ(aggregated[i]);
+        if (cq !== null && Math.abs(cq - proposed) < 0.0001) {
+            exact = aggregated[i];
+            break;
+        }
+    }
+    if (!exact) {
+        return { allowed: false, reason: 'exact CQ lacks a full measured binding-metric row' };
+    }
+    var strictPolicy = Object.assign({}, policy || {}, { requireAuxMetrics: true });
+    var evaluate = evaluator || require('../../_lib/feasibility.js').evaluate;
+    var assessment = evaluate(exact, strictPolicy);
+    return {
+        allowed: assessment && assessment.feasible === true,
+        reason: assessment && assessment.reason ? assessment.reason : 'binding evaluation unavailable',
+        evaluation: assessment || null,
+    };
+}
+
 function assessHoldoutSkipShadow(candidate, policy) {
     candidate = candidate || {};
     policy = policy || {};
@@ -801,19 +1011,19 @@ function appendHoldoutShadowRecord(args, record) {
     }
 }
 
-// ── Size-gate policy (90% gate demoted to shadow, 2026-07-20) ──
+// ── Size-gate policy (projection and delivery limits separated) ──
 // The legacy >=90% projected-ratio hard reject was never prospectively validated: every
-// candidate it rejected was censored (no final-size label ever produced), and on the 82
-// labelled accepted jobs since 2026-07-10 the projection shows MAE 5.46pp, p90 |error|
-// 11.56pp, max overprediction 16.39pp. Policy now:
+// candidate it rejected was censored (no final-size label ever produced). The projection
+// also has observed two-sided error, so a projection at the real-byte delivery boundary is
+// not proof that the completed file will fail that boundary. Policy:
 //   - projected >= emergencyRatioPct (default 110): hard reject. Even the worst observed
 //     overprediction cannot bring a >=110% projection under the 90% benefit cap, so these
 //     are all-risk-no-benefit encodes (e.g. Nino 2026-07-18: best quality-passing CQ
 //     projected 120.8%).
-//   - legacyRatioPct (default 90) <= projected < emergencyRatioPct: shadow band. Allowed
-//     through while the bounded forced-full label budget lasts so the live size monitor
-//     produces the first uncensored labels for this region; when the budget is exhausted
-//     the legacy hard reject resumes.
+//   - legacyRatioPct (default 90) <= projected < emergencyRatioPct: always allowed through
+//     to the full transcode. The monotonic actual-byte guard remains authoritative. The
+//     bounded reservation ledger controls label telemetry only; exhaustion or telemetry
+//     failure must never turn this uncertain projection back into a hard rejection.
 //   - below legacyRatioPct: unaffected.
 function evaluateSizeGate(projectedRatioPct, options) {
     options = options || {};
@@ -849,10 +1059,13 @@ function evaluateSizeGate(projectedRatioPct, options) {
         return { action: 'reject', band: 'emergency', forcedFull: false, legacyWouldReject: true };
     }
     if (ratio >= legacy) {
-        if (remaining > 0) {
-            return { action: 'allow', band: 'shadow', forcedFull: true, legacyWouldReject: true };
-        }
-        return { action: 'reject', band: 'shadow_budget_exhausted', forcedFull: false, legacyWouldReject: true };
+        return {
+            action: 'allow',
+            band: 'shadow',
+            forcedFull: true,
+            legacyWouldReject: true,
+            labelBudgetAvailable: remaining > 0,
+        };
     }
     return { action: 'allow', band: 'clear', forcedFull: false, legacyWouldReject: false };
 }
@@ -1190,26 +1403,18 @@ function requiresForcedFullReservation(bestParams, legacyRatioPct, emergencyRati
     return isFinite(projected) && projected >= legacyRatioPct && projected < emergencyRatioPct;
 }
 
-function forcedFullDeniedResult(args, reservation, bestParams) {
-    delete args.variables.vmafBestParameters;
-    delete args.variables.vmafFinalSelectedCQ;
-    delete args.variables.vmafSelectedParameterSetId;
-    args.variables.vmafSizeGateForcedFull = false;
+function noteForcedFullReservationFailure(args, reservation, bestParams) {
+    args.variables.vmafSizeGateForcedFull = true;
     args.variables.vmafSizeGateForcedFullReservationFailure = reservation.code;
     args.variables.vmafSizeGateForcedFullReservationError = reservation.error;
-    args.variables.vmafSelectOutput = 2;
     var projected = Number(bestParams && bestParams.projectedOutputRatioPct);
     try {
-        args.jobLog('SIZE-GATE FORCED-FULL DENIED (fail closed): selected CQ '
+        args.jobLog('SIZE-GATE LABEL RESERVATION UNAVAILABLE (non-fatal): selected CQ '
             + (bestParams && bestParams.parameterSet && bestParams.parameterSet.quality)
             + ' projected ' + (isFinite(projected) ? projected.toFixed(1) : 'unknown') + '%; '
-            + reservation.code + ': ' + reservation.error);
+            + reservation.code + ': ' + reservation.error
+            + '. Full transcode remains allowed; the monotonic actual-byte guard is authoritative.');
     } catch (_) {}
-    return {
-        outputFileObj: args.inputFileObj,
-        outputNumber: 2,
-        variables: args.variables,
-    };
 }
 
 function commitForcedFullSelection(args, bestParams, options) {
@@ -1226,6 +1431,7 @@ function commitForcedFullSelection(args, bestParams, options) {
     var reservation = null;
     if (requiresForcedFullReservation(bestParams,
         Number(options.legacyRatioPct), Number(options.emergencyRatioPct))) {
+        args.variables.vmafSizeGateForcedFull = true;
         var capResolution = options.capResolution;
         reservation = capResolution && !capResolution.ok
             ? capResolution
@@ -1240,16 +1446,13 @@ function commitForcedFullSelection(args, bestParams, options) {
                 : forcedFullFailure('reservation_identity_unavailable',
                     options.reservationReadError || 'stable job identity is unavailable'));
         if (!reservation.ok) {
-            return {
-                ok: false,
-                reservation: reservation,
-                result: forcedFullDeniedResult(args, reservation, bestParams),
-            };
+            noteForcedFullReservationFailure(args, reservation, bestParams);
+            reservation = null;
+        } else {
+            args.variables.vmafSizeGateForcedFullJobHash = options.jobIdentityHash;
+            args.variables.vmafSizeGateForcedFullReservationSlot = reservation.slot;
+            args.variables.vmafSizeGateForcedFullReservationStatus = reservation.status;
         }
-        args.variables.vmafSizeGateForcedFull = true;
-        args.variables.vmafSizeGateForcedFullJobHash = options.jobIdentityHash;
-        args.variables.vmafSizeGateForcedFullReservationSlot = reservation.slot;
-        args.variables.vmafSizeGateForcedFullReservationStatus = reservation.status;
     }
     var selection = publishFinalSelection(args.variables, bestParams, validatedSelection);
     return {
@@ -1424,58 +1627,6 @@ var plugin = function (args) {
             meanFloor: configuredMeanFloor, sampleDuration: Math.max(1, Number(vars.vmafSegmentDuration || 5))
 
         };
-
-    }
-
-    function estimateCandidateSizeMetrics(candidate, policy) {
-
-        var sampleMB = Number(candidate.avgFileSizeMB || 0);
-
-        // Preferred method: per-clip compression ratio (encoded sample bytes / ORIGINAL bytes of
-        // the SAME clips, both video-only) scaled to the full source size. Hardness-first
-        // sampling (2026-07-04) makes measured clips the hardest/highest-bitrate ones, so the
-        // legacy duration extrapolation of their absolute size systematically inflates
-        // projections (Hail Mary 2026-07-07: projected 122% vs ~60% observed live). The ratio is
-        // far less hardness-sensitive because source bytes of hard clips are inflated too.
-        // Slight underestimate (~1-3%) from copied audio; the post-transcode actual-size check
-        // remains the authority for >100% outputs.
-        var projectedMB = 0;
-
-        try {
-            var _osMap = policy.originalSampleMBByIndex || null;
-            if (_osMap && sampleMB > 0 && policy.sourceSizeMB > 0) {
-                var _mIdx = (candidate.clipSampleIndices || []).filter(function (x) { return _osMap[x] != null; });
-                var _oSum = 0, _oN = 0;
-                if (_mIdx.length > 0) {
-                    for (var _oi = 0; _oi < _mIdx.length; _oi++) { _oSum += _osMap[_mIdx[_oi]]; _oN++; }
-                } else {
-                    // Unaligned fallback (revived/legacy candidates without clipSampleIndices):
-                    // all-sample original mean; residual hardness bias is conservative (inflates).
-                    for (var _ok in _osMap) { _oSum += _osMap[_ok]; _oN++; }
-                }
-                if (_oN > 0 && _oSum > 0) {
-                    projectedMB = (sampleMB / (_oSum / _oN)) * policy.sourceSizeMB;
-                }
-            }
-        } catch (_prjErr) { projectedMB = 0; }
-
-        if (!(projectedMB > 0)) projectedMB = (policy.duration > 0 && policy.sampleDuration > 0)
-
-            ? sampleMB * (policy.duration / policy.sampleDuration) : 0;
-
-        var outputMbps = projectedMB > 0 && policy.duration > 0
-
-            ? projectedMB * 1024 * 1024 * 8 / policy.duration / 1000000 : 0;
-
-        var outputBpp = outputMbps > 0 && policy.width > 0 && policy.height > 0 && policy.fps > 0
-
-            ? outputMbps * 1000000 / (policy.width * policy.height * policy.fps) : 0;
-
-        var projectedRatioPct = projectedMB > 0 && policy.sourceSizeMB > 0
-
-            ? projectedMB / policy.sourceSizeMB * 100 : 0;
-
-        return { projectedMB: projectedMB, outputMbps: outputMbps, outputBpp: outputBpp, projectedRatioPct: projectedRatioPct };
 
     }
 
@@ -1766,6 +1917,7 @@ var plugin = function (args) {
         var holdoutVmafArgs = buildHoldoutVmafArgs({
             distortedPath: distortedPath,
             referencePath: holdout.path,
+            encoder: encoder,
             referenceCuvid: refCuvid,
             scoringPixelFormat: holdoutMetricContract.scoringPixelFormat,
             filterName: holdoutMetricContract.filterName,
@@ -1940,6 +2092,18 @@ var plugin = function (args) {
                             avgCAMBI: _cjrRow.cambi_mean != null ? Number(_cjrRow.cambi_mean) : null,
                             maxCAMBI: _cjrRow.cambi_max != null ? Number(_cjrRow.cambi_max) : null,
                             p95CAMBI: _cjrRow.cambi_p95 != null ? Number(_cjrRow.cambi_p95) : null,
+                            avgSSIM: _cjrRow.ssim != null ? Number(_cjrRow.ssim) : null,
+                            minXPSNR: _cjrRow.xpsnr_min != null ? Number(_cjrRow.xpsnr_min) : null,
+                            avgXPSNRWeighted: _cjrRow.xpsnr_weighted != null ? Number(_cjrRow.xpsnr_weighted) : null,
+                            avgPSNR: _cjrRow.psnr_avg != null ? Number(_cjrRow.psnr_avg) : null,
+                            ssimulacra2: _cjrRow.ssimulacra2 != null ? Number(_cjrRow.ssimulacra2) : null,
+                            ssimulacra2P5: _cjrRow.ssimulacra2_p5 != null ? Number(_cjrRow.ssimulacra2_p5) : null,
+                            butteraugliNormInf: _cjrRow.butteraugli_norm_inf != null
+                                ? Number(_cjrRow.butteraugli_norm_inf) : null,
+                            butteraugli: _cjrRow.butteraugli_norm3 != null
+                                ? Number(_cjrRow.butteraugli_norm3) : null,
+                            cvvdp: _cjrRow.cvvdp != null ? Number(_cjrRow.cvvdp) : null,
+                            gpuPerceptualContractId: _cjrRow.gpu_perceptual_contract_id || null,
                             avgFileSizeMB: Number(_cjrRow.avg_size_mb),
                             sampleCount: _cjrRow.sample_count != null ? Number(_cjrRow.sample_count) : null,
                             clipSampleIndices: _cjrIndices,
@@ -2174,23 +2338,19 @@ var plugin = function (args) {
     args.variables.vmafCambiAvailable = metricContract.cambi.required === true;
     args.variables.vmafCambiUnavailableReason = metricContract.cambi.reasonCode || null;
 
-    // Original (source) sample sizes by sampleIndex, feeding the ratio-based size projection in
-    // estimateCandidateSizeMetrics. Samples are video-only stream copies that persist in the
-    // workDir across sweep attempts, so revived cross-attempt candidates resolve too.
+    // Original source sample sizes by sampleIndex, feeding the ratio-based size projection.
+    // Do not derive this map from vmafTestResults.originalSamplePath: on the canonical-denoise
+    // path that field is the lossless FFV1 quality reference, not the compressed source clip.
     try {
         var _osFs = require('fs');
-        var _osMap = {};
-        var _osTests = args.variables.vmafTestResults || [];
-        for (var _osI = 0; _osI < _osTests.length; _osI++) {
-            var _osT = _osTests[_osI];
-            if (!_osT || _osT.sampleIndex == null || !_osT.originalSamplePath) continue;
-            if (_osMap[_osT.sampleIndex] != null) continue;
-            try { _osMap[_osT.sampleIndex] = _osFs.statSync(_osT.originalSamplePath).size / (1024 * 1024); } catch (_osSt) {}
-        }
+        var _osMap = buildOriginalSourceSampleSizeMap(args.variables, _osFs);
         var _osN = Object.keys(_osMap).length;
         if (_osN > 0) {
             qualityRiskPolicy.originalSampleMBByIndex = _osMap;
-            args.jobLog('Size projection: per-clip compression ratio vs ' + _osN + ' original sample size(s) (hardness-bias corrected)');
+            args.jobLog('Size projection: per-clip compression ratio vs ' + _osN
+                + ' authenticated original-source sample size(s) (lossless references excluded)');
+        } else {
+            args.jobLog('Size projection: authenticated original-source samples unavailable; using encoded-duration extrapolation');
         }
     } catch (_osErr) {
         args.jobLog('Original-sample size map unavailable (non-fatal, using duration extrapolation): ' + _osErr.message);
@@ -2314,9 +2474,27 @@ var plugin = function (args) {
 
     args.jobLog('');
 
-    // All tests now use 10-bit format
-
-    var recommendedPixFmt = 'p010le';
+    // Product contract: every AV1 delivery is 10-bit, including 8-bit SDR.
+    // The sweep publishes its measured format explicitly so backend differences
+    // cannot silently reintroduce an 8-bit delivery domain.
+    var recommendedPixFmt = pixelFormatContract.AV1_DELIVERY_PIX_FMT;
+    var measuredPixFmt = String(args.variables.vmafMeasurementPixFmt || '').trim();
+    if (!measuredPixFmt) {
+        var measuredFormats = parameterSets.map(function (set) {
+            return String(set && set.pixFmt || '').trim().toLowerCase();
+        }).filter(Boolean).filter(function (value, index, values) {
+            return values.indexOf(value) === index;
+        });
+        if (measuredFormats.length === 1) measuredPixFmt = measuredFormats[0];
+    }
+    var measuredDepth = pixelFormatContract.outputDepthForPixelFormat(measuredPixFmt);
+    var recommendedDepth = pixelFormatContract.outputDepthForPixelFormat(recommendedPixFmt);
+    if (measuredDepth !== recommendedDepth) {
+        throw new Error('AV1 measurement/delivery bit-depth contract mismatch: measured ' +
+            measuredPixFmt + ' (' + measuredDepth + '-bit), selected ' +
+            recommendedPixFmt + ' (' + recommendedDepth + '-bit)');
+    }
+    var encoderDomainBridge = null;
 
     args.jobLog('=== VMAF Quality Thresholds ===');
 
@@ -2374,14 +2552,44 @@ var plugin = function (args) {
         })
         : null;
     args.variables.vmafEffectiveCambiLimit = sharedCambiLimit;
-    args.variables.vmafSelectorPolicyVersion = 'selector-authoritative-v2';
+    args.variables.vmafSelectorPolicyVersion = 'selector-authoritative-v5-ssim2p5-exact-holdout';
+
+    // SSIMULACRA2 mean and lower-tail evidence are mandatory for authoritative selection.
+    // The current-contract replay found visually weak Upright encodes clustered just above
+    // the former mean-80 boundary, and one selected CQ had no SSIMULACRA2 measurement at all.
+    // Other auxiliary metrics remain advisory when a backend cannot produce them.
+    var sharedSsimFloor = feasibility.resolveAuxFloor(args, 'vmafSsimFloor', 'ssimFloor',
+        feasibility.DEFAULT_SSIM_FLOOR);
+    var sharedXpsnrFloor = feasibility.resolveAuxFloor(args, 'vmafXpsnrFloor', 'xpsnrFloor',
+        feasibility.DEFAULT_XPSNR_FLOOR);
+    args.variables.vmafEffectiveSsimFloor = sharedSsimFloor;
+    args.variables.vmafEffectiveXpsnrFloor = sharedXpsnrFloor;
+    var sharedSsimulacra2Floor = feasibility.resolveAuxFloor(args, 'vmafSsimulacra2Floor',
+        'ssimulacra2Floor', feasibility.DEFAULT_SSIMULACRA2_FLOOR);
+    var sharedSsimulacra2P5Floor = feasibility.resolveAuxFloor(args, 'vmafSsimulacra2P5Floor',
+        'ssimulacra2P5Floor', feasibility.DEFAULT_SSIMULACRA2_P5_FLOOR);
+    var sharedButteraugliCeiling = feasibility.resolveAuxFloor(args, 'vmafButteraugliCeiling',
+        'butteraugliCeiling', feasibility.DEFAULT_BUTTERAUGLI_CEILING);
+    var sharedCvvdpFloor = feasibility.resolveAuxFloor(args, 'vmafCvvdpFloor',
+        'cvvdpFloor', feasibility.DEFAULT_CVVDP_FLOOR);
+    args.variables.vmafEffectiveSsimulacra2Floor = sharedSsimulacra2Floor;
+    args.variables.vmafEffectiveSsimulacra2P5Floor = sharedSsimulacra2P5Floor;
+    args.variables.vmafEffectiveButteraugliCeiling = sharedButteraugliCeiling;
+    args.variables.vmafEffectiveCvvdpFloor = sharedCvvdpFloor;
 
     var sharedQualityPolicy = {
         targetVmaf: adjustedMinVMAF,
         vmafMetric: 'harmonic',
         requireVmafMean: true,
         vmafP1Floor: adjustedMinFrameVMAF > 0 ? adjustedMinFrameVMAF : null,
-        cambiLimit: sharedCambiLimit
+        cambiLimit: sharedCambiLimit,
+        ssimFloor: sharedSsimFloor,
+        xpsnrFloor: sharedXpsnrFloor,
+        ssimulacra2Floor: sharedSsimulacra2Floor,
+        ssimulacra2P5Floor: sharedSsimulacra2P5Floor,
+        butteraugliCeiling: sharedButteraugliCeiling,
+        cvvdpFloor: sharedCvvdpFloor,
+        requiredAuxMetrics: ['ssimulacra2', 'ssimulacra2P5']
     };
 
     // Size-gate demotion policy (see evaluateSizeGate for rationale). The private
@@ -2393,6 +2601,8 @@ var plugin = function (args) {
     if (!isFinite(sizeGateEmergencyPct) || sizeGateEmergencyPct <= sizeGateLegacyPct) {
         sizeGateEmergencyPct = Math.max(110, sizeGateLegacyPct);
     }
+    var sizeGateDeliveryPct = Number(args.variables.vmafMaxFinalOutputRatioPct);
+    if (!isFinite(sizeGateDeliveryPct) || sizeGateDeliveryPct <= 0) sizeGateDeliveryPct = 90;
     resetForcedFullAttemptState(args.variables);
     var sizeGateCapResolution = resolveForcedFullCap(args.variables.vmafSizeGateForcedFullCap);
     var sizeGateForcedFullCap = sizeGateCapResolution.ok ? sizeGateCapResolution.cap : 0;
@@ -2424,13 +2634,15 @@ var plugin = function (args) {
             ? 1
             : Math.max(0, sizeGateForcedFullCap - sizeGateForcedFullUsed))
         : 0;
-    args.jobLog('Size gate: legacy ' + sizeGateLegacyPct + '% cap demoted to shadow; hard emergency cutoff '
+    args.jobLog('Size gate: projections from ' + sizeGateLegacyPct + '% through '
+        + (sizeGateEmergencyPct - 0.1).toFixed(1) + '% run under the actual-byte delivery guard; hard emergency cutoff '
         + sizeGateEmergencyPct + '%; forced-full label budget used ' + sizeGateForcedFullUsed
         + '/' + sizeGateForcedFullCap
         + (sizeGateReservationSnapshot && sizeGateReservationSnapshot.ownedSlot !== null
             ? ' (this job already owns slot ' + sizeGateReservationSnapshot.ownedSlot + ')' : '')
         + (sizeGateReservationReadError
-            ? ' (reservation ledger unavailable; shadow band fails closed: ' + sizeGateReservationReadError + ')' : ''));
+            ? ' (reservation ledger unavailable; label telemetry disabled: ' + sizeGateReservationReadError + ')' : '')
+        + '; actual-byte delivery cap ' + sizeGateDeliveryPct + '%; label-budget state never changes the allow decision');
 
     var validResults = [];
 
@@ -2441,6 +2653,7 @@ var plugin = function (args) {
     delete args.variables.vmafToleranceFallbackCQ;
     delete args.variables.vmafToleranceFallbackHoldoutMiss;
     args.variables.vmafLowerPlausibilityAdvisories = [];
+    args.variables.vmafLowerPlausibilityRejections = [];
 
     // Keep rejected sets (with the reason) so the decision summary can explain why a more
     // aggressive (higher) CQ was not chosen.
@@ -2512,8 +2725,7 @@ var plugin = function (args) {
             // this shared evaluation now owns only the too-small quality-risk floors.
             var sharedSizeEvaluation = feasibility.evaluate(result, {
                 minOutputRatioPct: qualityRiskPolicy.minOutputRatioPct,
-                minOutputBpp: qualityRiskPolicy.minOutputBpp,
-                minOutputMbps: qualityRiskPolicy.minOutputMbps
+                minOutputBpp: qualityRiskPolicy.minOutputBpp
             });
             var lowerPlausibilityMessage = !sharedSizeEvaluation.feasible
                 ? 'Shared feasibility: ' + sharedSizeEvaluation.reason : null;
@@ -2524,9 +2736,7 @@ var plugin = function (args) {
 
             var mbpsLow = sizeMetrics.outputMbps > 0 && sizeMetrics.outputMbps < qualityRiskPolicy.minOutputMbps;
 
-            var severeBppLow = sizeMetrics.outputBpp > 0 && sizeMetrics.outputBpp < qualityRiskPolicy.minOutputBpp * 0.75;
-
-            if ((ratioLow && (bppLow || mbpsLow)) || severeBppLow) {
+            if (ratioLow || bppLow) {
 
                 lowerPlausibilityMessage = 'Projected output too small for ' + qualityRiskPolicy.tier
 
@@ -2542,32 +2752,45 @@ var plugin = function (args) {
 
             }
 
-            // These lower bitrate/ratio floors are model plausibility checks, not evidence of
-            // corruption. Once the measured harmonic and frame-quality gates above pass, keep
-            // the candidate eligible and let the normal target selector choose the smallest
-            // quality-preserving CQ. A quality-saturated HDR canary exposed why this matters: every
-            // CQ had excellent measured VMAF while the sample-size projection claimed 0.5-3.1%
-            // of source and would otherwise waste four downward retries before keeping HEVC.
+            // Absolute Mbps is retained as telemetry, not an independent veto. BPP already
+            // normalizes the same byte rate for coded width, coded height and frame rate.
+            // Making both bind double-counts bitrate and rejects cropped 1080p titles such as
+            // 1920x800 sources even when ratio, BPP and every measured quality metric pass.
+            if (!ratioLow && !bppLow && mbpsLow) {
+                result.vmafLowerPlausibilityAdvisory = 'Projected output is below the legacy ' +
+                    'absolute bitrate floor (' + (sizeMetrics.outputMbps || 0).toFixed(2) +
+                    ' < ' + qualityRiskPolicy.minOutputMbps.toFixed(2) +
+                    ' Mbps), but normalized ratio/BPP safeguards pass';
+                args.jobLog('SIZE ADVISORY for ' + result.parameterSetId + ': ' +
+                    result.vmafLowerPlausibilityAdvisory + '. Candidate remains eligible.');
+            }
+
+            // A quality metric can be over-optimistic on a small or unrepresentative clip set.
+            // Ratio and normalized BPP remain independently binding. Absolute Mbps is advisory
+            // because it is an aspect-ratio-blind restatement of the BPP signal.
             if (lowerPlausibilityMessage) {
-                result.vmafLowerPlausibilityAdvisory = lowerPlausibilityMessage;
-                args.variables.vmafLowerPlausibilityAdvisories.push({
+                delete result.vmafLowerPlausibilityAdvisory;
+                result.vmafLowerPlausibilityRejection = lowerPlausibilityMessage;
+                args.variables.vmafLowerPlausibilityRejections.push({
                     parameterSetId: result.parameterSetId,
                     cq: result.parameterSet && result.parameterSet.quality,
                     reason: lowerPlausibilityMessage
                 });
-                args.jobLog('⚠ LOWER-SIZE PLAUSIBILITY ADVISORY for ' + result.parameterSetId + ': '
-                    + lowerPlausibilityMessage + '. Measured VMAF/frame quality passed; candidate remains eligible.');
+                rejected = true;
+                rejectReason = lowerPlausibilityMessage;
+                args.jobLog('✗ LOWER-SIZE QUALITY-RISK REJECTION for ' + result.parameterSetId + ': '
+                    + lowerPlausibilityMessage + '. Retrying a lower CQ; source is preserved if no CQ passes.');
             }
 
-            // Size gate (demoted 2026-07-20): the legacy >=90% projection cap is shadow-only.
-            // Hard rejection only at the emergency cutoff; the shadow band passes through as a
-            // bounded forced-full label-collection cohort (live size monitor stays the kill
-            // switch). See evaluateSizeGate for the validation evidence.
+            // The legacy >=90% projection cap is shadow-only. Hard rejection occurs only at
+            // the emergency cutoff. Every shadow-band candidate may run under the monotonic
+            // actual-byte guard; the bounded reservation ledger is telemetry, not admission.
             if (!rejected && sizeMetrics.projectedRatioPct > 0) {
 
                 var sizeGateDecision = evaluateSizeGate(sizeMetrics.projectedRatioPct, {
                     legacyRatioPct: sizeGateLegacyPct,
                     emergencyRatioPct: sizeGateEmergencyPct,
+                    deliveryRatioPct: sizeGateDeliveryPct,
                     forcedFullRemaining: sizeGateForcedFullRemaining
                 });
                 result.sizeGateDecision = sizeGateDecision;
@@ -2588,8 +2811,10 @@ var plugin = function (args) {
 
                     args.jobLog('SIZE-GATE SHADOW: ' + result.parameterSetId + ' projected '
                         + sizeMetrics.projectedRatioPct.toFixed(1) + '% would have been rejected by the retired '
-                        + sizeGateLegacyPct + '% gate; allowed for forced-full label collection (budget remaining '
-                        + sizeGateForcedFullRemaining + ')');
+                        + sizeGateLegacyPct + '% gate; full transcode allowed under the actual-byte guard'
+                        + (sizeGateDecision.labelBudgetAvailable
+                            ? ' (label budget remaining ' + sizeGateForcedFullRemaining + ')'
+                            : ' (label budget exhausted or unavailable; admission unchanged)'));
 
                 }
 
@@ -2666,6 +2891,11 @@ var plugin = function (args) {
 
     if (validResults.length === 0) {
 
+        args.variables.vmafPolicyGateOnlyBlock = aggregatedResults.length > 0 &&
+            aggregatedResults.every(function (result) {
+                return Boolean(result && result.vmafLowerPlausibilityRejection);
+            });
+
         var retryCount = args.variables.vmafRetryCount || 0;
 
         var maxRetries = args.variables.vmafMaxRetries || 4;
@@ -2679,8 +2909,9 @@ var plugin = function (args) {
             return cq !== null && cq <= 16.5;
         });
 
-        // CAMBI-only and oversize-model-only misses have a useful measured answer now;
-        // descending CQ cannot turn either model tolerance into an integrity property.
+        // A CAMBI-only miss can have a useful measured answer now because the source
+        // may itself exceed the prescribed tolerance. Oversize rejection is deliberately
+        // non-overridable: keeping the source is always smaller than that candidate.
         // Actual VMAF/frame-floor misses still use the retry search, then ship the most
         // source-like technically complete measurement at the encoder floor/budget limit.
         var toleranceFallback = chooseMeasuredToleranceFallback(aggregatedResults, {
@@ -3148,39 +3379,27 @@ var plugin = function (args) {
 
     if (strategy === 'target-balanced') {
 
-        // Explicit constrained optimisation: choose the HIGHEST CQ (smallest file) whose
+        // Every entry in candidates has already passed the shared measured quality, auxiliary,
+        // lower-size and emergency-size feasibility contract. Select the highest measured CQ.
+        // The old LCB is retained as an uncertainty diagnostic only: these clips are deliberately
+        // hardness-selected rather than a probability sample, and the independent holdout below
+        // is the authoritative validation when the four-clip estimate is uncertain.
 
-        // lower confidence bound on mean VMAF still clears the target, and whose worst-case
+        selectionMethod = 'Shared-feasibility (highest fully measured CQ; LCB diagnostic, holdout authoritative)';
 
-        // frame statistic clears the floor. Scale-invariant (no megabyte-weighted scoring),
-
-        // so it behaves identically for 720p and 4K content.
-
-        selectionMethod = 'Target-floor (highest CQ with LCB >= target, worst-case floor, SSIM veto)';
-
-        var Z_LCB = 1.28; // 90% one-sided confidence on the mean
-
-        var ranked = candidates.filter(function(r) {
-
-            return r.parameterSet && isFinite(Number(r.parameterSet.quality));
-
-        }).slice().sort(function(a, b) { return Number(b.parameterSet.quality) - Number(a.parameterSet.quality); });
-
-        var fallbackBest = null;
+        var ranked = rankMeasuredCandidatesByCompression(candidates);
 
         for (var ci = 0; ci < ranked.length; ci++) {
 
             var cand = ranked[ci];
 
-            var nSamp = Math.max(1, cand.sampleCount || 1);
+            var uncertainty = measuredCandidateUncertainty(cand, targetVMAF);
 
-            var sdC = (cand.vmafStdDev !== undefined && cand.vmafStdDev !== null && isFinite(cand.vmafStdDev) && cand.vmafStdDev > 0)
+            var nSamp = uncertainty.sampleCount;
 
-                ? cand.vmafStdDev : 0.8;
+            var seC = uncertainty.standardError;
 
-            var seC = Math.max(0.3, sdC / Math.sqrt(nSamp));
-
-            var lcb = cand.avgVMAF - Z_LCB * seC;
+            var lcb = uncertainty.lcb;
 
             var floorStatC = (cand.vmafP1Low !== null && cand.vmafP1Low !== undefined && isFinite(cand.vmafP1Low))
 
@@ -3188,30 +3407,7 @@ var plugin = function (args) {
 
                 : ((cand.minVMAF !== null && cand.minVMAF !== undefined) ? cand.minVMAF : null);
 
-            var floorOk = !(adjustedMinFrameVMAF > 0 && floorStatC !== null && floorStatC < adjustedMinFrameVMAF);
-
-            var lowerModelAdvisory = !!cand.vmafLowerPlausibilityAdvisory;
-            var eligible = (lowerModelAdvisory ? cand.avgVMAF >= targetVMAF : lcb >= targetVMAF) && floorOk;
-
-            if (eligible && bestParams && lcb >= bestParams.lcb - 0.3) {
-
-                var cw = Math.max(Number(cand.avgCAMBI||0), Number(cand.p95CAMBI||0));
-
-                var bw = Math.max(Number(bestParams.avgCAMBI||0), Number(bestParams.p95CAMBI||0));
-
-                if (cw < bw - 0.1) {
-
-                    args.jobLog('  CAMBI tiebreak: ' + cand.parameterSetId
-
-                        + ' (CAMBI ' + cw.toFixed(2) + ' < ' + bw.toFixed(2) + ')');
-
-                    bestParams = cand;
-
-                    eligible = false;
-
-                }
-
-            }
+            var lcbClear = uncertainty.clearsTarget;
 
             args.jobLog(cand.parameterSetId + ': CQ=' + cand.parameterSet.quality
 
@@ -3231,31 +3427,28 @@ var plugin = function (args) {
 
                 + ', proj=' + ((cand.projectedOutputRatioPct || 0).toFixed(1)) + '%/' + ((cand.projectedOutputMbps || 0).toFixed(2)) + 'Mbps/BPP' + ((cand.projectedOutputBpp || 0).toFixed(4))
 
-                + (eligible ? ' [eligible]' : '')
-                + (lowerModelAdvisory ? ' [lower-size model advisory: measured VMAF/frame floors authoritative]' : '')
-
+                + (ci === 0 ? ' [selected-highest-feasible]' : '')
+                + (lcbClear ? ' [LCB-clear]' : ' [LCB-uncertain: holdout required]')
                 + (cand.avgCAMBI !== null && cand.avgCAMBI !== undefined
 
                     ? ' CAMBI_w=' + Math.max(Number(cand.avgCAMBI||0),Number(cand.p95CAMBI||0)).toFixed(3) : ''));
 
-            if (eligible && !bestParams) {
+            if (!bestParams) {
 
                 bestParams = cand;
 
-            }
+                args.variables.vmafSelectionUncertainty = uncertainty;
 
-            if (!fallbackBest) fallbackBest = cand;
+                args.variables.vmafSelectionLcbClear = lcbClear;
+
+            }
 
         }
 
-        if (!bestParams && fallbackBest) {
-
-            args.jobLog('No candidate clears the lower confidence bound; using highest passing CQ '
-
-                + fallbackBest.parameterSet.quality + ' (mean cleared the target but confidence is thin)');
-
-            bestParams = fallbackBest;
-
+        if (bestParams && args.variables.vmafSelectionLcbClear !== true) {
+            args.jobLog('UNCERTAINTY ADVISORY: selected CQ ' + bestParams.parameterSet.quality
+                + ' passed every measured constraint but its hardness-sample LCB crosses the target;'
+                + ' this is not a title-wide confidence interval, so the independent holdout remains authoritative.');
         }
 
         // SSIM disagreement veto: if SSIM collapses disproportionately at the chosen CQ
@@ -3464,6 +3657,12 @@ var plugin = function (args) {
 
     if (bestParams) {
 
+        // XPSNR second opinion on the winner. This duplicate synchronous decode is disabled
+        // by default together with the uncalibrated default floor; it remains available
+        // only when an operator explicitly configures an XPSNR floor for this contract.
+
+        if (sharedXpsnrFloor !== null) {
+
         // XPSNR second opinion on the winner: a perceptually-weighted PSNR variant that
 
         // catches banding/chroma damage in flat and dark regions where VMAF over-scores.
@@ -3474,7 +3673,11 @@ var plugin = function (args) {
 
             var xpSpawnSync = require('child_process').spawnSync;
 
-            var xpTests = (args.variables.vmafTestResults || []).filter(function(t) {
+            var xpSamples = args.variables.vmafSamples || [];
+            var xpTests = (args.variables.vmafTestResults || []).map(function(t) {
+                if (!t || t.originalSamplePath) return t;
+                return Object.assign({}, t, { originalSamplePath: xpSamples[t.sampleIndex] || null });
+            }).filter(function(t) {
 
                 return t && t.parameterSetId === bestParams.parameterSetId && t.outputPath && t.originalSamplePath;
 
@@ -3489,7 +3692,8 @@ var plugin = function (args) {
                     // XPSNR prints its summary on stderr. Capture both streams
                     // directly instead of asking a shell to merge descriptors.
                     var xpRun = xpSpawnSync(args.ffmpegPath, buildXpsnrArgs(
-                        xpTests[xi].outputPath, xpTests[xi].originalSamplePath
+                        xpTests[xi].outputPath, xpTests[xi].originalSamplePath,
+                        bestParams.parameterSet && bestParams.parameterSet.encoder
                     ), {
                         encoding: 'utf8',
                         stdio: 'pipe',
@@ -3571,9 +3775,11 @@ var plugin = function (args) {
 
         }
 
-        // Fractional CQ refinement: av1_nvenc accepts fractional -cq values, so instead of
+        }
 
-        // settling for the tested integer CQ (often a whole step of headroom above target),
+        // Fractional CQ refinement is local to the measured boundary. Historical attested NVENC
+        // pairs show that neighbouring tenths often produce different bytes and metrics, so do
+        // not collapse this final refinement to an integer grid.
 
         // interpolate between the selected CQ and the next higher tested CQ to land just
 
@@ -3582,6 +3788,8 @@ var plugin = function (args) {
         // safety margin and a min-frame-VMAF guard.
 
         var preFractionalRefinementParams = bestParams;
+
+        var nvencIntegerCqGrid = false;
 
         var primaryHoldoutEnabled = args.inputs.enableHoldoutValidation !== false
             && args.inputs.enableHoldoutValidation !== 'false';
@@ -3694,7 +3902,7 @@ var plugin = function (args) {
 
             var interpTarget = adjustedMinVMAF + interpMargin;
 
-            if (!args.variables.vmafToleranceFallbackActive && primaryHoldoutAvailable
+            if (!nvencIntegerCqGrid && !args.variables.vmafToleranceFallbackActive && primaryHoldoutAvailable
                 && selPt && nextPt && selPt.vmaf > interpTarget && nextPt.vmaf < interpTarget && selPt.vmaf > nextPt.vmaf) {
 
                 var fracCq = selPt.cq + (interpTarget - selPt.vmaf) * (nextPt.cq - selPt.cq) / (nextPt.vmaf - selPt.vmaf);
@@ -3835,6 +4043,7 @@ var plugin = function (args) {
         var holdoutShadowSelectedCQ = null;
 
         var holdoutTechnicalFailure = null;
+        var holdoutPolicyFailure = null;
 
         args.variables.vmafHoldoutTechnicalFailure = null;
         args.variables.vmafAuthoritativeHoldoutOutcome = null;
@@ -3983,6 +4192,8 @@ var plugin = function (args) {
                     args.variables.vmafAuthoritativeHoldoutOutcome = {
                         passed: holdoutShadowActual.passed,
                         directlyMeasured: true,
+                        selectedCQ: chosenCQ,
+                        testedCQ: chosenCQ,
                         metricContractId: args.variables.vmafMetricContractId || null,
                         referenceContractId: args.variables.vmafReferenceContractId || null,
                         vmaf: hoV,
@@ -4015,59 +4226,103 @@ var plugin = function (args) {
 
                     args.variables.vmafHoldoutCAMBIP95 = hoCP;
 
-                    if ((!vmafOk || !floorOk || !cambiOk) && args.variables.vmafToleranceFallbackActive) {
+                    if (!vmafOk || !floorOk || !cambiOk) {
 
                         holdoutFailReason = 'vmaf=' + vmafOk + ',floor=' + floorOk + ',cambi=' + cambiOk;
-                        args.variables.vmafToleranceFallbackHoldoutMiss = true;
-                        args.jobLog('⚠ Holdout also misses a prescribed tolerance during advisory fallback; retaining the selected measured CQ '
-                            + chosenCQ + '. Technical/integrity checks remain authoritative.');
-
-                    } else if (!vmafOk || !floorOk || !cambiOk) {
-
-                        holdoutFailReason = 'vmaf=' + vmafOk + ',floor=' + floorOk + ',cambi=' + cambiOk;
-
-                        var safer = null;
-
-                        for (var sk = 0; sk < validResults.length; sk++) {
-
-                            var sr = validResults[sk];
-
-                            if (sr && sr.parameterSet && isFinite(Number(sr.parameterSet.quality)) && Number(sr.parameterSet.quality) < chosenCQ) {
-
-                                if (!safer || Number(sr.parameterSet.quality) > Number(safer.parameterSet.quality)) safer = sr;
-
+                        var saferCandidates = validResults.filter(function (candidate) {
+                            return candidate && candidate.parameterSet &&
+                                isFinite(Number(candidate.parameterSet.quality)) &&
+                                Number(candidate.parameterSet.quality) < chosenCQ;
+                        }).sort(function (left, right) {
+                            return Number(right.parameterSet.quality) - Number(left.parameterSet.quality);
+                        });
+                        var fallbackAttempts = [];
+                        var validatedSafer = null;
+                        for (var sk = 0; sk < saferCandidates.length; sk++) {
+                            var safer = saferCandidates[sk];
+                            var saferCQ = Number(safer.parameterSet.quality);
+                            args.jobLog('Holdout FAILED at CQ ' + chosenCQ +
+                                ' - validating measured safer CQ ' + saferCQ + ' before selection.');
+                            var saferData = runVmafOnHoldout(args, ho, safer.parameterSet, qualityRiskPolicy);
+                            if (!saferData) {
+                                fallbackAttempts.push({ cq: saferCQ, passed: false, reason: 'no_holdout_data' });
+                                continue;
                             }
-
-                        }
-
-                        if (safer) {
-
-                            holdoutSuggestedCQ = Number(safer.parameterSet.quality);
-
-                            args.jobLog('Holdout FAILED - stepping back to tested safer CQ ' + holdoutSuggestedCQ);
-
+                            var saferMetrics = validateHoldoutMetrics(saferData, frameFloor,
+                                { requireCambi: metricContract.cambi.required === true });
+                            if (!saferMetrics.ok) {
+                                fallbackAttempts.push({ cq: saferCQ, passed: false, reason: saferMetrics.reason });
+                                continue;
+                            }
+                            var saferVmaf = saferMetrics.metrics.avgVMAF;
+                            var saferP1 = saferMetrics.metrics.p1;
+                            var saferCambiMean = saferMetrics.metrics.cambiMean;
+                            var saferCambiP95 = saferMetrics.metrics.cambiP95;
+                            var saferCambiRisk = (saferCambiMean !== null || saferCambiP95 !== null)
+                                ? Math.max(saferCambiMean !== null ? saferCambiMean : -Infinity,
+                                    saferCambiP95 !== null ? saferCambiP95 : -Infinity) : null;
+                            var saferSourceMean = Number(saferData.srcCambiMean);
+                            var saferSourceP95 = Number(saferData.srcCambiP95);
+                            var saferSourceRisk = Math.max(isFinite(saferSourceMean) ? saferSourceMean : -Infinity,
+                                isFinite(saferSourceP95) ? saferSourceP95 : -Infinity);
+                            var saferCambiLimit = cambiLimit;
+                            if (isFinite(saferSourceRisk)) saferCambiLimit = Math.max(saferCambiLimit, saferSourceRisk + 1.0);
+                            var saferPassed = saferVmaf >= meanFloor &&
+                                (!(frameFloor > 0) || saferP1 >= frameFloor) &&
+                                (saferCambiRisk === null || saferCambiRisk <= saferCambiLimit);
+                            fallbackAttempts.push({
+                                cq: saferCQ,
+                                passed: saferPassed,
+                                vmaf: saferVmaf,
+                                p1: saferP1,
+                                cambiRisk: saferCambiRisk
+                            });
+                            args.jobLog('Safer-CQ holdout: CQ ' + saferCQ + ', VMAF=' + saferVmaf.toFixed(2) +
+                                ', 1%-low=' + saferP1.toFixed(2) + ', CAMBI=' +
+                                (saferCambiRisk === null ? 'n/a' : saferCambiRisk.toFixed(3)) +
+                                ' => ' + (saferPassed ? 'PASS' : 'FAIL'));
+                            if (!saferPassed) continue;
+                            validatedSafer = safer;
+                            holdoutSuggestedCQ = saferCQ;
                             bestParams = safer;
-
-                        } else {
-
-                            holdoutSuggestedCQ = Math.max(1, Math.round((chosenCQ - 2) * 10) / 10);
-
-                            args.jobLog('Holdout FAILED - no lower-CQ tested candidate available; reducing CQ ' + chosenCQ + ' -> ' + holdoutSuggestedCQ);
-
-                            var hoParamSet = {};
-
-                            for (var hk in bestParams.parameterSet) {
-
-                                if (Object.prototype.hasOwnProperty.call(bestParams.parameterSet, hk)) hoParamSet[hk] = bestParams.parameterSet[hk];
-
-                            }
-
-                            setParameterSetCQ(hoParamSet, holdoutSuggestedCQ);
-
-                            hoParamSet.id = String(hoParamSet.id || bestParams.parameterSetId || 'sel') + '_holdoutcq' + holdoutSuggestedCQ;
-
-                            bestParams = Object.assign({}, bestParams, { parameterSet: hoParamSet, parameterSetId: hoParamSet.id });
-
+                            args.variables.vmafHoldoutVMAF = saferVmaf;
+                            args.variables.vmafHoldoutP1VMAF = saferP1;
+                            args.variables.vmafHoldoutCAMBI = saferCambiMean;
+                            args.variables.vmafHoldoutCAMBIP95 = saferCambiP95;
+                            args.variables.vmafAuthoritativeHoldoutOutcome = {
+                                passed: true,
+                                directlyMeasured: true,
+                                selectedCQ: saferCQ,
+                                testedCQ: saferCQ,
+                                primaryFailedCQ: chosenCQ,
+                                fallbackAttempts: fallbackAttempts,
+                                metricContractId: args.variables.vmafMetricContractId || null,
+                                referenceContractId: args.variables.vmafReferenceContractId || null,
+                                vmaf: saferVmaf,
+                                p1: saferP1,
+                                cambiMean: saferCambiMean,
+                                cambiP95: saferCambiP95
+                            };
+                            args.jobLog('Holdout fallback PASSED at measured CQ ' + saferCQ + '.');
+                            break;
+                        }
+                        if (!validatedSafer) {
+                            holdoutPolicyFailure = 'selected CQ failed the authoritative holdout and no measured lower CQ passed';
+                            args.variables.vmafAuthoritativeHoldoutOutcome = {
+                                passed: false,
+                                directlyMeasured: true,
+                                selectedCQ: chosenCQ,
+                                testedCQ: chosenCQ,
+                                fallbackAttempts: fallbackAttempts,
+                                metricContractId: args.variables.vmafMetricContractId || null,
+                                referenceContractId: args.variables.vmafReferenceContractId || null,
+                                vmaf: hoV,
+                                p1: hoP1,
+                                cambiMean: hoCM,
+                                cambiP95: hoCP,
+                                reason: holdoutPolicyFailure
+                            };
+                            args.jobLog('Holdout FAILED CLOSED: ' + holdoutPolicyFailure + '.');
                         }
 
                     } else {
@@ -4138,6 +4393,19 @@ var plugin = function (args) {
 
         }
 
+        if (holdoutPolicyFailure) {
+            args.variables.vmafBestParameters = null;
+            delete args.variables.vmafSelectionHandoff;
+            args.variables.vmafSelectionStatus = 'holdout_failed_no_validated_fallback';
+            args.variables.vmafSelectOutput = 2;
+            args.variables.vmafHoldoutFailReason = holdoutPolicyFailure;
+            return {
+                outputFileObj: args.inputFileObj,
+                outputNumber: 2,
+                variables: args.variables
+            };
+        }
+
         if (holdoutShadowAssessment) {
 
             var holdoutShadowRecord = {
@@ -4189,7 +4457,7 @@ var plugin = function (args) {
         // just below the binding constraint instead of falling all the way back to the previous
         // measured CQ. This replaces the old shadow-only selectCQ path.
         try {
-            var _vp = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js');
+            var _vp = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafpredict.js');
             var _agg = args.variables.vmafAggregatedResults || [];
             var _curve = [];
             for (var _ai = 0; _ai < _agg.length; _ai++) {
@@ -4203,6 +4471,18 @@ var plugin = function (args) {
                     vmaf_p1_low: _a.vmafP1Low != null ? Number(_a.vmafP1Low) : null,
                     cambi_p95: _a.p95CAMBI != null ? Number(_a.p95CAMBI) : null,
                     avg_size_mb: Number(_a.avgFileSizeMB) || null,
+                    ssim: _a.avgSSIM != null ? Number(_a.avgSSIM) : null,
+                    xpsnr: _a.minXPSNR != null ? Number(_a.minXPSNR) : null,
+                    ssimulacra2: _a.ssimulacra2 != null ? Number(_a.ssimulacra2) : null,
+                    ssimulacra2_p5: _a.ssimulacra2P5 != null ? Number(_a.ssimulacra2P5) : null,
+                    butteraugli: _a.butteraugliNormInf != null ? Number(_a.butteraugliNormInf) : null,
+                    cvvdp: _a.cvvdp != null ? Number(_a.cvvdp) : null,
+                    projected_output_ratio_pct: _a.projectedOutputRatioPct != null
+                        ? Number(_a.projectedOutputRatioPct) : null,
+                    projected_output_bpp: _a.projectedOutputBpp != null
+                        ? Number(_a.projectedOutputBpp) : null,
+                    projected_output_mbps: _a.projectedOutputMbps != null
+                        ? Number(_a.projectedOutputMbps) : null,
                     bits_per_pixel: null, source_codec: ''
                 });
             }
@@ -4233,15 +4513,49 @@ var plugin = function (args) {
                 ? (args.variables.isHDR ? 5.0 : (args.variables.vmafMediaIsAnimation === true ? 6.0 : 5.5))
                 : null;
             var _effCambi = _vp.effectiveCambiFloor({ cambiFloor: _cambiBase, sourceCambi: args.variables.vmafSourceCAMBI, sourceCambiP95: args.variables.vmafSourceCAMBIP95 });
-            var _sel = _vp.selectCQ(_curve, {}, {
+            var _predictConstraints = {
                 targetVmaf: _tgt, vmafFloor: _floor, cambiFloor: _cambiBase,
-                sourceCambi: args.variables.vmafSourceCAMBI, sourceCambiP95: args.variables.vmafSourceCAMBIP95
-            }, { minSupport: 0.05, cqBandwidth: 1.5, cqStep: 0.1 });
+                sourceCambi: args.variables.vmafSourceCAMBI, sourceCambiP95: args.variables.vmafSourceCAMBIP95,
+                ssimFloor: sharedSsimFloor, xpsnrFloor: sharedXpsnrFloor,
+                ssimulacra2Floor: sharedSsimulacra2Floor,
+                ssimulacra2P5Floor: sharedSsimulacra2P5Floor,
+                butteraugliCeiling: sharedButteraugliCeiling, cvvdpFloor: sharedCvvdpFloor,
+                minOutputRatioPct: qualityRiskPolicy.minOutputRatioPct,
+                minOutputBpp: qualityRiskPolicy.minOutputBpp,
+                maxOutputRatioPct: sizeGateEmergencyPct
+            };
+            var _predictOptions = {
+                minSupport: 0.05,
+                cqBandwidth: 1.5,
+                cqStep: nvencIntegerCqGrid ? 1 : 0.1,
+            };
+            var _rawSel = _vp.selectCQ(_curve, {}, _predictConstraints, _predictOptions);
+            var _measuredBracket = measuredConstraintBracket(
+                _agg, sharedQualityPolicy, feasibility.evaluate);
+            var _sel = _rawSel;
+            var _predictionMaxCq = null;
+            if (finiteNumber(_measuredBracket.firstRejectedAbove) !== null) {
+                _predictionMaxCq = Math.round((Number(_measuredBracket.firstRejectedAbove)
+                    - _predictOptions.cqStep) * 10) / 10;
+                if (finiteNumber(_rawSel.cq) !== null && Number(_rawSel.cq) > _predictionMaxCq) {
+                    _sel = _vp.selectCQ(_curve, {}, _predictConstraints,
+                        Object.assign({}, _predictOptions, { maxCq: _predictionMaxCq }));
+                    args.jobLog('[ACTING] Constraint-aware raw pick ' + Number(_rawSel.cq).toFixed(1)
+                        + ' was clipped to the measured bracket below rejected CQ '
+                        + Number(_measuredBracket.firstRejectedAbove).toFixed(1)
+                        + '; bounded prediction=' + (_sel.cq != null ? Number(_sel.cq).toFixed(1) : 'none') + '.');
+                }
+            }
             var _liveCq = (bestParams.parameterSet && (bestParams.parameterSet.cq != null ? bestParams.parameterSet.cq : bestParams.parameterSet.quality));
             args.jobLog('[ACTING] constraint-aware selectCQ pick=' + (_sel.cq != null ? _sel.cq : 'none')
                 + ' (binding=' + _sel.bindingConstraint + ', predVMAF=' + (_sel.predictedVmaf != null ? _sel.predictedVmaf.toFixed(2) : 'n/a')
                 + ', pred1%low=' + (_sel.predictedP1Low != null ? _sel.predictedP1Low.toFixed(2) : 'n/a')
                 + ', predCAMBI_p95=' + (_sel.predictedCambi != null ? _sel.predictedCambi.toFixed(2) : 'n/a')
+                + ', predSSIMULACRA2=' + (_sel.predictedSsimulacra2 != null ? _sel.predictedSsimulacra2.toFixed(2) : 'n/a')
+                + ', predSSIMULACRA2_p5=' + (_sel.predictedSsimulacra2P5 != null ? _sel.predictedSsimulacra2P5.toFixed(2) : 'n/a')
+                + ', predCVVDP=' + (_sel.predictedCvvdp != null ? _sel.predictedCvvdp.toFixed(3) : 'n/a')
+                + ', predRatio=' + (_sel.predictedOutputRatioPct != null ? _sel.predictedOutputRatioPct.toFixed(1) + '%' : 'n/a')
+                + ', predBPP=' + (_sel.predictedOutputBpp != null ? _sel.predictedOutputBpp.toFixed(4) : 'n/a')
                 + ', effCambiFloor=' + (_effCambi != null ? _effCambi.toFixed(2) : 'n/a')
                 + ') vs measured-core pick CQ=' + _liveCq);
 
@@ -4252,7 +4566,16 @@ var plugin = function (args) {
                 args.jobLog('[ACTING] Constraint-aware fractional CQ ' + Number(_sel.cq).toFixed(1)
                     + ' is prediction-only and no enabled holdout is available; retaining fresh measured CQ ' + _liveCq + '.');
             }
-            if (!args.variables.vmafToleranceFallbackActive
+            var _bindingAuthority = assessMeasuredBindingAuthority(_agg, _sel.cq, sharedQualityPolicy,
+                feasibility.evaluate);
+            if (_fractionalWouldHarden && !_bindingAuthority.allowed) {
+                args.jobLog('[ACTING] Constraint-aware CQ ' + Number(_sel.cq).toFixed(1)
+                    + ' remains prediction-only and cannot override measured CQ ' + _liveCq
+                    + ': ' + _bindingAuthority.reason + '.');
+            }
+            if (!nvencIntegerCqGrid
+                && !args.variables.vmafToleranceFallbackActive
+                && _bindingAuthority.allowed
                 && shouldApplyFractionalOverride(_sel.cq, _liveCq, _fractionalHoldoutAvailable)) {
                 var _preSelectParams = bestParams;
                 var _newCq = Math.round(Number(_sel.cq) * 10) / 10;
@@ -4269,6 +4592,11 @@ var plugin = function (args) {
                 var _predAvgCambi = _metricAt(_newCq, function(x) { return x.avgCAMBI; });
                 var _predSize = _sel.predictedSizeMb != null ? Number(_sel.predictedSizeMb) : _metricAt(_newCq, function(x) { return x.avgFileSizeMB; });
                 var _predSSIM = _metricAt(_newCq, function(x) { return x.avgSSIM; });
+                var _predXpsnr = _sel.predictedXpsnr != null ? Number(_sel.predictedXpsnr) : _metricAt(_newCq, function(x) { return x.minXPSNR; });
+                var _predSsimulacra2 = _sel.predictedSsimulacra2 != null ? Number(_sel.predictedSsimulacra2) : _metricAt(_newCq, function(x) { return x.ssimulacra2; });
+                var _predSsimulacra2P5 = _sel.predictedSsimulacra2P5 != null ? Number(_sel.predictedSsimulacra2P5) : _metricAt(_newCq, function(x) { return x.ssimulacra2P5; });
+                var _predButteraugli = _sel.predictedButteraugli != null ? Number(_sel.predictedButteraugli) : _metricAt(_newCq, function(x) { return x.butteraugliNormInf; });
+                var _predCvvdp = _sel.predictedCvvdp != null ? Number(_sel.predictedCvvdp) : _metricAt(_newCq, function(x) { return x.cvvdp; });
                 bestParams = Object.assign({}, bestParams, {
                     parameterSet: _paramSet,
                     parameterSetId: _paramSet.id,
@@ -4280,6 +4608,11 @@ var plugin = function (args) {
                     p95CAMBI: _predP95Cambi != null ? _predP95Cambi : bestParams.p95CAMBI,
                     avgFileSizeMB: _predSize != null ? _predSize : bestParams.avgFileSizeMB,
                     avgSSIM: _predSSIM != null ? _predSSIM : bestParams.avgSSIM,
+                    minXPSNR: _predXpsnr != null ? _predXpsnr : bestParams.minXPSNR,
+                    ssimulacra2: _predSsimulacra2 != null ? _predSsimulacra2 : bestParams.ssimulacra2,
+                    ssimulacra2P5: _predSsimulacra2P5 != null ? _predSsimulacra2P5 : bestParams.ssimulacra2P5,
+                    butteraugliNormInf: _predButteraugli != null ? _predButteraugli : bestParams.butteraugliNormInf,
+                    cvvdp: _predCvvdp != null ? _predCvvdp : bestParams.cvvdp,
                     vmafConstraintAware: true
                 });
                 args.variables.vmafConstraintAwareCQApplied = true;
@@ -4348,6 +4681,20 @@ var plugin = function (args) {
                         } else {
                             args.variables.vmafConstraintAwareCQValidated = true;
                             args.variables.vmafMaxCompressionApplied = true;
+                            args.variables.vmafAuthoritativeHoldoutOutcome = {
+                                passed: true,
+                                directlyMeasured: true,
+                                selectedCQ: _newCq,
+                                testedCQ: _newCq,
+                                metricContractId: args.variables.vmafMetricContractId || null,
+                                referenceContractId: args.variables.vmafReferenceContractId || null,
+                                vmaf: _hv2,
+                                p1: _hp12,
+                                cambiMean: _hcm2,
+                                cambiP95: _hcp2,
+                                sourceCambiMean: isFinite(_hsCM2) ? _hsCM2 : null,
+                                sourceCambiP95: isFinite(_hsCP2) ? _hsCP2 : null
+                            };
                             selectionMethod += ' + constraint-aware fractional selectCQ';
                             args.jobLog('Constraint-aware holdout PASSED');
                         }
@@ -4404,6 +4751,19 @@ var plugin = function (args) {
         args.variables.vmafSelectionMethod = selectionMethod;
 
         args.variables.vmafRecommendedPixFmt = recommendedPixFmt;
+
+        // FFmpeg av1_nvenc remains the bounded sample frontend while direct
+        // NVEncC owns full delivery. Record that bridge as an explicit selector
+        // correction instead of leaving the backend boundary implicit.
+        encoderDomainBridge = publishEncoderDomainBridge(
+            args.variables, bestParams.parameterSet, measuredPixFmt,
+            recommendedPixFmt, finalSelectionContract.cq);
+        if (encoderDomainBridge) {
+            args.jobLog('Encoder-domain correction: FFmpeg av1_nvenc measurement -> direct NVEncC ' +
+                'delivery; CQ offset 0, both normalized to ' + recommendedDepth + '-bit ' +
+                recommendedPixFmt + ', with fail-closed delivered-depth validation (' +
+                encoderDomainBridge.contract_id + ').');
+        }
 
         args.variables.vmafSelectedStdDev = bestParams.vmafStdDev;
 
@@ -4784,7 +5144,7 @@ var plugin = function (args) {
                 if (maxDim >= 1280) return '720p';
                 return 'SD';
             }
-            var _sizeShadow = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/sizeFailureShadow.js');
+            var _sizeShadow = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/sizeFailureShadow.js');
             var _shadowFeatures = {
                 // Runtime sometimes cannot derive source bitrate/BPP before the selected-CQ stage.
                 // Zero is outside the training distribution and must mean missing so the exported
@@ -4861,10 +5221,9 @@ var plugin = function (args) {
             args.jobLog('Size-failure pre-skip shadow skipped (non-fatal): ' + (_shadowErr && _shadowErr.message ? _shadowErr.message : String(_shadowErr)));
         }
 
-        // Candidate filtering used a reservation snapshot. Commit the atomic
-        // slot only after every selection guard, invariant, report, and shadow
-        // step above has completed, then publish the already-validated handoff.
-        // No uncaught work remains between this point and output 1.
+        // Candidate filtering used a reservation snapshot for telemetry only. Try to commit
+        // a label slot after every selection guard and invariant, but never let telemetry
+        // capacity or availability veto a validated handoff. Actual bytes remain authoritative.
         var _ffProjected = Number(bestParams.projectedOutputRatioPct);
         var _ffCommit = commitForcedFullSelection(args, bestParams, {
             validatedSelection: finalSelectionContract,
@@ -4876,9 +5235,6 @@ var plugin = function (args) {
             reservationReadError: sizeGateReservationReadError,
             rootPath: SIZE_GATE_FORCED_FULL_ROOT,
         });
-        if (!_ffCommit.ok) {
-            return _ffCommit.result;
-        }
         var _ffReservation = _ffCommit.reservation;
 
         if (_ffReservation) {
@@ -4905,7 +5261,7 @@ var plugin = function (args) {
                     JSON.stringify(_ffRecord) + '\n', { encoding: 'utf8', mode: 0o600 });
             } catch (_ffTelemetryError) {
                 try {
-                    args.jobLog('Size-gate forced-full telemetry write failed (non-fatal; reservation remains authoritative): '
+                    args.jobLog('Size-gate forced-full telemetry write failed (non-fatal; actual-byte guard remains authoritative): '
                         + (_ffTelemetryError && _ffTelemetryError.message
                             ? _ffTelemetryError.message : String(_ffTelemetryError)));
                 } catch (_) {}
@@ -4936,6 +5292,13 @@ var plugin = function (args) {
     } else {
 
         args.jobLog('ERROR: Could not select best parameters');
+        args.variables.vmafSelectionStatus = 'no_feasible_parameters';
+        args.variables.vmafNoFeasibleParametersReason = rejectedResults.length
+            ? rejectedResults.map(function (result) {
+                return 'CQ ' + result.cq + ': ' + result.reason;
+            }).join('; ')
+            : 'No measured parameter set passed the authoritative quality contract';
+        delete args.variables.vmafSelectionHandoff;
 
         // Store output number for retry check
 
@@ -4957,10 +5320,17 @@ var plugin = function (args) {
 
 exports.plugin = plugin;
 exports._test = {
+    buildOriginalSourceSampleSizeMap: buildOriginalSourceSampleSizeMap,
+    estimateCandidateSizeMetrics: estimateCandidateSizeMetrics,
     buildHoldoutVmafArgs: buildHoldoutVmafArgs,
     buildXpsnrArgs: buildXpsnrArgs,
+    decoderForEncoder: decoderForEncoder,
     assessHoldoutSkipShadow: assessHoldoutSkipShadow,
     shouldApplyFractionalOverride: shouldApplyFractionalOverride,
+    measuredCandidateUncertainty: measuredCandidateUncertainty,
+    rankMeasuredCandidatesByCompression: rankMeasuredCandidatesByCompression,
+    measuredConstraintBracket: measuredConstraintBracket,
+    assessMeasuredBindingAuthority: assessMeasuredBindingAuthority,
     evaluateSizeGate: evaluateSizeGate,
     resolveForcedFullCap: resolveForcedFullCap,
     resetForcedFullAttemptState: resetForcedFullAttemptState,
@@ -4969,7 +5339,7 @@ exports._test = {
     inspectForcedFullReservations: inspectForcedFullReservations,
     reserveForcedFullSlot: reserveForcedFullSlot,
     requiresForcedFullReservation: requiresForcedFullReservation,
-    forcedFullDeniedResult: forcedFullDeniedResult,
+    noteForcedFullReservationFailure: noteForcedFullReservationFailure,
     commitForcedFullSelection: commitForcedFullSelection,
     buildHoldoutEncodeArgs: buildHoldoutEncodeArgs,
     classifyToleranceRejection: classifyToleranceRejection,
@@ -4977,6 +5347,7 @@ exports._test = {
     chooseMeasuredToleranceFallback: chooseMeasuredToleranceFallback,
     validateFinalSelection: validateFinalSelection,
     publishFinalSelection: publishFinalSelection,
+    publishEncoderDomainBridge: publishEncoderDomainBridge,
     markConstraintAwareHoldoutTechnicalFailure: markConstraintAwareHoldoutTechnicalFailure,
     revertPredictionOnlyFractionalSelection: revertPredictionOnlyFractionalSelection,
     validateHoldoutMetrics: validateHoldoutMetrics,

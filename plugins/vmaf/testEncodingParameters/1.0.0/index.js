@@ -7,7 +7,16 @@ var grainVmafContract = require('../../_lib/grainVmafContract.js');
 var referenceContractBridge = require('../../_lib/referenceContractBridge.js');
 var vmafMetricContract = require('../../_lib/vmafMetricContract.js');
 var deliveryPolicy = require('../../_lib/deliveryPolicy.js');
+var adaptiveFrameFloor = require('../../_lib/adaptiveFrameFloor.js');
+var pixelFormatContract = require('../../_lib/pixelFormatContract.js');
 var fs = require('fs');
+// Chronological current-contract replay (2026-08-08): at eight exact-contract
+// neighbours the binding-aware centre beat CQ30 by ~1 CQ MAE, while a four-CQ
+// uncertainty floor bracketed 17/18 labels with the same three probes. Keep the
+// support and uncertainty guards together; lowering one without the other makes
+// a sparse, overconfident history hint control measurement order.
+var CURRENT_CONTRACT_PREDICTOR_MIN_SUPPORT = 8;
+var CURRENT_CONTRACT_PREDICTOR_MIN_SIGMA = 4;
 var details = function () { return ({
     name: 'Test Encoding Parameters',
     description: 'Encodes video samples with different parameters to find optimal settings.',
@@ -293,6 +302,51 @@ function buildFreshProbeSeed(centerCq, rangeMin, rangeMax) {
     return values.sort(function (a, b) { return a - b; }).slice(0, 3);
 }
 
+function normalizeFgsFallbackPlanningSeed(seed, referenceContract) {
+    if (!seed || seed.schema !== 1 ||
+            seed.role !== 'cross-contract-probe-planning-only' ||
+            seed.acceptance_authority !== 'fresh-target-contract-measurements-only' ||
+            seed.final_cq_reuse !== false) return null;
+    if (!referenceContract ||
+            referenceContract.selectorMode !== grainVmafContract.SELECTOR_MODE_BYPASS ||
+            seed.source_reference_contract_id !== canonicalDenoise.REFERENCE_CONTRACT_ID ||
+            seed.target_reference_contract_id !== referenceContract.id) return null;
+    var center = Number(seed.center_cq);
+    var radius = Number(seed.radius_cq);
+    if (!Number.isFinite(center) || center < 16 || center > 51 ||
+            !Number.isFinite(radius) || radius < 0.5 || radius > 6) return null;
+    return {
+        center: Math.round(center * 10) / 10,
+        radius: Math.round(radius * 10) / 10,
+    };
+}
+
+// A failed FGS path changes the reference domain, so the denoised CQ cannot be
+// accepted or reused. It is still strong measurement-order evidence from the
+// same title and encoder. Center three fresh bypass-contract probes on it and
+// let the normal measured bracket/secant logic own every later decision.
+function buildFgsFallbackProbeSeed(seed, referenceContract) {
+    var normalized = normalizeFgsFallbackPlanningSeed(seed, referenceContract);
+    if (!normalized) return [];
+    function legal(value) {
+        var rounded = Math.round(Number(value) * 10) / 10;
+        return Number.isFinite(rounded) ? Math.max(16, Math.min(51, rounded)) : null;
+    }
+    var values = [];
+    function add(value) {
+        value = legal(value);
+        if (value !== null && values.indexOf(value) === -1) values.push(value);
+    }
+    add(normalized.center - normalized.radius);
+    add(normalized.center);
+    add(normalized.center + normalized.radius);
+    for (var distance = normalized.radius + 1; values.length < 3 && distance <= 35; distance += 1) {
+        add(normalized.center - distance);
+        if (values.length < 3) add(normalized.center + distance);
+    }
+    return values.sort(function (a, b) { return a - b; }).slice(0, 3);
+}
+
 function loadReferenceContractCalibration(fsModule, paths, onError) {
     fsModule = fsModule || fs;
     paths = Array.isArray(paths) ? paths : [];
@@ -310,47 +364,86 @@ function loadReferenceContractCalibration(fsModule, paths, onError) {
     return { artifact: null, path: null };
 }
 
-// Maps color primaries/TRC/matrix to integer values for av1_metadata bitstream filter.
-function av1ColorMetadataArgs(colorPrimaries, colorTrc, colorspace) {
+// Maps colour declarations to Matroska track-header values. The AV1 bitstream
+// is deliberately not rewritten: this FFmpeg build's av1_metadata parser can
+// reject valid NVENC show_existing_frame sequences after the encoder exits 0.
+function av1MatroskaColorMetadata(colorPrimaries, colorTrc, colorspace) {
     function mapPrimaries(v) {
         v = String(v || '').toLowerCase();
-        if (v.indexOf('bt2020') !== -1) return 9;
-        if (v.indexOf('bt709') !== -1) return 1;
-        return 2;
+        if (v.indexOf('bt2020') !== -1) return { code: 9, probe: 'bt2020' };
+        if (v.indexOf('bt709') !== -1) return { code: 1, probe: 'bt709' };
+        return { code: 2, probe: 'unknown' };
     }
     function mapTransfer(v) {
         v = String(v || '').toLowerCase();
-        if (v.indexOf('smpte2084') !== -1) return 16;
-        if (v.indexOf('arib-std-b67') !== -1 || v.indexOf('hlg') !== -1) return 18;
-        if (v.indexOf('bt2020-10') !== -1) return 14;
-        if (v.indexOf('bt2020-12') !== -1) return 15;
-        if (v.indexOf('bt709') !== -1) return 1;
-        return 2;
+        if (v.indexOf('smpte2084') !== -1) return { code: 16, probe: 'smpte2084' };
+        if (v.indexOf('arib-std-b67') !== -1 || v.indexOf('hlg') !== -1) {
+            return { code: 18, probe: 'arib-std-b67' };
+        }
+        if (v.indexOf('bt2020-10') !== -1) return { code: 14, probe: 'bt2020-10' };
+        if (v.indexOf('bt2020-12') !== -1) return { code: 15, probe: 'bt2020-12' };
+        if (v.indexOf('bt709') !== -1) return { code: 1, probe: 'bt709' };
+        return { code: 2, probe: 'unknown' };
     }
     function mapMatrix(v) {
         v = String(v == null ? '' : v).toLowerCase().trim();
-        if (v === '' || v === 'undefined') return 9; // safe default for HDR: bt2020nc
-        if (v.indexOf('bt2020') !== -1) return 9;
-        if (v.indexOf('bt709') !== -1) return 1;
-        return 2;
+        if (v === '' || v === 'undefined' || v.indexOf('bt2020') !== -1) {
+            return { code: 9, probe: 'bt2020nc' };
+        }
+        if (v.indexOf('bt709') !== -1) return { code: 1, probe: 'bt709' };
+        return { code: 2, probe: 'unknown' };
     }
     return {
-        bsf: 'av1_metadata=color_primaries=' + mapPrimaries(colorPrimaries) + ':transfer_characteristics=' + mapTransfer(colorTrc) + ':matrix_coefficients=' + mapMatrix(colorspace)
+        primaries: mapPrimaries(colorPrimaries),
+        transfer: mapTransfer(colorTrc),
+        matrix: mapMatrix(colorspace),
     };
 }
 
-function buildNvencCapabilityProbeArgs(nvencFlagArgs, temporalPolicy) {
+function buildMkvColorMetadataEditArgs(outputPath, paramSet) {
+    var metadata = av1MatroskaColorMetadata(
+        paramSet.colorPrimaries, paramSet.colorTrc, paramSet.colorspace);
+    return [String(outputPath), '--edit', 'track:v1',
+        '--set', 'color-matrix-coefficients=' + metadata.matrix.code,
+        '--set', 'color-transfer-characteristics=' + metadata.transfer.code,
+        '--set', 'color-primaries=' + metadata.primaries.code];
+}
+
+function applyAndVerifyMkvColorMetadata(execFileSync, ffprobePath, outputPath, paramSet) {
+    var metadata = av1MatroskaColorMetadata(
+        paramSet.colorPrimaries, paramSet.colorTrc, paramSet.colorspace);
+    execFileSync('mkvpropedit', buildMkvColorMetadataEditArgs(outputPath, paramSet), {
+        stdio: 'pipe', timeout: 30000, windowsHide: true,
+    });
+    var raw = execFileSync(ffprobePath || 'tdarr-ffprobe', [
+        '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=color_space,color_transfer,color_primaries',
+        '-of', 'json', String(outputPath),
+    ], { stdio: 'pipe', timeout: 30000, windowsHide: true }).toString();
+    var parsed = JSON.parse(raw);
+    var stream = parsed && parsed.streams && parsed.streams[0];
+    if (!stream || String(stream.color_space || '').toLowerCase() !== metadata.matrix.probe ||
+        String(stream.color_transfer || '').toLowerCase() !== metadata.transfer.probe ||
+        String(stream.color_primaries || '').toLowerCase() !== metadata.primaries.probe) {
+        throw new Error('Matroska colour metadata verification failed');
+    }
+    return metadata;
+}
+
+function buildNvencCapabilityProbeArgs(nvencFlagArgs, temporalPolicy, encoder) {
     temporalPolicy = temporalPolicy || nvencTemporalFilter.LEGACY_POLICY;
+    encoder = String(encoder || 'av1_nvenc');
     var argv = ['-hide_banner', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=256x256:d=0.5:r=24',
-        '-c:v', 'av1_nvenc', '-pix_fmt', 'p010le', '-rc', 'vbr', '-cq', '30', '-b:v', '0',
+        '-c:v', encoder, '-pix_fmt', 'p010le', '-rc', 'vbr', '-cq', '30', '-b:v', '0',
         '-preset', 'p7'];
+    if (encoder === 'hevc_nvenc') argv.push('-profile:v', 'main10');
     nvencTemporalFilter.appendValidatedQualityFlags(argv, nvencFlagArgs, temporalPolicy, 'NVENC capability probe');
     argv.push('-g', '96', '-forced-idr', '1', '-f', 'null', '-');
-    nvencTemporalFilter.assertAv1NvencCommand(argv, temporalPolicy, 'NVENC capability probe');
+    nvencTemporalFilter.assertNvencCommand(argv, temporalPolicy, 'NVENC capability probe');
     return argv;
 }
 
-function resolveNvencFlagContract(args, temporalPolicy, execFileSync) {
+function resolveNvencFlagContract(args, temporalPolicy, execFileSync, encoder) {
     // Preserve the test/helper's old boolean API while production callers pass
     // the explicit three-way policy.
     if (temporalPolicy === true) temporalPolicy = nvencTemporalFilter.CANONICAL_POLICY;
@@ -364,14 +457,14 @@ function resolveNvencFlagContract(args, temporalPolicy, execFileSync) {
     args.variables.vmafNvencTemporalPolicy = temporalPolicy;
     if (!args.variables.vmafNvencFlagArgs) {
         try {
-            execFileSync(args.ffmpegPath, buildNvencCapabilityProbeArgs(enhanced, temporalPolicy),
+            execFileSync(args.ffmpegPath, buildNvencCapabilityProbeArgs(enhanced, temporalPolicy, encoder),
                 { stdio: 'pipe', timeout: 60000, windowsHide: true });
             args.variables.vmafNvencFlagArgs = enhanced;
             args.jobLog('NVENC enhanced quality flags enabled for ' + temporalPolicy + ' temporal policy.');
         } catch (_enhancedError) {
             args.jobLog('NVENC enhanced flags unsupported on this encoder/driver; probing baseline flags for ' + temporalPolicy);
             try {
-                execFileSync(args.ffmpegPath, buildNvencCapabilityProbeArgs(baseline, temporalPolicy),
+                execFileSync(args.ffmpegPath, buildNvencCapabilityProbeArgs(baseline, temporalPolicy, encoder),
                     { stdio: 'pipe', timeout: 60000, windowsHide: true });
                 args.variables.vmafNvencFlagArgs = baseline;
                 args.jobLog('NVENC baseline quality flags enabled for ' + temporalPolicy + ' temporal policy.');
@@ -397,35 +490,130 @@ function buildSampleEncodeArgs(paramSet, sample, outputPath, nvencFlagArgs, opti
     if (canonicalInput && temporalPolicy !== nvencTemporalFilter.CANONICAL_POLICY) {
         throw new Error('canonical VMAF sample requires the canonical tf0 policy');
     }
+    var encoder = String(paramSet.encoder || '');
+    var isNvenc = paramSet.isGPU && encoder.indexOf('_nvenc') !== -1;
+    var isHevcNvenc = isNvenc && encoder.indexOf('hevc_nvenc') !== -1;
     var argv = [];
-    if (!canonicalInput && paramSet.isGPU && paramSet.encoder.indexOf('av1_nvenc') !== -1) {
+    if (!canonicalInput && isNvenc) {
         argv.push('-hwaccel', 'cuda');
     }
     argv.push('-i', sample, '-c:v', paramSet.encoder);
-    if (paramSet.isGPU && paramSet.encoder.indexOf('av1_nvenc') !== -1) {
+    if (isNvenc) {
         argv.push('-pix_fmt', paramSet.pixFmt, '-rc', 'vbr', '-cq', String(paramSet.quality), '-b:v', '0');
         argv.push('-preset', paramSet.preset);
         nvencTemporalFilter.appendValidatedQualityFlags(argv, nvencFlagArgs, temporalPolicy, 'VMAF sample encode');
+        if (isHevcNvenc) argv.push('-profile:v', 'main10');
         argv.push('-g', '96', '-forced-idr', '1');
         argv.push('-color_primaries', paramSet.colorPrimaries, '-color_trc', paramSet.colorTrc, '-colorspace', paramSet.colorspace);
-        var av1Meta = av1ColorMetadataArgs(paramSet.colorPrimaries, paramSet.colorTrc, paramSet.colorspace);
-        argv.push('-bsf:v', av1Meta.bsf);
+        // av1_nvenc already writes these three colour fields from the encoder
+        // options above. Re-parsing and rewriting the freshly encoded stream
+        // with av1_metadata is redundant and, on some valid NVENC sequences,
+        // fails with show_existing_frame/reference errors and leaves an empty
+        // sample. Keep the encoder signalling and do not mutate the bitstream.
         // av1_nvenc in this FFmpeg build does not expose -master_display/-max_cll encoder options.
         // Static HDR metadata is logged/exported by the flow, while the encoded AV1 stream carries
         // color primaries/TRC/matrix signalling via the supported color options above.
         argv.push('-max_muxing_queue_size', '4096');
     }
     argv.push('-an', '-y', outputPath);
-    nvencTemporalFilter.assertAv1NvencCommand(argv, temporalPolicy, 'VMAF sample encode');
+    nvencTemporalFilter.assertNvencCommand(argv, temporalPolicy, 'VMAF sample encode');
     canonicalDenoise.assertAbsent(argv, canonicalInput
         ? 'VMAF encode from canonical denoised FFV1 sample'
         : 'legacy VMAF sample encode');
     return argv;
 }
 
+function parseFrameRateForMetricContract(stream) {
+    var raw = stream && (stream.avg_frame_rate || stream.r_frame_rate || stream.frame_rate);
+    if (typeof raw === 'string' && raw.indexOf('/') !== -1) {
+        var parts = raw.split('/');
+        var numerator = Number(parts[0]);
+        var denominator = Number(parts[1]);
+        return isFinite(numerator) && isFinite(denominator) && denominator > 0
+            ? numerator / denominator : null;
+    }
+    var value = Number(raw);
+    return isFinite(value) && value > 0 ? value : null;
+}
+
+// Resolve the contract that the downstream scorer will persist, not merely the temporary
+// GPU-v0 capability contract available before sample encoding. Canonical production uses the
+// promoted isolated CPU-v1 scorer; matching that identity here lets policy-only requeues skip
+// compatible encodes and revive their full metric rows under the current selector.
+function resolveMeasurementMetricContractForReuse(options) {
+    options = options || {};
+    var fallback = vmafMetricContract.resolveProductionForVideo(
+        options.width,
+        options.height,
+        { attestedEncoderProfileId: options.encoderProfileId }
+    );
+    if (!options.canonical || !options.videoStream) return fallback;
+    try {
+        return vmafMetricContract.resolveCpuV1Production({
+            width: options.width,
+            height: options.height,
+            sampleAspectRatio: options.videoStream.sample_aspect_ratio,
+            displayAspectRatio: options.videoStream.display_aspect_ratio,
+            geometryNormalization: 'none',
+            isHdr: options.isHdr === true,
+            frameRate: parseFrameRateForMetricContract(options.videoStream),
+            scoringBitDepth: 10,
+        }, { attestedEncoderProfileId: options.encoderProfileId });
+    } catch (_) {
+        // The scorer uses the same geometry fail-closed fallback for unsupported sources.
+        return fallback;
+    }
+}
+
+function capCodecCqs(cqs, alreadyTested, codecStage, maximumUnique) {
+    var isHevc = String(codecStage || '').toLowerCase() === 'hevc';
+    var onMeasuredGrid = function(cq) {
+        return isFinite(cq) && cq >= 0 && cq <= 51 &&
+            Math.abs(cq * 10 - Math.round(cq * 10)) < 0.000001;
+    };
+    var normalize = function(cq) { return Number(Number(cq).toFixed(1)); };
+    var values = (Array.isArray(cqs) ? cqs : []).map(Number)
+        .filter(onMeasuredGrid).map(normalize)
+        .filter(function(cq, index, all) { return all.indexOf(cq) === index; });
+    if (!isHevc) return values;
+    var cap = Number(maximumUnique);
+    if (!Number.isInteger(cap) || cap < 1 || cap > 16) cap = 8;
+    var tested = (Array.isArray(alreadyTested) ? alreadyTested : []).map(Number)
+        .filter(onMeasuredGrid).map(normalize)
+        .filter(function(cq, index, all) { return all.indexOf(cq) === index; });
+    var remaining = Math.max(0, cap - tested.length);
+    return values.filter(function(cq) { return tested.indexOf(cq) === -1; }).slice(0, remaining);
+}
+
+function shouldUseConfiguredFallback(cqs, isGuidedRound) {
+    return (!Array.isArray(cqs) || cqs.length === 0) && isGuidedRound !== true;
+}
+
+function shouldRetryTransientNvencSampleFailure(result, attempt) {
+    if (!result || result.ok === true || result.timedOut === true || Number(attempt) >= 2) return false;
+    var detail = String(result.stderrTail || '') + '\n' + String(result.error || '');
+    return /OpenEncodeSessionEx failed:[^\r\n]*unsupported device/i.test(detail)
+        || /No capable devices found/i.test(detail)
+        || /Failed locking bitstream buffer:\s*out of memory\s*\(10\)/i.test(detail);
+}
+
+function settleTimedOutSampleAttempt(child, finish, result) {
+    try { child.kill('SIGKILL'); } catch (e) {}
+    finish(Object.assign({}, result || {}, { ok: false, timedOut: true }));
+}
+
+function formatDiagnosticTail(value, maximumCharacters) {
+    var limit = Number(maximumCharacters);
+    if (!Number.isInteger(limit) || limit < 1) limit = 1000;
+    return String(value || '').trim().replace(/\s+/g, ' ').slice(-limit);
+}
+
 var plugin = async function (args) {
     var lib = require('../../../../../methods/lib')();
     args.inputs = lib.loadDefaultValues(args.inputs, details);
+    // Publish the decision policy before measurement/shadow records are emitted so every
+    // downstream artifact can be replayed against a later gating revision.
+    args.variables.vmafSelectorPolicyVersion = 'selector-authoritative-v5-ssim2p5-exact-holdout';
     var path = require('path');
     var execFileSync = require('child_process').execFileSync;
     var spawn = require('child_process').spawn;
@@ -435,6 +623,11 @@ var plugin = async function (args) {
     });
     var canonicalInput = referenceContract.canonical;
     var allowHistoricalGuidance = referenceContract.legacyHistory;
+    // This switch controls exact-file measurement reuse, not legacy-history authority.
+    // Preserve an explicit caller kill switch while allowing current-contract rows to be
+    // revived for canonical-denoise requeues. The reuse query below still requires exact
+    // reference, metric, encoder and GPU-perceptual contracts and retains one fresh probe.
+    var allowExactCurrentContractReuse = args.variables.vmafCrossJobReuse !== false;
     args.variables.vmafSelectorSignalDomain = referenceContract.selectorMode;
     args.variables.vmafSelectorLegacyBridgePlanningOnly =
         referenceContract.selectorMode === grainVmafContract.SELECTOR_MODE_PREPARED;
@@ -446,13 +639,14 @@ var plugin = async function (args) {
     args.variables.vmafHistoricalGuidanceAllowed = allowHistoricalGuidance;
     args.variables.vmafHistoricalProbePlanningAllowed = true;
     if (!allowHistoricalGuidance) {
-        args.variables.vmafCrossJobReuse = false;
+        args.variables.vmafCrossJobReuse = allowExactCurrentContractReuse;
         args.variables.vmafInfeasibleCooldown = false;
         args.variables.vmafSameTitleShadowInitialized = true;
         args.variables.vmafSameTitleEmptyBandShadow = null;
         args.variables.vmafReusedSweepRows = [];
         args.jobLog('[CONTRACT] ' + referenceContract.id +
-            ': legacy exact reuse, cooldown, acceptance, and size/CAMBI/frame-floor authority are disabled.');
+            ': legacy-history acceptance, cooldown, and size/CAMBI/frame-floor authority are disabled; '
+            + 'exact-file current-contract reuse=' + (allowExactCurrentContractReuse ? 'enabled' : 'disabled') + '.');
     }
 
     // Same-title history is a routing hint only. It cannot reject the current file and is carried
@@ -463,7 +657,7 @@ var plugin = async function (args) {
         try {
             var _stTitle = String(args.variables.vmafSeriesTitle || '').trim();
             if (_stTitle) {
-                var _stDbModule = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+                var _stDbModule = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafdb.js');
                 var _stDb = _stDbModule.openDb();
                 var _stStreams = args.inputFileObj && args.inputFileObj.ffProbeData && args.inputFileObj.ffProbeData.streams;
                 var _stVideo = Array.isArray(_stStreams) ? _stStreams.filter(function (stream) {
@@ -637,7 +831,7 @@ var plugin = async function (args) {
             if (_cdSince < _cdEraFloor) _cdSince = _cdEraFloor;
             var _cdPath = String((args.inputFileObj && (args.inputFileObj._id || args.inputFileObj.file)) || '');
             if (_cdPath) {
-                var _cdDbm = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+                var _cdDbm = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafdb.js');
                 var _cdDb = _cdDbm.openDb();
                 var _cdPrior = _cdDb.prepare(
                     'SELECT job_id, timestamp, skip_reason FROM jobs' +
@@ -758,7 +952,7 @@ var plugin = async function (args) {
         var knownFailedCQs = [];
         var lowestFailedCQ = null;
         if (allowHistoricalGuidance) try {
-            var _kfVdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+            var _kfVdb = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafdb.js');
             var _kfDb = _kfVdb.openDb();
             var _kfFilePath = (args.inputFileObj && args.inputFileObj._id) || (args.inputFileObj && args.inputFileObj.file) || '';
             if (_kfFilePath) {
@@ -859,6 +1053,7 @@ var plugin = async function (args) {
         var sourceHeight = 1080;
         var sourceCodec = 'unknown';
         var sourceDuration = 0;
+        var sourceVideoStream = null;
         var sourceFileSizeMB = args.inputFileObj.file_size || 0;
 
         if (args.inputFileObj.ffProbeData) {
@@ -871,6 +1066,7 @@ var plugin = async function (args) {
 
             for (var i = 0; i < streams.length; i++) {
                 if (streams[i].codec_type === 'video') {
+                    sourceVideoStream = streams[i];
                     sourceWidth = streams[i].width || 1920;
                     sourceHeight = streams[i].height || 1080;
                     sourceCodec = streams[i].codec_name || 'unknown';
@@ -901,6 +1097,12 @@ var plugin = async function (args) {
             args.variables.vmafDynamicCQ = false;
         }
 
+        crfValues = capCodecCqs(crfValues, args.variables.vmafTestedCQs,
+            args.variables.vmafCodecStage, args.variables.vmafHevcMaxUniqueCQs);
+        if (String(args.variables.vmafCodecStage || '').toLowerCase() === 'hevc' && crfValues.length === 0) {
+            throw new Error('HEVC CQ evaluation budget exhausted before sample encoding');
+        }
+
         // Track tested CQ values to avoid retesting in retry loops
     if (!args.variables.vmafTestedCQs) {
         args.variables.vmafTestedCQs = [];
@@ -917,9 +1119,9 @@ var plugin = async function (args) {
 
     var presets = presetsStr.split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
     var resolvedNvencContract = null;
-    if (useGPU && gpuEncoder && String(gpuEncoder).toLowerCase() === 'av1_nvenc') {
+    if (useGPU && gpuEncoder && /^(?:av1|hevc)_nvenc$/.test(String(gpuEncoder).toLowerCase())) {
         resolvedNvencContract = resolveNvencFlagContract(
-            args, referenceContract.temporalPolicy, execFileSync);
+            args, referenceContract.temporalPolicy, execFileSync, gpuEncoder);
     }
     var referenceComparisonEncoderProfileId = resolvedNvencContract
         ? nvencTemporalFilter.referenceComparisonEncoderProfileId({
@@ -930,12 +1132,19 @@ var plugin = async function (args) {
         }) : null;
     args.variables.vmafReferenceComparisonEncoderProfileId =
         referenceComparisonEncoderProfileId;
-    var measurementMetricContract = vmafMetricContract.resolveProductionForVideo(
-        sourceWidth,
-        sourceHeight,
-        { attestedEncoderProfileId: referenceComparisonEncoderProfileId }
-    );
-    vmafMetricContract.assertModelFile(measurementMetricContract, { fs: fs });
+    var measurementMetricContract = resolveMeasurementMetricContractForReuse({
+        width: sourceWidth,
+        height: sourceHeight,
+        videoStream: sourceVideoStream,
+        isHdr: isHDR,
+        canonical: canonicalInput,
+        encoderProfileId: referenceComparisonEncoderProfileId,
+    });
+    if (measurementMetricContract.builtInModel !== true) {
+        vmafMetricContract.assertModelFile(measurementMetricContract, { fs: fs });
+    }
+    args.jobLog('[MEASUREMENT CONTRACT] pre-encode reuse identity=' +
+        measurementMetricContract.metricContractId);
     args.variables.vmafMetricContractFamilyId = measurementMetricContract.metricContractFamilyId;
     args.variables.vmafMetricContractId = measurementMetricContract.metricContractId;
     args.variables.vmafEncoderProfileId = measurementMetricContract.encoderProfileId;
@@ -966,8 +1175,8 @@ var plugin = async function (args) {
     // guided round/retry. selectBestParameters/checkCQRangeRetry retain the
     // current file's measured curve across attempts and own all later CQs.
     if (dynamicCQ && (allowHistoricalGuidance || canonicalInput) && !isGuidedRound) try {
-        var _vdb = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
-        var _vp = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafpredict.js');
+        var _vdb = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafdb.js');
+        var _vp = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafpredict.js');
         var _db = _vdb.openDb();
         var _streams = (args.inputFileObj && args.inputFileObj.ffProbeData && args.inputFileObj.ffProbeData.streams) || [];
         var _vs = null; for (var _si = 0; _si < _streams.length; _si++) { if (_streams[_si].codec_type === 'video') { _vs = _streams[_si]; break; } }
@@ -1010,16 +1219,33 @@ var plugin = async function (args) {
             encoderProfileId: measurementMetricContract.encoderProfileId,
         });
         // Binding-constraint floors for the constraint-aware centre. These activate predictCQCenter's
-        // per-neighbour bindingTargetCQ ONLY for neighbours whose curve carries 1%-low / CAMBI (sparse
+        // per-neighbour bindingTargetCQ ONLY for neighbours whose curve carries the relevant metric (sparse
         // today, accruing via the dual-write); all other neighbours keep the VMAF-mean crossing, so the
         // centre is unchanged until the data fills in, then it self-corrects for banding/grain-bound
-        // content. Floors mirror the live selection gates (1%-low 88; CAMBI 6.0 anim / 5.0 HDR / 5.5 SDR).
-        var _vmafFloor = Number(args.variables.vmafMinFrameVMAF) || Number(args.inputs && args.inputs.minFrameVMAF) || 88;
+        // content. Resolve the same adaptive 1%-low floor checkCQBracket and selection use;
+        // the old hard-coded 88 was stricter than the actual 84.5-86 policy and biased the
+        // historical centre toward unnecessarily low CQ values.
+        var _vmafFloor = adaptiveFrameFloor.resolveAdaptiveFrameFloor(
+            args.inputFileObj, args.variables);
+        if (!(Number(_vmafFloor) > 0)) {
+            _vmafFloor = Number(args.inputs && args.inputs.minFrameVMAF) || 88;
+        }
         var _cambiFloor = (args.variables.vmafMediaIsAnimation === true) ? 6.0 : (isHDR ? 5.0 : 5.5);
+        var _feasibility = require('../../_lib/feasibility.js');
+        var _ssimFloor = _feasibility.resolveAuxFloor(args, 'vmafSsimFloor', 'ssimFloor', _feasibility.DEFAULT_SSIM_FLOOR);
+        var _xpsnrFloor = _feasibility.resolveAuxFloor(args, 'vmafXpsnrFloor', 'xpsnrFloor', _feasibility.DEFAULT_XPSNR_FLOOR);
+        var _ssimulacra2Floor = _feasibility.resolveAuxFloor(args, 'vmafSsimulacra2Floor', 'ssimulacra2Floor', _feasibility.DEFAULT_SSIMULACRA2_FLOOR);
+        var _ssimulacra2P5Floor = _feasibility.resolveAuxFloor(args, 'vmafSsimulacra2P5Floor', 'ssimulacra2P5Floor', _feasibility.DEFAULT_SSIMULACRA2_P5_FLOOR);
+        var _butteraugliCeiling = _feasibility.resolveAuxFloor(args, 'vmafButteraugliCeiling', 'butteraugliCeiling', _feasibility.DEFAULT_BUTTERAUGLI_CEILING);
+        var _cvvdpFloor = _feasibility.resolveAuxFloor(args, 'vmafCvvdpFloor', 'cvvdpFloor', _feasibility.DEFAULT_CVVDP_FLOOR);
         var _labelMaxExtrap = String(_src.tier || '').toLowerCase() === '720p' ? 12 : 5;
         var _ctr = _vp.predictCQCenter(_curves, _src, { targetVmaf: _tgt },
             { recencyHalfLifeDays: _historyHalfLifeDays, vmafFloor: _vmafFloor,
-                cambiFloor: _cambiFloor, maxLabelExtrap: _labelMaxExtrap });
+                cambiFloor: _cambiFloor, ssimFloor: _ssimFloor, xpsnrFloor: _xpsnrFloor,
+                ssimulacra2Floor: _ssimulacra2Floor, ssimulacra2P5Floor: _ssimulacra2P5Floor,
+                butteraugliCeiling: _butteraugliCeiling,
+                cvvdpFloor: _cvvdpFloor, maxLabelExtrap: _labelMaxExtrap,
+                minSigma: CURRENT_CONTRACT_PREDICTOR_MIN_SIGMA });
         var _sameContractEffectiveSupport = referenceContractBridge.effectiveJobSupport(
             _curves, _src, { recencyHalfLifeDays: _historyHalfLifeDays }, {});
         if (_ctr) _ctr.effectiveSupport = Math.round(_sameContractEffectiveSupport * 10) / 10;
@@ -1029,8 +1255,9 @@ var plugin = async function (args) {
         // bridge applies a hard 365-day cutoff plus a real 120-day half-life;
         // unlike the old recencyHalfLifeDays=0 call, this is not infinite-age
         // equal weighting.
-        if (canonicalInput && (!_ctr || _ctr.centerCq == null || Number(_ctr.support) < 30
-            || _sameContractEffectiveSupport < 8)) {
+        if (canonicalInput && (!_ctr || _ctr.centerCq == null
+            || Number(_ctr.support) < CURRENT_CONTRACT_PREDICTOR_MIN_SUPPORT
+            || _sameContractEffectiveSupport < CURRENT_CONTRACT_PREDICTOR_MIN_SUPPORT)) {
             var _legacyCurves = _vdb.getSimilarSweepCurves(_db, _src, {
                 limit: 20000,
                 referenceContractId: canonicalDenoise.LEGACY_REFERENCE_CONTRACT_ID,
@@ -1121,13 +1348,14 @@ var plugin = async function (args) {
         // Every later guided/retry round bypasses this block and follows only
         // the current file's measured current-contract curve.
         var _legacyEffectiveSupportOk = _predictionRole !== 'legacy_contract_probe_planning_only'
-            || Number(_ctr && _ctr.effectiveSupport) >= 8;
+            || Number(_ctr && _ctr.effectiveSupport) >= CURRENT_CONTRACT_PREDICTOR_MIN_SUPPORT;
         if (shouldApplyHistoricalProbeSeed({
                 isRetry: isRetry,
                 guidedCount: guidedNext.length,
                 alreadySeeded: args.variables.vmafPredictorSeeded,
                 dynamicCQ: dynamicCQ,
-            }) && _ctr && _ctr.centerCq != null && _ctr.support >= 30
+            }) && _ctr && _ctr.centerCq != null
+            && _ctr.support >= CURRENT_CONTRACT_PREDICTOR_MIN_SUPPORT
             && _legacyEffectiveSupportOk
             && _ctr.rangeMin != null && _ctr.rangeMax != null) {
             var _cC = Math.max(16, Math.min(51, Math.round(_ctr.centerCq)));
@@ -1149,12 +1377,34 @@ var plugin = async function (args) {
         args.jobLog('[PREDICT] predictor calc failed (non-fatal): ' + (_shErr && _shErr.message ? _shErr.message : String(_shErr)));
     }
 
+    // A post-encode FGS failure has an exact selected CQ from the denoised
+    // contract. It cannot authorize the untouched-source result, but it can
+    // avoid restarting from a five-point generic sweep. Prefer any same-target
+    // predictor result; otherwise center three FRESH bypass probes on that CQ.
+    if (crfValues.length === 0 && dynamicCQ && !isGuidedRound &&
+            args.variables.vmafFgsFallbackPlanningApplied !== true) {
+        var _fgsFallbackSeed = buildFgsFallbackProbeSeed(
+            args.variables.vmafFgsFallbackPlanningSeed, referenceContract);
+        if (_fgsFallbackSeed.length === 3) {
+            crfValues = _fgsFallbackSeed;
+            args.variables.vmafTestedCQs = crfValues.slice();
+            args.variables.vmafFgsFallbackPlanningApplied = true;
+            args.jobLog('[ACTING] FGS-bypass FRESH sweep centered on the prior denoised CQ: crfValues=[' +
+                crfValues.join(',') + ']. The prior CQ controls measurement order only; ' +
+                'fresh untouched-source scores retain sole acceptance authority.');
+        }
+    }
+
     // Fallback: a first-attempt dynamicCQ job has no base CQ list unless the predictor seeded one
-    // (gated on DB availability AND support>=30). If the predictor was unavailable (e.g. the shared
+    // (gated on DB availability, raw/effective support, and a replay-calibrated uncertainty floor).
+    // If the predictor was unavailable (e.g. the shared
     // SQLite handle was closed by an earlier job -> "database is not open") or support was thin, fall
     // back to the configured crfValues so the sweep still runs (pre-predictor behaviour) instead of
     // failing the whole job. The predictor is an optimisation, never a hard dependency.
-    if (crfValues.length === 0) {
+    if (crfValues.length === 0 && isGuidedRound) {
+        throw new Error('Guided CQ selection produced no valid untested CQ values; refusing configured-sweep fallback');
+    }
+    if (shouldUseConfiguredFallback(crfValues, isGuidedRound)) {
         crfValues = crfValuesStr.split(',').map(function(v) { return parseInt(v.trim(), 10); })
             .filter(function(v) { return !isNaN(v); });
         if (crfValues.length > 0) {
@@ -1252,24 +1502,44 @@ var plugin = async function (args) {
     // the stored row and re-judges it under CURRENT policy. At least one CQ is always measured
     // fresh — it acts as an encoder/pipeline drift canary and guarantees selection has a
     // parameterSet template for revived rows. Era floor 2026-07-08 (hardness-first sampling +
-    // corrected size projection both live); rows must carry harmonic/1%-low/size and >=8 clips.
+    // corrected size projection both live); rows must carry every binding metric. Legacy-reference
+    // rows still require >=8 clips. Canonical-denoise rows may reuse >=4 clips because the current
+    // adaptive sampler itself accepts four hard clips, all contracts must match exactly, the rows
+    // are at most seven days old, and one CQ is always re-measured as a drift canary.
     // Kill switch: args.variables.vmafCrossJobReuse === false.
     try {
         if (args.variables.vmafCrossJobReuse !== false && crfValues.length >= 2) {
             var _cjPath = String((args.inputFileObj && (args.inputFileObj._id || args.inputFileObj.file)) || '');
-            if (_cjPath) {
-                var _cjDbm = require('/custom-cont-init.d/vmaf-plugin-patches/_lib/vmafdb.js');
+            var _cjSourceSizeMb = Number(sourceFileSizeMB);
+            var _cjSourceDurationSec = Number(sourceDuration);
+            var _cjSourceCodec = String((sourceVideoStream && sourceVideoStream.codec_name) || '');
+            if (_cjPath && isFinite(_cjSourceSizeMb) && _cjSourceSizeMb > 0 &&
+                    isFinite(_cjSourceDurationSec) && _cjSourceDurationSec > 0 &&
+                    _cjSourceCodec && sourceWidth > 0 && sourceHeight > 0) {
+                var _cjDbm = require('/custom-cont-init.d/.vmaf-plugin-patches/_lib/vmafdb.js');
                 var _cjDb = _cjDbm.openDb();
                 var _cjMaxAgeDays = Number(args.variables.vmafCrossJobReuseMaxAgeDays);
                 if (!isFinite(_cjMaxAgeDays) || _cjMaxAgeDays <= 0) _cjMaxAgeDays = 45;
+                if (canonicalInput) _cjMaxAgeDays = Math.min(_cjMaxAgeDays, 7);
+                var _cjMinSamples = canonicalInput ? 4 : 8;
+                var _cjGpuPerceptualContractId = 'vship-5.1.1-cuda-sm120-concat-per-cq-v1';
                 var _cjSince = new Date(Date.now() - _cjMaxAgeDays * 86400000).toISOString();
                 if (_cjSince < '2026-07-08') _cjSince = '2026-07-08';
                 var _cjRows = _cjDb.prepare(
                     'SELECT s.cq, s.parameter_set_id, s.preset, s.vmaf_mean, s.vmaf_harmonic_mean, s.vmaf_min,' +
                     ' s.vmaf_max, s.vmaf_p1_low, s.vmaf_stddev, s.cambi_mean, s.cambi_max, s.cambi_p95,' +
+                    ' s.ssim, s.xpsnr_min, s.xpsnr_weighted, s.psnr_avg,' +
+                    ' s.ssimulacra2, s.ssimulacra2_p5, s.butteraugli_norm_inf, s.butteraugli_norm3,' +
+                    ' s.cvvdp, s.gpu_perceptual_contract_id,' +
                     ' s.avg_size_mb, s.sample_count, s.clip_sample_indices, s.created_at, s.job_id' +
                     ' FROM sweep_points s JOIN jobs j ON s.job_id = j.job_id' +
-                    ' WHERE j.file_path = ? AND s.created_at >= ?' +
+                     ' WHERE j.file_path = ? AND s.created_at >= ?' +
+                     ' AND j.source_file_size_mb IS NOT NULL' +
+                     ' AND ABS(j.source_file_size_mb - ?) <= MAX(0.5, ? * 0.0001)' +
+                     ' AND j.source_duration_sec IS NOT NULL' +
+                     ' AND ABS(j.source_duration_sec - ?) <= 0.05' +
+                     ' AND LOWER(COALESCE(j.source_codec, \'\')) = LOWER(?)' +
+                     ' AND j.source_width = ? AND j.source_height = ?' +
                     " AND COALESCE(s.reference_contract_id, 'legacy-original-tf4-v1') = ?" +
                     " AND COALESCE(j.reference_contract_id, 'legacy-original-tf4-v1') = ?" +
                      " AND COALESCE(s.reference_contract_id, 'legacy-original-tf4-v1')" +
@@ -1278,12 +1548,20 @@ var plugin = async function (args) {
                      ' AND s.encoder_profile_id = j.encoder_profile_id' +
                      ' AND s.metric_contract_id = ? AND s.encoder_profile_id = ?' +
                      ' AND s.vmaf_harmonic_mean IS NOT NULL AND s.vmaf_p1_low IS NOT NULL' +
-                     ' AND s.avg_size_mb IS NOT NULL AND s.sample_count >= 8' +
+                     ' AND s.ssim IS NOT NULL AND s.xpsnr_min IS NOT NULL' +
+                     ' AND s.ssimulacra2 IS NOT NULL AND s.ssimulacra2_p5 IS NOT NULL' +
+                     ' AND s.cvvdp IS NOT NULL' +
+                     ' AND s.gpu_perceptual_contract_id = ?' +
+                     ' AND s.avg_size_mb IS NOT NULL AND s.sample_count >= ?' +
                      ' ORDER BY s.created_at DESC').all(_cjPath, _cjSince,
+                         _cjSourceSizeMb, _cjSourceSizeMb, _cjSourceDurationSec,
+                         _cjSourceCodec, sourceWidth, sourceHeight,
                          args.variables.vmafReferenceContractId,
                          args.variables.vmafReferenceContractId,
                          measurementMetricContract.metricContractId,
-                         measurementMetricContract.encoderProfileId);
+                         measurementMetricContract.encoderProfileId,
+                         _cjGpuPerceptualContractId,
+                         _cjMinSamples);
                 var _cjByCq = {};
                 for (var _cjI = 0; _cjI < _cjRows.length; _cjI++) {
                     var _cjR = _cjRows[_cjI];
@@ -1291,9 +1569,11 @@ var plugin = async function (args) {
                     var _cjKey = Math.round(Number(_cjR.cq) * 10) / 10;
                     if (isFinite(_cjKey) && _cjByCq[_cjKey] === undefined) _cjByCq[_cjKey] = _cjR; // newest wins
                 }
-                var _cjReusable = crfValues.filter(function (v) {
-                    return _cjByCq[Math.round(v * 10) / 10] !== undefined;
-                });
+                var _cjReusable = canonicalInput
+                    ? Object.keys(_cjByCq).map(function (v) { return Number(v); })
+                    : crfValues.filter(function (v) {
+                        return _cjByCq[Math.round(v * 10) / 10] !== undefined;
+                    });
                 if (_cjReusable.length >= crfValues.length) {
                     // Keep the middle CQ fresh as the drift canary / parameterSet template.
                     var _cjSorted = crfValues.slice().sort(function (a, b) { return a - b; });
@@ -1323,7 +1603,9 @@ var plugin = async function (args) {
         args.jobLog('[REUSE] cross-job reuse skipped (non-fatal): ' + (_cjErr && _cjErr.message ? _cjErr.message : String(_cjErr)));
     }
 
-    // Generate parameter sets - all use 10-bit (p010le) format
+    // AV1 delivery is 10-bit for every source, including 8-bit SDR. Sample
+    // encodes must use the same selected depth as the eventual full encode.
+    var measurementPixFmt = pixelFormatContract.AV1_DELIVERY_PIX_FMT;
     if (crfValues.length === 0) {
         var errorMsg = 'No CQ values to test. This may indicate all CQ values were filtered out as already tested, or dynamic CQ calculation failed.';
         args.jobLog('ERROR: ' + errorMsg);
@@ -1341,16 +1623,23 @@ var plugin = async function (args) {
                     preset: preset,
                     quality: cq,
                     isGPU: true,
-                    pixFmt: 'p010le',
+                    pixFmt: measurementPixFmt,
                     colorPrimaries: colorPrimaries,
                     colorTrc: colorTrc,
                     colorspace: colorspace,
                     hdrMasterDisplay: hdrMasterDisplay,
                     hdrMaxCll: hdrMaxCll,
-                    is10Bit: true,
+                    is10Bit: pixelFormatContract.outputDepthForPixelFormat(
+                        measurementPixFmt) === 10,
                 });
             }
         }
+    }
+    args.variables.vmafMeasurementPixFmt = measurementPixFmt;
+    args.variables.vmafMeasurementBitDepth =
+        pixelFormatContract.outputDepthForPixelFormat(measurementPixFmt);
+    if (String(targetCodec).toLowerCase() === 'av1') {
+        args.variables.vmafPixelFormatContractId = pixelFormatContract.CONTRACT_ID;
     }
     if (parameterSets.length === 0) {
         var noParamMsg = 'No encoding parameter sets generated. useGPU=' + useGPU +
@@ -1407,43 +1696,101 @@ var plugin = async function (args) {
     function runEncodeTask(task) {
         return new Promise(function (resolve) {
             var paramSet = task.paramSet, si = task.sampleIndex, sample = task.sample;
-            var container = path.extname(sample).slice(1);
+            // AV1 NVENC samples are always Matroska so colour declarations can
+            // be written to the track header without mutating sequence OBUs.
+            var isAv1Nvenc = paramSet.isGPU && paramSet.encoder.indexOf('av1_nvenc') !== -1;
+            var container = isAv1Nvenc ? 'mkv' : path.extname(sample).slice(1);
             var outputPath = cacheDir + '/test_' + paramSet.id + '_s' + (si + 1) + '.' + container;
             var invocationArgs = buildSampleEncodeArgs(paramSet, sample, outputPath, nvencFlagArgs, {
                 canonicalInput: canonicalInput,
                 temporalPolicy: referenceContract.temporalPolicy,
             });
-            args.jobLog('Testing: ' + paramSet.id + ' on sample ' + (si + 1));
-            var startTime = Date.now();
-            var child = spawn(args.ffmpegPath, invocationArgs, { shell: false, windowsHide: true });
-            var stderrTail = '';
-            var settled = false;
-            var timedOut = false;
-            var timeout = setTimeout(function () {
-                timedOut = true;
-                try { child.kill('SIGKILL'); } catch (e) {}
-            }, sampleEncodeTimeoutSeconds * 1000);
-            function finish(result) {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timeout);
-                resolve(result);
+            var overallStartTime = Date.now();
+
+            function startAttempt(attempt) {
+                if (attempt === 1) {
+                    args.jobLog('Testing: ' + paramSet.id + ' on sample ' + (si + 1));
+                }
+                var child = spawn(args.ffmpegPath, invocationArgs, { shell: false, windowsHide: true });
+                var stderrTail = '';
+                var settled = false;
+                var timedOut = false;
+                var timeout = setTimeout(function () {
+                    timedOut = true;
+                    settleTimedOutSampleAttempt(child, finish,
+                        { paramSet: paramSet, sampleIndex: si, sample: sample, outputPath: outputPath,
+                        ok: false, timedOut: true,
+                        error: 'sample encode timed out after ' + sampleEncodeTimeoutSeconds + 's',
+                        stderrTail: stderrTail });
+                }, sampleEncodeTimeoutSeconds * 1000);
+                function finish(result) {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timeout);
+                    result.attempts = attempt;
+                    result.encodingTime = (Date.now() - overallStartTime) / 1000;
+                    if (shouldRetryTransientNvencSampleFailure(result, attempt)) {
+                        try { fs.unlinkSync(outputPath); } catch (_) {}
+                        args.jobLog('  Transient NVENC resource/session failure (' + paramSet.id +
+                            ' s' + (si + 1) + '); retrying once after 1000ms');
+                        setTimeout(function () { startAttempt(attempt + 1); }, 1000);
+                        return;
+                    }
+                    resolve(result);
+                }
+                if (child.stderr) child.stderr.on('data', function (d) {
+                    stderrTail += d.toString();
+                    if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
+                });
+                child.on('error', function (e) {
+                    finish({ paramSet: paramSet, sampleIndex: si, sample: sample, outputPath: outputPath,
+                        ok: false, error: e.message, stderrTail: stderrTail });
+                });
+                child.on('close', function (code) {
+                    if (code === 0 && !timedOut && isAv1Nvenc) {
+                        try {
+                            applyAndVerifyMkvColorMetadata(
+                                execFileSync, args.ffprobePath || 'tdarr-ffprobe', outputPath, paramSet);
+                        } catch (metadataError) {
+                            try { fs.unlinkSync(outputPath); } catch (_) {}
+                            finish({ paramSet: paramSet, sampleIndex: si, sample: sample,
+                                outputPath: outputPath, ok: false,
+                                error: 'sample colour metadata finalization failed: ' + metadataError.message,
+                                stderrTail: stderrTail });
+                            return;
+                        }
+                    }
+                    finish({ paramSet: paramSet, sampleIndex: si, sample: sample, outputPath: outputPath,
+                        ok: code === 0 && !timedOut, error: timedOut ? ('sample encode timed out after ' + sampleEncodeTimeoutSeconds + 's')
+                            : (code === 0 ? null : ('ffmpeg exited with code ' + code)),
+                        stderrTail: stderrTail });
+                });
             }
-            if (child.stderr) child.stderr.on('data', function (d) {
-                stderrTail += d.toString();
-                if (stderrTail.length > 4000) stderrTail = stderrTail.slice(-4000);
-            });
-            child.on('error', function (e) {
-                finish({ paramSet: paramSet, sampleIndex: si, sample: sample, outputPath: outputPath,
-                    ok: false, error: e.message, stderrTail: stderrTail, encodingTime: (Date.now() - startTime) / 1000 });
-            });
-            child.on('close', function (code) {
-                finish({ paramSet: paramSet, sampleIndex: si, sample: sample, outputPath: outputPath,
-                    ok: code === 0 && !timedOut, error: timedOut ? ('sample encode timed out after ' + sampleEncodeTimeoutSeconds + 's')
-                        : (code === 0 ? null : ('ffmpeg exited with code ' + code)),
-                    stderrTail: stderrTail, encodingTime: (Date.now() - startTime) / 1000 });
-            });
+
+            startAttempt(1);
         });
+    }
+
+    // Describes the encoder's input after a zero-frame encode, so the job report carries evidence
+    // instead of a guess. Deliberately best-effort and bounded: this runs on a failure path and
+    // must never itself throw or stall the sweep.
+    function describeEmptyEncodeInput(args, samplePath) {
+        if (!samplePath) return 'sample path unknown';
+        var childProcess = require('child_process');
+        var bytes = null;
+        try { bytes = fs.statSync(samplePath).size; } catch (e) { return 'sample missing: ' + samplePath; }
+        var probe = '';
+        try {
+            probe = childProcess.execFileSync(args.ffprobePath || 'tdarr-ffprobe', [
+                '-v', 'error', '-select_streams', 'v:0',
+                '-count_packets', '-show_entries', 'stream=nb_read_packets,codec_name',
+                '-of', 'default=nw=1:nk=1', samplePath,
+            ], { stdio: 'pipe', timeout: 20000, shell: false, windowsHide: true })
+                .toString().trim().replace(/\s+/g, '/');
+        } catch (e) {
+            probe = 'probe failed';
+        }
+        return bytes + ' bytes, v:0 ' + (probe || 'no video stream');
     }
 
     function handleEncodeResult(r) {
@@ -1456,23 +1803,38 @@ var plugin = async function (args) {
             encodeFailures.push({ parameterSetId: r.paramSet.id, sampleIndex: r.sampleIndex,
                 error: r.error || 'encode failed', stderrTail: r.stderrTail, outputPath: r.outputPath });
             args.jobLog('  Failed (' + r.paramSet.id + ' s' + (r.sampleIndex + 1) + '): ' + (r.error || 'encode failed'));
-            var det = (r.stderrTail || '').trim();
-            if (det) args.jobLog('  FFmpeg error tail: ' + det.replace(/\s+/g, ' ').substring(0, 500));
+            var det = formatDiagnosticTail(r.stderrTail, 1000);
+            if (det) args.jobLog('  FFmpeg error tail: ' + det);
         } else {
             var fileSize = 0;
             try { fileSize = fs.statSync(r.outputPath).size / (1024 * 1024); }
             catch (e) { args.jobLog('Could not get file size for ' + r.outputPath); }
-            // A near-empty output means the encode produced no frames (e.g. the input sample had no
-            // video packets) even though ffmpeg exited 0. Treat as failure so it can't poison VMAF.
+            // A near-empty output means the encode produced no frames even though ffmpeg exited 0.
+            // Treat as failure so it can't poison VMAF.
+            //
+            // This branch used to drop ffmpeg's stderr and blame the input sample. That guess is
+            // often wrong - a 2026-07-29 DV Profile 7 remux failed all 80 encodes here while its
+            // samples decoded fine and re-encoded fine on retry - and discarding the stderr left
+            // nothing to diagnose from afterwards. Keep the encoder's own words, and probe the
+            // input so the report distinguishes "sample really had no video" from "encoder
+            // produced nothing from a good sample".
             if (fileSize * 1024 * 1024 < 20000) {
+                var emptyEvidence = describeEmptyEncodeInput(args, r.sample);
                 encodeFailures.push({ parameterSetId: r.paramSet.id, sampleIndex: r.sampleIndex,
                     error: 'Output file is empty/near-empty (' + (fileSize * 1024).toFixed(1) + ' KB) - no video frames encoded',
-                    outputPath: r.outputPath });
-                args.jobLog('  Failed: output is empty/near-empty (' + (fileSize * 1024).toFixed(1) + ' KB) - input sample likely has no video');
+                    stderrTail: r.stderrTail, inputEvidence: emptyEvidence, outputPath: r.outputPath });
+                args.jobLog('  Failed (' + r.paramSet.id + ' s' + (r.sampleIndex + 1) + '): output is empty/near-empty (' +
+                    (fileSize * 1024).toFixed(1) + ' KB) after ' + (r.encodingTime || 0).toFixed(1) + 's; input ' + emptyEvidence);
+                var emptyTail = formatDiagnosticTail(r.stderrTail, 1000);
+                if (emptyTail) {
+                    args.jobLog('  FFmpeg tail (exit 0, empty output): ' + emptyTail);
+                }
             } else {
+                // Parameter definitions and source sample paths already have canonical
+                // job-level arrays. Do not repeat them in every per-clip row: those
+                // duplicates inflate every Tdarr CRUD/update payload during long jobs.
                 testResults.push({ parameterSetId: r.paramSet.id, sampleIndex: r.sampleIndex,
-                    outputPath: r.outputPath, fileSizeMB: fileSize, encodingTimeSeconds: r.encodingTime,
-                    parameterSet: r.paramSet, originalSamplePath: r.sample });
+                    outputPath: r.outputPath, fileSizeMB: fileSize, encodingTimeSeconds: r.encodingTime });
                 args.jobLog('  Done: ' + r.paramSet.id + ' s' + (r.sampleIndex + 1) + ' -> ' + fileSize.toFixed(2) + ' MB, ' + r.encodingTime.toFixed(1) + 's');
             }
         }
@@ -1687,6 +2049,11 @@ var plugin = async function (args) {
     }
 
     args.variables.vmafTestResults = testResults;
+    args.variables.vmafEncodingTimeSecondsByParameterSet = testResults.reduce(function (byId, row) {
+        if (!byId[row.parameterSetId]) byId[row.parameterSetId] = [];
+        byId[row.parameterSetId].push(row.encodingTimeSeconds);
+        return byId;
+    }, {});
     args.variables.vmafParameterSets = parameterSets;
     args.variables.vmafEncodeFailures = encodeFailures; // Store for analysis
     args.jobLog('Completed ' + testResults.length + ' encoding tests (' + encodeFailures.length + ' failed).');
@@ -1698,13 +2065,27 @@ var plugin = async function (args) {
 };
 exports.plugin = plugin;
 exports._test = {
+    CURRENT_CONTRACT_PREDICTOR_MIN_SUPPORT: CURRENT_CONTRACT_PREDICTOR_MIN_SUPPORT,
+    CURRENT_CONTRACT_PREDICTOR_MIN_SIGMA: CURRENT_CONTRACT_PREDICTOR_MIN_SIGMA,
     getHardestSampleIndices: getHardestSampleIndices,
     shouldEncodeHardAbort: shouldEncodeHardAbort,
     shouldSeedBoundaryCq16: shouldSeedBoundaryCq16,
     shouldApplyHistoricalProbeSeed: shouldApplyHistoricalProbeSeed,
     buildFreshProbeSeed: buildFreshProbeSeed,
+    normalizeFgsFallbackPlanningSeed: normalizeFgsFallbackPlanningSeed,
+    buildFgsFallbackProbeSeed: buildFgsFallbackProbeSeed,
     loadReferenceContractCalibration: loadReferenceContractCalibration,
     buildNvencCapabilityProbeArgs: buildNvencCapabilityProbeArgs,
     resolveNvencFlagContract: resolveNvencFlagContract,
     buildSampleEncodeArgs: buildSampleEncodeArgs,
+    av1MatroskaColorMetadata: av1MatroskaColorMetadata,
+    buildMkvColorMetadataEditArgs: buildMkvColorMetadataEditArgs,
+    applyAndVerifyMkvColorMetadata: applyAndVerifyMkvColorMetadata,
+    parseFrameRateForMetricContract: parseFrameRateForMetricContract,
+    resolveMeasurementMetricContractForReuse: resolveMeasurementMetricContractForReuse,
+    capCodecCqs: capCodecCqs,
+    shouldUseConfiguredFallback: shouldUseConfiguredFallback,
+    shouldRetryTransientNvencSampleFailure: shouldRetryTransientNvencSampleFailure,
+    settleTimedOutSampleAttempt: settleTimedOutSampleAttempt,
+    formatDiagnosticTail: formatDiagnosticTail,
 };

@@ -406,6 +406,48 @@ async function prepareReservedCrash(fixture, phase) {
     return { proof, journal, paths };
 }
 
+async function prepareInterruptedInstallCopy(fixture, copiedBytes) {
+    const prepared = await prepareReservedCrash(fixture, 'backed_up');
+    const sourceBytes = fs.readFileSync(prepared.paths.temp);
+    let published = false;
+    assert.throws(() =>
+        replacement._test.installCandidateAtomically(
+            prepared.paths.temp,
+            prepared.paths.installTemp,
+            prepared.paths.target,
+            () => { published = true; },
+            'crash fixture install',
+            prepared.journal.source,
+            prepared.journal.candidate,
+            {
+                copyFileSync(source, destination, flags) {
+                    assert.strictEqual(
+                        flags, fs.constants.COPYFILE_EXCL,
+                        'install copy must retain COPYFILE_EXCL');
+                    assert.strictEqual(source, prepared.paths.temp);
+                    const handle = fs.openSync(destination, 'wx');
+                    try {
+                        fs.writeSync(
+                            handle,
+                            sourceBytes,
+                            0,
+                            copiedBytes,
+                            0,
+                        );
+                    } finally {
+                        fs.closeSync(handle);
+                    }
+                    throw new Error(
+                        `injected install-copy crash at ${copiedBytes} bytes`);
+                },
+            },
+        ),
+    new RegExp(`injected install-copy crash at ${copiedBytes} bytes`));
+    assert.strictEqual(published, false,
+        'an interrupted copy must never publish the candidate');
+    return prepared;
+}
+
 async function main() {
     const created = [];
     try {
@@ -631,6 +673,40 @@ async function main() {
             (entry) => replacement._test.samePath(
                 entry, rollbackStage)),
         'retained authenticated stage must remain registered for cleanup');
+
+        for (const copiedBytes of [0, 1, 257, 1023, 1024]) {
+            const interrupted = makeFixture(
+                `install-copy-crash-${copiedBytes}`);
+            created.push(interrupted.root);
+            const prepared = await prepareInterruptedInstallCopy(
+                interrupted, copiedBytes);
+            assert.deepStrictEqual(
+                fs.readFileSync(interrupted.originalPath),
+                interrupted.originalBytes,
+                `copy crash at ${copiedBytes} bytes must leave the original visible`);
+            const interruptedState =
+                replacement._test.classifyReservedFilesystem(
+                    prepared.paths, prepared.journal);
+            assert.strictEqual(
+                interruptedState.phase,
+                copiedBytes === interrupted.candidateBytes.length
+                    ? 'install_ready'
+                    : 'install_copying');
+            const resumedResult =
+                await replacement._test.replaceOriginal(
+                    interrupted.args,
+                    replacementDependencies(interrupted),
+                );
+            assert.strictEqual(resumedResult.outputNumber, 2);
+            assert.deepStrictEqual(
+                fs.readFileSync(interrupted.originalPath),
+                interrupted.candidateBytes,
+                `copy crash at ${copiedBytes} bytes must resume to the exact candidate`);
+            assert.strictEqual(
+                fs.existsSync(prepared.paths.installTemp),
+                false,
+                'resume must remove or publish the reserved .partial.new file');
+        }
 
         for (const crashPhase of [
             'backed_up',

@@ -70,6 +70,9 @@ record for that rollout's exact disposition.
       escape startup qualification.
 - [ ] If the optional private size-shadow model is deployed, verify it outside
       Git and confirm no copy is staged or included in `manifest.json`.
+- [ ] Run `node test-release-payload-hygiene.js`; release staging must contain
+      no `*.bak*`, `*.orig`, or `*~` file under `custom-cont-init.d/` or any
+      plugin payload directory.
 - [ ] Regenerate `manifest.json`.
 
 ## Privacy
@@ -95,6 +98,7 @@ node --check build-scripts/apply-tdarr-runtime-settings.js
 node test-tdarr-runtime-settings.js
 node --check build-scripts/create-post-recovery-evidence.js
 node test-post-recovery-evidence.js
+node test-release-payload-hygiene.js
 node --check build-scripts/verify-compose-security-model.js
 node test-compose-security-model.js
 node --check build-scripts/verify-tdarr-auth-boundary.js

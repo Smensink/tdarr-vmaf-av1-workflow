@@ -110,9 +110,21 @@ function _userVersion(db) {
   return row && (row.user_version !== undefined ? row.user_version : row['user_version']) || 0;
 }
 
+function _runMigrationStep(db, targetVersion, migrate) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    migrate();
+    db.exec('PRAGMA user_version = ' + targetVersion + ';');
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch (eRollback) {}
+    throw e;
+  }
+}
+
 function _migrate(db) {
   var v = _userVersion(db);
-  if (v < 1) {
+  if (v < 1) _runMigrationStep(db, 1, function () {
     db.exec(
       'CREATE TABLE IF NOT EXISTS jobs (' +
       '  job_id TEXT PRIMARY KEY,' +
@@ -187,18 +199,16 @@ function _migrate(db) {
     db.exec('CREATE INDEX IF NOT EXISTS idx_sweep_job ON sweep_points(job_id);');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sweep_cq ON sweep_points(cq);');
     db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_tier_codec ON jobs(tier, source_codec);');
-    db.exec('PRAGMA user_version = 1;');
-  }
-  if (v < 2) {
+  });
+  if (v < 2) _runMigrationStep(db, 2, function () {
     // Capture worst-case + secondary quality signals that were computed but never
     // persisted by the legacy CSV writers: 1%-low VMAF (the frame-percentile floor
     // used in selection), SSIM, and max CAMBI. Null on backfilled historical rows.
     db.exec('ALTER TABLE sweep_points ADD COLUMN vmaf_p1_low REAL;');
     db.exec('ALTER TABLE sweep_points ADD COLUMN ssim REAL;');
     db.exec('ALTER TABLE sweep_points ADD COLUMN cambi_max REAL;');
-    db.exec('PRAGMA user_version = 2;');
-  }
-  if (v < 3) {
+  });
+  if (v < 3) _runMigrationStep(db, 3, function () {
     // Source content features (predict which constraint binds, esp. the 1%-low floor):
     // grain/noise energy, spatial & temporal complexity (SI/TI proxies), dark-scene fraction,
     // mean luma. Cheap to compute from the extracted clips. Null on rows from before capture.
@@ -207,23 +217,20 @@ function _migrate(db) {
     db.exec('ALTER TABLE jobs ADD COLUMN temporal_info REAL;');
     db.exec('ALTER TABLE jobs ADD COLUMN dark_fraction REAL;');
     db.exec('ALTER TABLE jobs ADD COLUMN luma_avg REAL;');
-    db.exec('PRAGMA user_version = 3;');
-  }
-  if (v < 4) {
+  });
+  if (v < 4) _runMigrationStep(db, 4, function () {
     // Metadata fields useful as encode-style/grain proxies (esp. cold-start): streaming network
     // (Apple TV+ = grainy, etc.) and original language (anime vs western). media_year already exists.
     db.exec('ALTER TABLE jobs ADD COLUMN network TEXT;');
     db.exec('ALTER TABLE jobs ADD COLUMN original_language TEXT;');
-    db.exec('PRAGMA user_version = 4;');
-  }
-  if (v < 5) {
+  });
+  if (v < 5) _runMigrationStep(db, 5, function () {
     // Raw per-clip VMAF scores as JSON array. Enables backtesting the sequential sampler's stopping
     // rule (mean CI, 1%-low coverage) against historical measured clip distributions. Null on rows
     // from before this migration.
     db.exec('ALTER TABLE sweep_points ADD COLUMN clip_vmafs TEXT;');
-    db.exec('PRAGMA user_version = 5;');
-  }
-  if (v < 6) {
+  });
+  if (v < 6) _runMigrationStep(db, 6, function () {
     // Series/show title (the SxxExx-stripped name for TV; movie title for film). A strong, encode-
     // pipeline-stable similarity signal: episodes of one show share source master/grain/grade, so
     // their CQ->VMAF curves cluster (measured within-series selected_cq std ~3.3 vs tier-wide ~6.4;
@@ -231,9 +238,8 @@ function _migrate(db) {
     // so the decision stays target-independent (re-derived from the pooled curve at the live target).
     // Null on backfilled rows whose filename was unavailable.
     db.exec('ALTER TABLE jobs ADD COLUMN media_title TEXT;');
-    db.exec('PRAGMA user_version = 6;');
-  }
-  if (v < 7) {
+  });
+  if (v < 7) _runMigrationStep(db, 7, function () {
     // Size-viability instrumentation. These are deliberately separate from met_size_target so
     // unknown size outcomes stop being recorded as false failures. The projected fields come from
     // sample-sweep projection; final_* is reserved for full-output measurement once available.
@@ -244,17 +250,15 @@ function _migrate(db) {
     db.exec('ALTER TABLE jobs ADD COLUMN final_output_ratio_pct REAL;');
     db.exec('ALTER TABLE jobs ADD COLUMN size_target_status TEXT;');
     db.exec('ALTER TABLE jobs ADD COLUMN skip_reason TEXT;');
-    db.exec('PRAGMA user_version = 7;');
-  }
-  if (v < 8) {
+  });
+  if (v < 8) _runMigrationStep(db, 8, function () {
     // Per-clip CAMBI as JSON ({"mean":[...],"p95":[...]}, position-aligned with clip_vmafs).
     // Replaces the conservative p95-minus-mean spread proxy in autoresearch confidence gating
     // with real per-clip CAMBI CIs, and enables paired cross-CQ CAMBI estimation. Null on rows
     // from before this migration.
     db.exec('ALTER TABLE sweep_points ADD COLUMN clip_cambis TEXT;');
-    db.exec('PRAGMA user_version = 8;');
-  }
-  if (v < 9) {
+  });
+  if (v < 9) _runMigrationStep(db, 9, function () {
     // Per-row clip provenance: which sample indices were measured (index-aligned with clip_vmafs)
     // and where those clips sit in the source. Ends the positional ambiguity when the sequential
     // sampler measures different clip counts at different CQs. clip_time_starts/clip_durations may
@@ -267,9 +271,8 @@ function _migrate(db) {
     if (!_spCols.clip_time_starts) db.exec('ALTER TABLE sweep_points ADD COLUMN clip_time_starts TEXT;');
     if (!_spCols.clip_durations) db.exec('ALTER TABLE sweep_points ADD COLUMN clip_durations TEXT;');
     if (!_spCols.clip_sample_indices) db.exec('ALTER TABLE sweep_points ADD COLUMN clip_sample_indices TEXT;');
-    db.exec('PRAGMA user_version = 9;');
-  }
-  if (v < 10) {
+  });
+  if (v < 10) _runMigrationStep(db, 10, function () {
     // Live per-probe timing written by the plugins at export time (timing_source='live_plugin'),
     // replacing the job-report backfill that only covered ~10% of rows. Most timing columns
     // already exist from that backfill's out-of-band ALTERs, so everything is guarded.
@@ -287,9 +290,8 @@ function _migrate(db) {
       var _tName = _tAdd[_tai].split(' ')[0];
       if (!_tCols[_tName]) db.exec('ALTER TABLE sweep_points ADD COLUMN ' + _tAdd[_tai] + ';');
     }
-    db.exec('PRAGMA user_version = 10;');
-  }
-  if (v < 11) {
+  });
+  if (v < 11) _runMigrationStep(db, 11, function () {
     // Persist the selector-authoritative per-clip vectors needed to replay paired-CQ
     // predictions. clip_vmafs is the legacy harmonic diagnostic and cannot reconstruct
     // production arithmetic-mean or frame-level 1%-low selection semantics by itself.
@@ -308,9 +310,8 @@ function _migrate(db) {
     if (!_v11JobCols.effective_frame_floor) db.exec('ALTER TABLE jobs ADD COLUMN effective_frame_floor REAL;');
     if (!_v11JobCols.effective_cambi_limit) db.exec('ALTER TABLE jobs ADD COLUMN effective_cambi_limit REAL;');
     if (!_v11JobCols.selector_policy_version) db.exec('ALTER TABLE jobs ADD COLUMN selector_policy_version TEXT;');
-    db.exec('PRAGMA user_version = 11;');
-  }
-  if (v < 12) {
+  });
+  if (v < 12) _runMigrationStep(db, 12, function () {
     // VMAF/CQ rows are only reusable inside the exact encoder/reference signal
     // contract that produced them. Historical NULL rows belong to the legacy
     // original-reference/tf4 contract; canonical hqdn3d/tf0 rows are explicit.
@@ -326,9 +327,8 @@ function _migrate(db) {
     if (!_v12JobCols.reference_contract_id) db.exec('ALTER TABLE jobs ADD COLUMN reference_contract_id TEXT;');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sweep_reference_contract ON sweep_points(reference_contract_id);');
     db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_reference_contract ON jobs(reference_contract_id);');
-    db.exec('PRAGMA user_version = 12;');
-  }
-  if (v < 13) {
+  });
+  if (v < 13) _runMigrationStep(db, 13, function () {
     // Contract IDs form an immutable signal-domain boundary. Historical NULL
     // values are logically the legacy original-reference/tf4 contract; keep
     // their stored NULL representation while comparing through COALESCE.
@@ -365,9 +365,8 @@ function _migrate(db) {
       " = COALESCE(NEW.reference_contract_id, 'legacy-original-tf4-v1')" +
       ") BEGIN SELECT RAISE(ABORT, 'sweep reference contract must match its job'); END;"
     );
-    db.exec('PRAGMA user_version = 13;');
-  }
-  if (v < 14) {
+  });
+  if (v < 14) _runMigrationStep(db, 14, function () {
     // A VMAF score is reusable only inside the exact measurement model/backend
     // and encoder profile that produced it.  Older rows predate those stamps;
     // retain them under explicit coarse legacy labels instead of pretending
@@ -450,9 +449,8 @@ function _migrate(db) {
       ' AND j.encoder_profile_id = NEW.encoder_profile_id' +
       ") BEGIN SELECT RAISE(ABORT, 'sweep measurement contract must match its job'); END;"
     );
-    db.exec('PRAGMA user_version = 14;');
-  }
-  if (v < 15) {
+  });
+  if (v < 15) _runMigrationStep(db, 15, function () {
     // CAMBI is a distinct CPU process and must be represented separately from
     // GPU VMAF. Source/holdout timing is job-level; CQ timing/provenance is row-level.
     var _v15SweepCols = {};
@@ -477,9 +475,8 @@ function _migrate(db) {
       var _v15JName = _v15JobAdd[_v15Ja].split(' ')[0];
       if (!_v15JobCols[_v15JName]) db.exec('ALTER TABLE jobs ADD COLUMN ' + _v15JobAdd[_v15Ja] + ';');
     }
-    db.exec('PRAGMA user_version = 15;');
-  }
-  if (v < 16) {
+  });
+  if (v < 16) _runMigrationStep(db, 16, function () {
     // Delivery-authoritative size labels. Historical success rows remain NULL
     // for outcome_stage/policy provenance because a base encode completing was
     // not proof that grain/remux/replacement also completed.
@@ -507,9 +504,8 @@ function _migrate(db) {
       }
     }
     db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_outcome_stage ON jobs(outcome_stage);');
-    db.exec('PRAGMA user_version = 16;');
-  }
-  if (v < 17) {
+  });
+  if (v < 17) _runMigrationStep(db, 17, function () {
     var _v17JobCols = {};
     try {
       var _v17Jti = db.prepare('PRAGMA table_info(jobs)').all();
@@ -635,8 +631,7 @@ function _migrate(db) {
       ' OR NEW.skip_reason IS NOT OLD.skip_reason' +
       ") BEGIN SELECT RAISE(ABORT, 'delivered outcome is immutable'); END;"
     );
-    db.exec('PRAGMA user_version = 17;');
-  }
+  });
 }
 
 function _coerce(v) {

@@ -12,6 +12,7 @@ const postReplaceAttestation = require('../../_lib/postReplaceAttestation.js');
 const PENDING_SCHEMA = 'vmaf-delivery-outcome-pending/v1';
 const VALIDATION_SCHEMA = 'vmaf-delivery-candidate-validation/v1';
 const STAGE_SUFFIX = '.tdarr-vmaf-delivery-stage';
+const INSTALL_SUFFIX = '.partial.new';
 const DB_RETRY_DELAYS_MS = Object.freeze([50, 150]);
 const FLOAT_TOLERANCE = 0.000000001;
 const PRETERMINAL_NULL_FIELDS = Object.freeze([
@@ -294,6 +295,7 @@ function pathPlan(sourcePath, candidatePath) {
         current,
         target: original,
         temp: `${current}${STAGE_SUFFIX}`,
+        installTemp: `${original}${INSTALL_SUFFIX}`,
         original,
         backup: postReplaceAttestation.exactBackupPath(original),
     };
@@ -323,6 +325,10 @@ function assertFreshMutationPaths(paths) {
     if (exactPathExists(paths.temp)) {
         throw new Error(
             'delivery staging path already exists; refusing to overwrite it');
+    }
+    if (exactPathExists(paths.installTemp)) {
+        throw new Error(
+            'replacement .partial.new path already exists; refusing to overwrite it');
     }
     if (!samePath(paths.target, paths.original) &&
         exactPathExists(paths.target)) {
@@ -645,6 +651,73 @@ function exclusiveCopy(source, destination, onCreated, label) {
     return 'exclusive_copy';
 }
 
+function removeInstallTemporary(paths) {
+    if (!exactPathExists(paths.installTemp)) return false;
+    fs.unlinkSync(paths.installTemp);
+    fsyncDirectory(path.dirname(paths.installTemp));
+    if (exactPathExists(paths.installTemp)) {
+        throw new Error(
+            'reserved .partial.new remained after cleanup');
+    }
+    return true;
+}
+
+function installCandidateAtomically(
+    source,
+    temporary,
+    destination,
+    onPublished,
+    label,
+    expectedSource,
+    expectedCandidate,
+    operations,
+) {
+    operations = operations || {};
+    const copyFileSync = operations.copyFileSync ||
+        fs.copyFileSync.bind(fs);
+    const renameSync = operations.renameSync || fs.renameSync.bind(fs);
+    const destinationDirectory = path.dirname(destination);
+    if (!samePath(path.dirname(temporary), destinationDirectory) ||
+        !samePath(temporary, `${destination}${INSTALL_SUFFIX}`)) {
+        throw new Error(
+            `${label} temporary path must be the reserved destination sibling`);
+    }
+    if (!exactPathExists(temporary)) {
+        try {
+            copyFileSync(
+                source, temporary, fs.constants.COPYFILE_EXCL);
+        } catch (error) {
+            if (error && error.code === 'EEXIST') {
+                throw new Error(
+                    `${label} .partial.new already exists; refusing to overwrite it`);
+            }
+            throw error;
+        }
+    }
+    fsyncFile(temporary);
+    const prepared = inspect(temporary);
+    assertContent(
+        expectedCandidate, prepared.identity,
+        `${label} prepared candidate`);
+    if (exactPathExists(destination)) {
+        const occupant = inspect(destination);
+        assertSourceForAtomicPublish(
+            expectedSource,
+            occupant,
+            `${label} original immediately before atomic publish`,
+        );
+    }
+    fsyncDirectory(destinationDirectory);
+    renameSync(temporary, destination);
+    onPublished();
+    fsyncDirectory(destinationDirectory);
+    const installed = inspect(destination);
+    assertContent(
+        expectedCandidate, installed.identity,
+        `${label} installed candidate`);
+    return installed;
+}
+
 function assertOriginalAfterBackup(sourceProof, currentSource, backup) {
     assertContent(sourceProof, currentSource.identity,
         'original after backup creation');
@@ -655,6 +728,19 @@ function assertOriginalAfterBackup(sourceProof, currentSource, backup) {
             String(currentSource.identity[field])) {
             throw new Error(
                 `original ${field} changed while the backup was created`);
+        }
+    }
+}
+
+function assertSourceForAtomicPublish(sourceProof, currentSource, label) {
+    assertContent(sourceProof, currentSource.identity, label);
+    if (!samePath(sourceProof.path, currentSource.path)) {
+        throw new Error(`${label} path changed after validation`);
+    }
+    for (const field of ['dev', 'ino', 'size_bytes', 'mtime_ns']) {
+        if (String(sourceProof[field]) !==
+            String(currentSource.identity[field])) {
+            throw new Error(`${label} ${field} changed after backup`);
         }
     }
 }
@@ -757,6 +843,22 @@ function inspectOptional(filePath) {
     return inspect(filePath);
 }
 
+function inspectInstallTemporary(filePath) {
+    if (!exactPathExists(filePath)) return null;
+    const stat = fs.lstatSync(filePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw new Error(
+            'reserved .partial.new is not a regular file');
+    }
+    if (stat.size === 0) {
+        return {
+            path: path.resolve(filePath),
+            identity: { size_bytes: 0, sha256_full: '' },
+        };
+    }
+    return inspect(filePath);
+}
+
 function fullIdentityMatches(expected, inspected) {
     if (!inspected) return false;
     try {
@@ -783,12 +885,15 @@ function classifyReservedFilesystem(paths, journal) {
     const current = inspectOptional(paths.current);
     const original = inspectOptional(paths.original);
     const temp = inspectOptional(paths.temp);
+    const installTemp = inspectInstallTemporary(paths.installTemp);
     const backup = inspectOptional(paths.backup);
     if (!fullIdentityMatches(journal.candidate, current)) {
         throw new Error(
             'reserved transaction candidate is missing or changed');
     }
     const tempIsCandidate = contentMatches(journal.candidate, temp);
+    const installTempIsCandidate =
+        contentMatches(journal.candidate, installTemp);
     const backupIsSource = contentMatches(journal.source, backup);
     const originalIsExactSource =
         fullIdentityMatches(journal.source, original);
@@ -798,16 +903,24 @@ function classifyReservedFilesystem(paths, journal) {
         contentMatches(journal.candidate, original);
 
     let phase;
-    if (originalIsExactSource && !temp && !backup) {
+    if (originalIsExactSource && !temp && !installTemp && !backup) {
         phase = 'clean';
-    } else if (originalIsExactSource && tempIsCandidate && !backup) {
+    } else if (originalIsExactSource && tempIsCandidate &&
+        !installTemp && !backup) {
         phase = 'staged';
-    } else if (originalIsSource && tempIsCandidate && backupIsSource) {
+    } else if (originalIsSource && tempIsCandidate &&
+        !installTemp && backupIsSource) {
         phase = 'backed_up';
-    } else if (!original && tempIsCandidate && backupIsSource) {
+    } else if ((originalIsSource || !original) && tempIsCandidate &&
+        installTemp && backupIsSource) {
+        phase = installTempIsCandidate
+            ? 'install_ready'
+            : 'install_copying';
+    } else if (!original && tempIsCandidate &&
+        !installTemp && backupIsSource) {
         phase = 'original_unlinked';
     } else if (originalIsCandidate &&
-        tempIsCandidate && backupIsSource) {
+        tempIsCandidate && !installTemp && backupIsSource) {
         phase = 'installed';
     } else {
         throw new Error(
@@ -818,6 +931,7 @@ function classifyReservedFilesystem(paths, journal) {
         current,
         original,
         temp,
+        installTemp,
         backup,
     };
 }
@@ -1003,6 +1117,9 @@ async function replaceOriginal(args, dependencies) {
         if (filesystem.temp) {
             registerTemporaryFile(variables, paths.temp);
         }
+        if (filesystem.installTemp) {
+            registerTemporaryFile(variables, paths.installTemp);
+        }
         if (filesystem.phase === 'installed') {
             state.installedByUs = true;
             state.installedIdentity =
@@ -1065,34 +1182,37 @@ async function replaceOriginal(args, dependencies) {
                 paths, journal);
         }
 
-        if (filesystem.phase === 'backed_up') {
-            assertOriginalAfterBackup(
-                journal.source,
-                filesystem.original,
-                filesystem.backup,
-            );
-            fs.unlinkSync(paths.original);
-            fsyncDirectory(path.dirname(paths.original));
-            if (exactPathExists(paths.original)) {
-                throw new Error(
-                    'original path remained after durable backup and unlink');
-            }
+        if (filesystem.phase === 'install_copying') {
+            removeInstallTemporary(paths);
+            unregisterTemporaryFile(variables, paths.installTemp);
             filesystem = classifyReservedFilesystem(
                 paths, journal);
         }
 
-        if (filesystem.phase === 'original_unlinked') {
+        if (['backed_up', 'original_unlinked', 'install_ready'].includes(
+            filesystem.phase)) {
             const installOperation = dependencies.installCandidate ||
-                ((source, destination, onCreated) =>
-                    exclusiveCopy(
-                        source, destination, onCreated,
-                        'replacement target'));
-            installOperation(
+                ((source, temporary, destination, onPublished) =>
+                    installCandidateAtomically(
+                        source,
+                        temporary,
+                        destination,
+                        onPublished,
+                        'replacement target',
+                        journal.source,
+                        journal.candidate,
+                    ));
+            registerTemporaryFile(variables, paths.installTemp);
+            const installed = installOperation(
                 paths.temp,
+                paths.installTemp,
                 paths.target,
-                () => { state.installedByUs = true; },
+                () => {
+                    state.installedByUs = true;
+                    state.installedIdentity = journal.candidate;
+                },
             );
-            const installed = inspect(paths.target);
+            unregisterTemporaryFile(variables, paths.installTemp);
             state.installedIdentity = installed.identity;
             assertContent(
                 journal.candidate, installed.identity,
@@ -1166,6 +1286,14 @@ async function replaceOriginal(args, dependencies) {
         };
     } catch (error) {
         let recoveryError = null;
+        if (paths && exactPathExists(paths.installTemp)) {
+            try {
+                removeInstallTemporary(paths);
+                unregisterTemporaryFile(variables, paths.installTemp);
+            } catch (cleanupError) {
+                recoveryError = cleanupError;
+            }
+        }
         if (paths && exactPathExists(paths.backup)) {
             state.backupCreated = true;
         }
@@ -1285,6 +1413,7 @@ exports._test = {
     PENDING_SCHEMA,
     VALIDATION_SCHEMA,
     STAGE_SUFFIX,
+    INSTALL_SUFFIX,
     DB_RETRY_DELAYS_MS,
     JOB_SELECT,
     RESERVE_SQL,
@@ -1310,6 +1439,8 @@ exports._test = {
     fsyncDirectory,
     exclusiveLinkOrCopy,
     exclusiveCopy,
+    removeInstallTemporary,
+    installCandidateAtomically,
     stageCandidate,
     restoreOriginalSafely,
     requireJournalBinding,
