@@ -21,7 +21,7 @@ const sharedHelpers = [
   'vmafpredict.js', 'referenceContractBridge.js', 'pairedCqShadow.js', 'emptyBandShadow.js', 'rejectionReasons.js',
   'grainAnalysisArtifact.js', 'postEncodeCheckpoint.js', 'postReplaceAttestation.js',
   'deliveryPolicy.js', 'deliveryFinalization.js', 'deliveryTransaction.js', 'canonicalDenoise.js',
-  'nvencTemporalFilter.js', 'nvenccKnn.js', 'grainVmafContract.js', 'preFgsCambi.js',
+  'nvencTemporalFilter.js', 'pixelFormatContract.js', 'nvenccKnn.js', 'grainVmafContract.js', 'preFgsCambi.js',
   'vmafMetricContract.js', 'currentContractMeasurementHistory.js', 'vmafV1Cpu.js'
 ];
 const roots = [
